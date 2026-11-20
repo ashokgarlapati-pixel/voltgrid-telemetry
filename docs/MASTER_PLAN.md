@@ -1,6 +1,6 @@
-# VoltGrid Fleet Telemetry Service — Master Plan & Tutorial Guide (Phases 1 to 5)
+# VoltGrid Fleet Telemetry Service — Master Plan & Tutorial Guide (Phases 1 to 6)
 
-This document is the complete architectural master plan and tutorial guide for **Phase 1** (Batch Ingestion, SQLite Storage, and Messy Traffic Simulator), **Phase 2** (Order-Independent Alert Engine, Alert Lifecycle, and Offline Detection Worker), **Phase 3** (Query API, Keyset Pagination, Peak-Preserving Downsampling, Optimistic Concurrency, and Observability), **Phase 4** (HMAC Authentication, Replay Protection, Distributed Token-Bucket Rate Limiting, and Live SSE Streaming), and **Phase 5** (Automated Unit/Integration/Concurrency Test Suites, Load Testing, and EXPLAIN Query Plans) of the VoltGrid Fleet Telemetry Service.
+This document is the complete architectural master plan and tutorial guide for **Phase 1** (Batch Ingestion, SQLite Storage, and Messy Traffic Simulator), **Phase 2** (Order-Independent Alert Engine, Alert Lifecycle, and Offline Detection Worker), **Phase 3** (Query API, Keyset Pagination, Peak-Preserving Downsampling, Optimistic Concurrency, and Observability), **Phase 4** (HMAC Authentication, Replay Protection, Distributed Token-Bucket Rate Limiting, and Live SSE Streaming), **Phase 5** (Automated Unit/Integration/Concurrency Test Suites, Load Testing, and EXPLAIN Query Plans), and **Phase 6** (System Design Reasoning & Documentation) of the VoltGrid Fleet Telemetry Service.
 
 Use this guide to explain the system end-to-end during code reviews, interviews, and technical demonstrations.
 
@@ -1066,4 +1066,44 @@ Using `loadtest/loadtest.js`, we ran a mixed concurrent load test against the AP
 ### Q3: "Which part of this system are you least confident about? (Live Review Question #6)"
 > **Answer**:
 > *"Single-node SQLite write serialization. While SQLite WAL mode with `PRAGMA synchronous = NORMAL` and `BEGIN IMMEDIATE` transactions comfortably handles 400+ writes/second on SSD storage, SQLite has a single-writer architecture. If the fleet scales to 200,000 vehicles (40,000 req/s), write lock contention on a single `.db` file will eventually saturate disk I/O. To scale 100x, we would shard vehicles into regional database clusters (or migrate raw telemetry ingestion to ClickHouse/TimescaleDB or Kafka) while retaining SQLite/Postgres for vehicle metadata and alert management."*
+
+<br/><br/>
+
+---
+
+# 📑 PHASE 6: SYSTEM DESIGN REASONING (PART C) & REPOSITORY DOCUMENTATION
+
+---
+
+## 26. Part C Design Document Summary (`DESIGN.md`)
+
+The comprehensive engineering answers to all 7 Part C evaluation questions are authored in **[DESIGN.md](file:///c:/Users/garla/OneDrive/Desktop/Fleet%20telementary/voltgrid-telemetry/DESIGN.md)**:
+
+1. **Scale (100x Growth → 200,000 Vehicles / ~40,000 Readings/sec)**:
+   * **First Bottleneck**: SQLite's single-writer lock on `BEGIN IMMEDIATE` transactions in `ingestion.js`.
+   * **Next 3 Bottlenecks**: Single-threaded Node.js event-loop CPU saturation (HMAC + JSON parsing) $\rightarrow$ NVMe disk I/O & B-tree write amplification on `telemetry_history` (3.45B rows/day) $\rightarrow$ In-memory SSE fan-out & `offlineWorker` 10s table scans.
+   * **Mitigations**: Stateless API cluster behind API Gateway $\rightarrow$ Kafka buffer + ClickHouse/TimescaleDB time-partitioned storage $\rightarrow$ Redis Sorted Sets for heartbeats and Redis Pub/Sub for SSE streaming.
+2. **Delivery Guarantees**:
+   * **Model**: At-least-once delivery with idempotent processing (effectively-once persistent storage).
+   * **Mechanism**: `PRIMARY KEY (vehicle_id, seq)` + `INSERT OR IGNORE` inside `BEGIN IMMEDIATE` transaction (proven by `concurrency.test.js`).
+   * **Edge Failure Modes**: Firmware sequence counter resets to 0 on reboot; network drops post-commit before HTTP 200 reaches the vehicle.
+3. **Time & Clock Drift**:
+   * **Device Timestamp (`ts`)**: Trusted for vehicle live state (`last_ts` CASE statement), history ordering, downsampling, and alert rule evaluation.
+   * **Server Timestamp (`received_at` / `updated_at`)**: Trusted for offline detection sweeps and HMAC 5-minute replay window validation.
+   * **25s Drift vs. 1 Day Off**: 25s drift accepted cleanly within 5-min window; 1 day drift rejected with `HTTP 401 Unauthorized` by `security.js`.
+4. **Storage & Cost (~35M Rows / Day)**:
+   * **Volume**: ~220 bytes/row $\times$ 35M $\approx$ 7.7 GB/day (~230 GB/month).
+   * **Tiered Lifecycle**: 7 days raw (Hot, ~54 GB) $\rightarrow$ 90 days 1-minute rollups (Warm, ~15 GB) $\rightarrow$ 1 year 1-hour rollups (Cold, raw dumped to S3 Glacier as Parquet).
+   * **What Operator Loses**: Sub-minute transient spikes (<60s), exact `seq` packet drop gaps, and exact 3-reading alert streaks.
+5. **Threat Model**:
+   * **Replay Attacks**: Defended via `used_nonces` table in `security.js` (HTTP 401 on duplicate signature within 5 mins).
+   * **Telemetry Forgery**: Defended via `HMAC-SHA256` signature verification with `crypto.timingSafeEqual` and per-device-group secrets in `api_keys`.
+   * **DoS / Flooding**: Defended via SQLite-backed distributed token bucket in `rate_limits` (HTTP 429 + `Retry-After`).
+6. **Trade-offs**:
+   * No Kafka/PostgreSQL cluster $\rightarrow$ Minimal single-container simplicity, but capped at ~1,500 writes/sec.
+   * In-memory SSE ring buffer $\rightarrow$ Zero dependencies, but events lost across server restarts.
+   * Single-tenant schema $\rightarrow$ Fast queries, but cannot isolate commercial fleets without application filtering.
+7. **Real Bug Encountered & Fixed**:
+   * Express `express.json()` parser mutated payload whitespace and key ordering, breaking `JSON.stringify(req.body)` HMAC verification.
+   * Fixed by capturing `req.rawBody` directly in `verify` option in `server.js`.
 
