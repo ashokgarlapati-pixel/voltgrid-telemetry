@@ -148,3 +148,29 @@ When two API instances share `voltgrid.db` across mounted volumes, `BEGIN IMMEDI
   WHERE id = @id AND version = @version AND status = 'open';
   ```
 * **Strict HTTP Semantics**: If `changes === 0`, the endpoint inspects the record to return `404 Not Found` if missing, or `409 Conflict` if the version is stale or the alert was already acknowledged/resolved. Tested with 10 concurrent requests; exactly 1 succeeds and 9 receive `409`.
+
+---
+
+## 10. Live Streaming Architecture & Server-Sent Events (Part A5)
+
+### Persistent SQLite Event Outbox vs. In-Memory Ring Buffer
+* **The Restart Vulnerability**: Pure in-memory buffers lose all event history and reset monotonic event counters upon process restarts or deployments. Reconnecting clients using `Last-Event-ID` either receive duplicate event IDs or miss historical alerts.
+* **Durable Outbox**: Events are written to `stream_events (id INTEGER PRIMARY KEY AUTOINCREMENT, event_type, data, created_at)`. Auto-increment guarantees monotonically increasing event IDs that persist across server restarts. A background maintenance query prunes rows beyond the 10,000-event retention limit, bounding disk usage to $< 2\text{ MB}$.
+
+### Replay-to-Live Handoff Algorithm
+* **The Replay Race Condition**: If a client connects with `Last-Event-ID` and the server queries the database while live ingestion is actively running, live events published during the database query could either be missed (if not subscribed) or delivered out of order before historical events.
+* **Deterministic Handoff**:
+  1. The client is registered into `connectedClients` with `replaying = true` and `replayQueue = []`.
+  2. Live events arriving during replay are enqueued in `replayQueue`.
+  3. Historical events ($id > \text{Last-Event-ID}$) are fetched from SQLite and streamed to the client, advancing `lastDeliveredId`.
+  4. Once database replay completes, `replayQueue` is drained: events with $id \le \text{lastDeliveredId}$ are dropped (deduplicated), and events with $id > \text{lastDeliveredId}$ are written.
+  5. `replaying` is set to `false`, transitioning the socket seamlessly to live broadcasting with zero missed events and zero duplicates.
+
+### Vehicle Update Coalescing
+* **Downstream Flood Prevention**: Ingesting ~400 readings/sec across 2,000 vehicles would flood connected SSE clients with 400 individual JSON frames/sec, causing client-side event-loop lag.
+* **State Coalescing**: Incoming updates are collapsed into `pendingVehicles = new Map()`, keyed by `vehicle_id`. Each vehicle retains strictly its latest state. Every 1 second (`STREAM_COALESCE_INTERVAL_MS = 1000`), the map is flushed into individual `vehicle_update` events. Memory is bounded to $O(\text{fleet\_size})$ ($\le 2,000$ entries, $\approx 300\text{ KB}$).
+* **Alert Isolation**: Alert lifecycle changes (`open`, `acknowledged`, `resolved`) **bypass coalescing** and dispatch immediately to all connected subscribers.
+
+### Per-Client Back-Pressure & Slow-Client Disconnect
+* **TCP Socket Congestion**: If a client has a slow connection, Node's `res.write()` returns `false`, indicating that the operating system's kernel TCP buffer is saturated.
+* **Bounded Buffering & Safe Disconnect**: Frames are routed to a per-client buffer (`MAX_CLIENT_BUFFER = 100`) while awaiting socket `'drain'`. If a slow client exceeds 100 queued frames, the server cleanly disconnects the client with `: disconnected: client backpressure buffer overflow\n\n` and frees all memory. The client can reconnect with `Last-Event-ID` when ready. Fast clients and ingestion pipelines remain completely unblocked.

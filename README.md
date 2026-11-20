@@ -233,7 +233,86 @@ Both `api` and `api2` containers share the exact same SQLite database file throu
 
 ---
 
-## 6. Running Tests
+## 6. Live Streaming & Server-Sent Events Specification (Part A5)
+
+The live streaming endpoint (`GET /v1/stream`) provides real-time telemetry updates and alert events to operator dashboards and dispatchers over Server-Sent Events (SSE).
+
+### 1. HTTP Endpoint & Transport Headers
+* **Endpoint**: `GET /v1/stream`
+* **Transport Headers**:
+  ```http
+  Content-Type: text/event-stream
+  Cache-Control: no-cache, no-transform
+  Connection: keep-alive
+  X-Accel-Buffering: no
+  ```
+* **Connection Lifecycle**: Emits `: connected\n\n` on initial connect. Periodically emits `: heartbeat\n\n` comments every 15 seconds to keep intermediary proxy and NAT connections active.
+
+### 2. Event Structure & Wire Contract
+Events adhere to standard SSE wire framing (`id: <id>\nevent: <type>\ndata: <json>\n\n`):
+
+* **Vehicle Update (`vehicle_update`)**:
+  ```json
+  {
+    "event_id": 412,
+    "event_type": "vehicle_update",
+    "vehicle_id": "VG-00104",
+    "state": {
+      "soc_pct": 74.5,
+      "battery_temp_c": 38.2,
+      "speed_kmh": 32.0,
+      "lat": 13.0827,
+      "lng": 80.2707,
+      "odometer_km": 1420.5,
+      "charging": false,
+      "status": "online",
+      "last_seq": 8840,
+      "last_ts": "2026-11-20T12:00:00.000Z"
+    },
+    "ts": "2026-11-20T12:00:00.000Z"
+  }
+  ```
+
+* **Alert Lifecycle Change (`alert_change`)**:
+  ```json
+  {
+    "event_id": 413,
+    "event_type": "alert_change",
+    "alert_id": 28,
+    "vehicle_id": "VG-00104",
+    "rule": "overheat",
+    "status": "open",
+    "version": 1,
+    "details": { "trigger_temp": 56.4, "consecutive_hot": 3 },
+    "ts": "2026-11-20T12:00:01.000Z"
+  }
+  ```
+
+### 3. Persistent Event Log & Reconnection (`Last-Event-ID`)
+* **SQLite Event Outbox**: Events are persisted into `stream_events (id INTEGER PRIMARY KEY AUTOINCREMENT, event_type, data, created_at)` in WAL mode. Monotonically increasing event IDs survive process restarts and power loss.
+* **Resumption**: Accepts the `Last-Event-ID` request header (or `?lastEventId=` query parameter). Queries `SELECT * FROM stream_events WHERE id > @lastId ORDER BY id ASC` to replay missed events.
+* **Retention Pruning**: Retains the latest 10,000 historical events. If a client connects with an ID older than the retention window, a `: gap_detected: ...` notification comment is sent and all available history is replayed.
+
+### 4. Replay-to-Live Handoff
+* Prevents the classic race condition where live events arriving during historical database replay are missed or delivered out-of-order.
+* Connecting clients with `Last-Event-ID` enter a temporary `replaying` state where live events are placed in an internal per-client `replayQueue`.
+* Once database replay completes, queued live events with `id > lastDeliveredId` are flushed in strict monotonic order before live broadcasting resumes, guaranteeing **zero missed events and zero duplicates**.
+
+### 5. Vehicle Update Coalescing
+* Ingesting ~400 readings/sec would overwhelm client event loops if dispatched individually.
+* Pending vehicle state updates are collapsed in memory by `vehicle_id` (`pendingVehicles = new Map()`), retaining only the freshest state per vehicle.
+* Flushed at a configurable 1-second interval (`STREAM_COALESCE_INTERVAL_MS = 1000`). Memory is bounded strictly to $O(\text{fleet\_size})$.
+* **Critical Rule**: Alert lifecycle events (`open`, `acknowledged`, `resolved`) **never coalesce**—they are dispatched immediately to all connected clients.
+
+### 6. Client Back-Pressure & Slow-Client Protection
+* Monitors the return value of Node.js `res.write()`.
+* If a client's kernel TCP socket buffer fills up (`canAcceptMore === false`), writing is paused and frames are queued in a bounded per-client buffer (`MAX_CLIENT_BUFFER = 100`).
+* When the socket drains (`res.on('drain')`), pending frames are iteratively drained.
+* If a slow client exceeds 100 queued frames, the server cleanly disconnects the client with `: disconnected: client backpressure buffer overflow\n\n`, allowing it to reconnect with `Last-Event-ID`. Fast clients and ingestion throughput remain completely uninhibited.
+
+---
+
+## 7. Running Tests
 
 The test suite uses Node's native test runner (`node:test` and `node:assert/strict`) with zero external test dependencies:
 
@@ -243,18 +322,16 @@ npm test
 ```
 
 ### Test Coverage Highlights:
+* **Live SSE Stream Tests (`backend/tests/stream.int.test.js`)**: Real HTTP SSE testing for connection handshake, canonical event formatting, monotonic `Last-Event-ID` replay, restart resilience, atomic replay-to-live handoff race conditions, slow-client backpressure disconnection, 1s vehicle coalescing, and 400 req/s high-throughput benchmark.
+* **Query API Tests (`backend/tests/queries.int.test.js`)**: Keyset cursor pagination, bounding box boundary/inversion validation, 17,280-reading 24h history downsampling benchmark, fleet summary p95 SLA latency benchmark, and 10-client concurrent OCC alert ack race test.
 * **Alert Integration Tests (`backend/tests/alerts.int.test.js`)**: Real HTTP batch ingestion testing chronological vs reverse vs random arrival convergence, >100 readings history scan, hysteresis persistence, offline worker recovery on telemetry resumption, alert ack optimistic locking, and rapid discharge window expiration.
 * **Alert Unit Tests (`backend/tests/alerts.unit.test.js`)**: Pure rule evaluation for Overheat (50°C–55°C hysteresis), Rapid Discharge (>8% drop in 5min), Geofence Breach (ray-casting polygon), and offline clock injection.
 * **Hermetic Integration Tests (`backend/tests/api.int.test.js`)**: Runs against an ephemeral port (`PORT=0`) with an isolated temporary SQLite database, verifying HTTP 207 partial success, latest-state timestamp resolution, sequence gap tracking, keyset pagination, peak downsampling, optimistic locking, and HMAC replay blocking.
-* **20-Client Concurrency Proof (`backend/tests/concurrency.test.js`)**: 20 concurrent clients simultaneously fire the identical 50-item batch. Mathematically asserts:
-  * Total accepted = **50**
-  * Total duplicates = **950**
-  * Database rows stored = **50**
-  * Double-counted increments = **0**
+* **20-Client Concurrency Proof (`backend/tests/concurrency.test.js`)**: 20 concurrent clients simultaneously fire the identical 50-item batch. Mathematically asserts 50 accepted, 950 duplicates, 50 rows stored, 0 double counting.
 * **Two-Instance Shared DB Tests (`backend/tests/two_instances.test.js`)**: Verifies shared rate limiting, replay blocking, and concurrency across two distinct processes sharing the same SQLite database.
 
 ---
 
-## 7. Architecture & System Design Document
+## 8. Architecture & System Design Document
 
 Read **[DESIGN.md](DESIGN.md)** for detailed engineering answers to scale, delivery guarantees, clock drift, storage retention, threat modeling, and trade-offs.

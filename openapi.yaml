@@ -321,12 +321,20 @@ paths:
       summary: Live Server-Sent Events (SSE) stream
       description: >
         Real-time telemetry and alert feed. Supports Last-Event-ID resumption,
-        1-second vehicle batch coalescing, and back-pressure socket protection.
+        1-second vehicle update coalescing, and back-pressure socket protection.
       parameters:
         - in: header
           name: Last-Event-ID
+          required: false
           schema:
             type: string
+          description: Event ID to resume streaming from after disconnect
+        - in: query
+          name: lastEventId
+          required: false
+          schema:
+            type: string
+          description: Alternative query param for clients unable to set custom headers
       responses:
         '200':
           description: Event stream (text/event-stream)

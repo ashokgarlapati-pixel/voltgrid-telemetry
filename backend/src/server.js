@@ -10,7 +10,7 @@ const {
   ackAlertHandler
 } = require('./queries');
 const { hmacAuth, rateLimiter } = require('./security');
-const { sseStreamHandler } = require('./stream');
+const { sseStreamHandler, stopStreamWorker } = require('./stream');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -292,6 +292,7 @@ const server = app.listen(PORT, () => {
 function handleShutdown(signal) {
   console.log(`[VoltGrid API] Received ${signal}, closing server, background workers, and database...`);
   stopOfflineWorker();
+  stopStreamWorker();
   server.close(() => {
     try {
       db.close();
