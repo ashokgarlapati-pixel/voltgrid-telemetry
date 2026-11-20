@@ -42,9 +42,9 @@ function normalizeReadings(readings) {
 
 /**
  * Rule 1: Overheat
- * - Trigger: 3 consecutive readings with battery_temp_c > 55°C.
- * - Resolve: 3 consecutive readings with battery_temp_c <= 50°C.
- * - Between 50°C and 55°C, maintain previous state (hysteresis).
+ * - Trigger: 3 consecutive valid readings with battery_temp_c > 55°C.
+ * - Resolve: 3 consecutive valid readings with battery_temp_c <= 50°C.
+ * - Between 50°C and 55°C, maintain previous alert state (hysteresis).
  */
 function evaluateOverheat(readings) {
   const sorted = normalizeReadings(readings);
@@ -55,18 +55,26 @@ function evaluateOverheat(readings) {
   let state = 'normal'; // 'normal' | 'triggered' | 'resolved'
   let hotStreak = 0;
   let coolStreak = 0;
+  let openedAt = null;
+  let resolvedAt = null;
 
   for (const r of sorted) {
     if (r.battery_temp_c > 55.0) {
       hotStreak++;
       coolStreak = 0;
       if (hotStreak >= 3) {
+        if (state !== 'triggered') {
+          openedAt = r.ts;
+        }
         state = 'triggered';
       }
     } else if (r.battery_temp_c <= 50.0) {
       coolStreak++;
       hotStreak = 0;
       if (coolStreak >= 3) {
+        if (state === 'triggered') {
+          resolvedAt = r.ts;
+        }
         state = 'resolved';
       }
     } else {
@@ -81,6 +89,7 @@ function evaluateOverheat(readings) {
     return {
       triggered: true,
       resolved: false,
+      openedAt: openedAt || latest.ts,
       details: {
         current_temp_c: latest.battery_temp_c,
         threshold: 55.0,
@@ -91,6 +100,8 @@ function evaluateOverheat(readings) {
     return {
       triggered: false,
       resolved: true,
+      openedAt,
+      resolvedAt: resolvedAt || latest.ts,
       details: {
         current_temp_c: latest.battery_temp_c,
         cooling_threshold: 50.0,
@@ -104,11 +115,12 @@ function evaluateOverheat(readings) {
 
 /**
  * Rule 2: Rapid Discharge
- * - Trigger: While charging === 0 (not charging), soc_pct drops by > 8 points
+ * - Trigger: While charging === false/0 (not charging), soc_pct drops by > 8 points
  *   compared to any non-charging reading within the preceding 5 minutes (300 seconds).
- * - Resolve: The 5-minute drop rate returns to <= 8 points (or the vehicle starts charging).
+ * - Resolve: The 5-minute drop rate returns to <= 8 points (or the vehicle starts charging,
+ *   or the 5-minute window expires).
  */
-function evaluateRapidDischarge(readings) {
+function evaluateRapidDischarge(readings, activeAlert = null) {
   const sorted = normalizeReadings(readings);
   if (sorted.length === 0) {
     return { triggered: false, resolved: false };
@@ -121,6 +133,7 @@ function evaluateRapidDischarge(readings) {
     return {
       triggered: false,
       resolved: true,
+      resolvedAt: latest.ts,
       details: { charging: true, current_soc: latest.soc_pct }
     };
   }
@@ -128,14 +141,30 @@ function evaluateRapidDischarge(readings) {
   const latestTimeMs = Date.parse(latest.ts);
   const fiveMinWindowStart = latestTimeMs - (5 * 60 * 1000);
 
-  // Filter non-charging readings within the 5-minute window
+  // Filter non-charging readings within preceding 5-minute event window
   const windowReadings = sorted.filter(r =>
     !r.charging &&
     Date.parse(r.ts) >= fiveMinWindowStart &&
     Date.parse(r.ts) <= latestTimeMs
   );
 
+  // If insufficient readings in window:
+  // - If alert is currently active, or history has older readings: the 5-minute window has elapsed/expired,
+  //   meaning rapid drop is no longer active in the current window -> resolve.
+  // - If brand new vehicle with single reading and no active alert: do nothing.
   if (windowReadings.length < 2) {
+    if (activeAlert || sorted.length >= 2) {
+      return {
+        triggered: false,
+        resolved: true,
+        resolvedAt: latest.ts,
+        details: {
+          reason: '5_min_window_expired',
+          message: 'Rapid discharge condition no longer active (window expired or sparse readings)',
+          current_soc: latest.soc_pct
+        }
+      };
+    }
     return { triggered: false, resolved: false };
   }
 
@@ -153,6 +182,7 @@ function evaluateRapidDischarge(readings) {
     return {
       triggered: true,
       resolved: false,
+      openedAt: latest.ts,
       details: {
         drop_points: Number(dropPoints.toFixed(1)),
         current_soc: latest.soc_pct,
@@ -165,6 +195,7 @@ function evaluateRapidDischarge(readings) {
   return {
     triggered: false,
     resolved: true,
+    resolvedAt: latest.ts,
     details: {
       drop_points: Number(dropPoints.toFixed(1)),
       current_soc: latest.soc_pct,
@@ -191,6 +222,7 @@ function evaluateGeofenceBreach(readings) {
     return {
       triggered: true,
       resolved: false,
+      openedAt: latest.ts,
       details: {
         lat: latest.lat,
         lng: latest.lng,
@@ -202,6 +234,7 @@ function evaluateGeofenceBreach(readings) {
   return {
     triggered: false,
     resolved: true,
+    resolvedAt: latest.ts,
     details: {
       lat: latest.lat,
       lng: latest.lng,
@@ -210,30 +243,43 @@ function evaluateGeofenceBreach(readings) {
   };
 }
 
-/**
- * Registry of active rules for telemetry readings.
- * Extensible design: adding a 5th rule (e.g. overspeed) during live code review
- * only requires adding an entry to this array.
- */
 const TELEMETRY_RULES = [
   { name: 'overheat', evaluate: evaluateOverheat },
   { name: 'rapid_discharge', evaluate: evaluateRapidDischarge },
   { name: 'geofence_breach', evaluate: evaluateGeofenceBreach }
 ];
 
-// Prepared statements for Alert lifecycle management
+// Query latest 100 readings in ascending chronological order (subquery sorts descending first)
 const getRecentHistoryStmt = db.prepare(`
   SELECT vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging
-  FROM telemetry_history
-  WHERE vehicle_id = ?
+  FROM (
+    SELECT vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging
+    FROM telemetry_history
+    WHERE vehicle_id = ?
+    ORDER BY ts DESC, seq DESC
+    LIMIT 100
+  )
   ORDER BY ts ASC, seq ASC
-  LIMIT 100
+`);
+
+// Prepared statement for full 5-minute window if 100 readings don't cover it
+const getFiveMinHistoryStmt = db.prepare(`
+  SELECT vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging
+  FROM telemetry_history
+  WHERE vehicle_id = ? AND ts >= ? AND ts <= ?
+  ORDER BY ts ASC, seq ASC
 `);
 
 const getActiveAlertStmt = db.prepare(`
   SELECT id, status, version, details
   FROM alerts
   WHERE vehicle_id = ? AND rule = ? AND status != 'resolved'
+`);
+
+const getActiveOfflineAlertStmt = db.prepare(`
+  SELECT id, status, version, details
+  FROM alerts
+  WHERE vehicle_id = ? AND rule = 'offline' AND status != 'resolved'
 `);
 
 const insertAlertStmt = db.prepare(`
@@ -244,10 +290,18 @@ const insertAlertStmt = db.prepare(`
   )
 `);
 
+const insertResolvedAlertStmt = db.prepare(`
+  INSERT INTO alerts (
+    vehicle_id, rule, status, version, details, opened_at, resolved_at, updated_at
+  ) VALUES (
+    @vehicle_id, @rule, 'resolved', 2, @details, @opened_at, @resolved_at, @now
+  )
+`);
+
 const resolveAlertStmt = db.prepare(`
   UPDATE alerts
   SET status = 'resolved',
-      resolved_at = @now,
+      resolved_at = @resolved_at,
       version = version + 1,
       details = @details,
       updated_at = @now
@@ -255,19 +309,49 @@ const resolveAlertStmt = db.prepare(`
 `);
 
 /**
- * Evaluates all telemetry rules for a specific vehicle.
- * Ensures order-independence by replaying chronologically sorted history.
- * @param {string} vehicleId 
- * @param {string} nowIso 
+ * Atomic transaction for evaluating vehicle alerts and recording lifecycle transitions.
+ * Wrapped in an immediate transaction to eliminate race conditions.
+ * Changed alerts are collected and returned for safe post-commit SSE publishing.
  */
-function evaluateVehicleAlerts(vehicleId, nowIso = new Date().toISOString()) {
-  // Query chronologically sorted history (guarantees identical result regardless of arrival order)
-  const readings = getRecentHistoryStmt.all(vehicleId);
-  if (!readings || readings.length === 0) return;
+const evaluateVehicleAlertsTx = db.transaction((vehicleId, nowIso) => {
+  let readings = getRecentHistoryStmt.all(vehicleId);
+  if (!readings || readings.length === 0) return [];
 
+  // Check if 100 readings cover the full 5-minute window for rapid discharge
+  const latest = readings[readings.length - 1];
+  const earliest = readings[0];
+  const fiveMinAgoIso = new Date(Date.parse(latest.ts) - (5 * 60 * 1000)).toISOString();
+  if (earliest.ts > fiveMinAgoIso) {
+    const windowReadings = getFiveMinHistoryStmt.all(vehicleId, fiveMinAgoIso, latest.ts);
+    if (windowReadings && windowReadings.length > readings.length) {
+      readings = windowReadings;
+    }
+  }
+
+  const changedAlerts = [];
+
+  // 1. If vehicle was offline and has an active offline alert, resolve it on new telemetry arrival
+  const activeOffline = getActiveOfflineAlertStmt.get(vehicleId);
+  if (activeOffline) {
+    resolveAlertStmt.run({
+      id: activeOffline.id,
+      details: JSON.stringify({
+        reason: 'telemetry_resumed',
+        resumed_at: nowIso
+      }),
+      resolved_at: nowIso,
+      now: nowIso
+    });
+    const resolved = db.prepare('SELECT * FROM alerts WHERE id = ?').get(activeOffline.id);
+    if (resolved) {
+      changedAlerts.push(resolved);
+    }
+  }
+
+  // 2. Evaluate telemetry rules (overheat, rapid_discharge, geofence_breach)
   for (const { name: ruleName, evaluate } of TELEMETRY_RULES) {
-    const outcome = evaluate(readings);
     const activeAlert = getActiveAlertStmt.get(vehicleId, ruleName);
+    const outcome = evaluate(readings, activeAlert);
 
     if (outcome.triggered) {
       if (!activeAlert) {
@@ -276,29 +360,62 @@ function evaluateVehicleAlerts(vehicleId, nowIso = new Date().toISOString()) {
           vehicle_id: vehicleId,
           rule: ruleName,
           details: JSON.stringify(outcome.details || {}),
-          now: nowIso
+          now: outcome.openedAt || nowIso
         });
         const newAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(insertInfo.lastInsertRowid);
         if (newAlert) {
-          publishAlertChange(newAlert);
+          changedAlerts.push(newAlert);
         }
       }
-      // If already open or acknowledged, do not create a duplicate
+      // If already open or acknowledged, maintain existing alert without duplication
     } else if (outcome.resolved) {
       if (activeAlert) {
-        // Active alert exists -> Transition to 'resolved'
+        // Active alert exists -> Transition to 'resolved' (version incremented)
         resolveAlertStmt.run({
           id: activeAlert.id,
           details: JSON.stringify(outcome.details || {}),
+          resolved_at: outcome.resolvedAt || nowIso,
           now: nowIso
         });
         const resolvedAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(activeAlert.id);
         if (resolvedAlert) {
-          publishAlertChange(resolvedAlert);
+          changedAlerts.push(resolvedAlert);
+        }
+      } else if (outcome.openedAt) {
+        // Out-of-order state reconstruction: alert opened and resolved within history
+        const insertInfo = insertResolvedAlertStmt.run({
+          vehicle_id: vehicleId,
+          rule: ruleName,
+          details: JSON.stringify(outcome.details || {}),
+          opened_at: outcome.openedAt,
+          resolved_at: outcome.resolvedAt || nowIso,
+          now: nowIso
+        });
+        const resolvedAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(insertInfo.lastInsertRowid);
+        if (resolvedAlert) {
+          changedAlerts.push(resolvedAlert);
         }
       }
     }
   }
+
+  return changedAlerts;
+}).immediate;
+
+/**
+ * Evaluates all telemetry rules for a specific vehicle.
+ * Guarantees that SSE alert stream events are published strictly AFTER
+ * the SQLite write transaction has successfully committed.
+ * @param {string} vehicleId 
+ * @param {string} nowIso 
+ * @returns {Array<object>} Changed alerts
+ */
+function evaluateVehicleAlerts(vehicleId, nowIso = new Date().toISOString()) {
+  const changedAlerts = evaluateVehicleAlertsTx(vehicleId, nowIso);
+  for (const alert of changedAlerts) {
+    publishAlertChange(alert);
+  }
+  return changedAlerts;
 }
 
 /**
@@ -306,11 +423,17 @@ function evaluateVehicleAlerts(vehicleId, nowIso = new Date().toISOString()) {
  * Called automatically at the end of batch ingestion.
  * @param {Set<string>|Array<string>} vehicleIds 
  * @param {string} nowIso 
+ * @returns {Array<object>}
  */
 function evaluateAlertsForVehicles(vehicleIds, nowIso = new Date().toISOString()) {
+  const allChanged = [];
   for (const vehicleId of vehicleIds) {
-    evaluateVehicleAlerts(vehicleId, nowIso);
+    const changed = evaluateVehicleAlerts(vehicleId, nowIso);
+    if (changed && changed.length > 0) {
+      allChanged.push(...changed);
+    }
   }
+  return allChanged;
 }
 
 module.exports = {

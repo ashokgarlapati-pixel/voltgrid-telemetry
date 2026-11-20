@@ -26,3 +26,15 @@ CREATE INDEX IF NOT EXISTS idx_alerts_status_rule
 -- Index for fetching active alerts for a specific vehicle
 CREATE INDEX IF NOT EXISTS idx_alerts_vehicle_status 
     ON alerts (vehicle_id, status);
+
+-- Composite covering index for vehicle history subquery in alertEngine (ORDER BY ts DESC, seq DESC)
+CREATE INDEX IF NOT EXISTS idx_history_vehicle_ts_seq 
+    ON telemetry_history (vehicle_id, ts DESC, seq DESC);
+
+-- Composite index for offline worker stale vehicle scans
+CREATE INDEX IF NOT EXISTS idx_vehicles_status_updated 
+    ON vehicles (status, updated_at);
+
+-- Index for chronologically sorting alert queries (GET /v1/alerts)
+CREATE INDEX IF NOT EXISTS idx_alerts_opened_at 
+    ON alerts (opened_at DESC, id DESC);

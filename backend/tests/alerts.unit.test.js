@@ -18,6 +18,7 @@ const {
   evaluateVehicleAlerts,
   CHENNAI_OPERATING_POLYGON
 } = require('../src/alertEngine');
+const { runOfflineCheck } = require('../src/offlineWorker');
 
 describe('Part A3 Alert Engine Unit Tests', () => {
 
@@ -63,6 +64,17 @@ describe('Part A3 Alert Engine Unit Tests', () => {
       ];
       const outcome = evaluateOverheat(readings);
       assert.strictEqual(outcome.triggered, true, 'Hysteresis temperature (53°C) must maintain triggered state');
+      assert.strictEqual(outcome.resolved, false);
+    });
+
+    test('Hysteresis: temperatures between 50°C and 55°C after normal readings stay normal', () => {
+      const readings = [
+        { seq: 1, ts: '2026-11-20T10:00:00Z', battery_temp_c: 45.0 },
+        { seq: 2, ts: '2026-11-20T10:00:05Z', battery_temp_c: 52.0 },
+        { seq: 3, ts: '2026-11-20T10:00:10Z', battery_temp_c: 53.5 }
+      ];
+      const outcome = evaluateOverheat(readings);
+      assert.strictEqual(outcome.triggered, false, 'Hysteresis temperature after normal must not trigger');
       assert.strictEqual(outcome.resolved, false);
     });
 
@@ -130,6 +142,26 @@ describe('Part A3 Alert Engine Unit Tests', () => {
       assert.strictEqual(outcome.triggered, false);
       assert.strictEqual(outcome.resolved, true, 'Should resolve when 5-min drop returns <= 8 points');
     });
+
+    test('Insufficient history for new vehicle with 1 reading does not trigger or resolve', () => {
+      const readings = [
+        { seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 80.0, charging: false }
+      ];
+      const outcome = evaluateRapidDischarge(readings);
+      assert.strictEqual(outcome.triggered, false);
+      assert.strictEqual(outcome.resolved, false);
+    });
+
+    test('5-minute window expiration with active alert resolves cleanly', () => {
+      const readings = [
+        { seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 80.0, charging: false },
+        // Reading 10 minutes later (only 1 reading in the new 5-minute window)
+        { seq: 2, ts: '2026-11-20T10:10:00Z', soc_pct: 79.5, charging: false }
+      ];
+      const outcome = evaluateRapidDischarge(readings, { id: 1, status: 'open' });
+      assert.strictEqual(outcome.triggered, false);
+      assert.strictEqual(outcome.resolved, true, 'Window expiration must resolve active alert');
+    });
   });
 
   describe('Rule 3: Geofence Breach (Operating Polygon)', () => {
@@ -157,6 +189,37 @@ describe('Part A3 Alert Engine Unit Tests', () => {
       const outcome = evaluateGeofenceBreach(readings);
       assert.strictEqual(outcome.triggered, false);
       assert.strictEqual(outcome.resolved, true, 'Re-entering polygon must resolve breach');
+    });
+  });
+
+  describe('Rule 4: Offline Detection Logic (Clock Injection)', () => {
+    test('runOfflineCheck with injectable clock accurately flags vehicles', () => {
+      const vid = `VG-UNIT-OFFLINE-${Date.now()}`;
+      const now = Date.now();
+
+      // Seed vehicle online at T0
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES (
+          ?, '2026-11-20T10:00:00Z', 1, 80, 35, 0, 13.08, 80.27, 10, 0, 'online', 1, 1, 1, ?
+        )
+      `).run(vid, new Date(now).toISOString());
+
+      // At T0 + 30s: vehicle is not stale (< 90s)
+      const res30s = runOfflineCheck(90, now + 30000);
+      const v30s = db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vid);
+      assert.strictEqual(v30s.status, 'online');
+
+      // At T0 + 95s: vehicle is stale (> 90s)
+      const res95s = runOfflineCheck(90, now + 95000);
+      const v95s = db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vid);
+      assert.strictEqual(v95s.status, 'offline');
+
+      const alert = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid);
+      assert.ok(alert);
+      assert.strictEqual(alert.status, 'open');
     });
   });
 

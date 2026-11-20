@@ -35,11 +35,13 @@ const insertOfflineAlertStmt = db.prepare(`
 /**
  * Checks for online vehicles that have not reported within the threshold window.
  * Transitions them to 'offline' and creates de-duplicated alerts.
- * Wrapped in a transaction for atomicity.
+ * Wrapped in an immediate transaction for atomicity.
+ * Defer event publishing until after commit.
  */
 const checkOfflineVehicles = db.transaction((cutoffIso, nowIso) => {
   const staleVehicles = findStaleVehiclesStmt.all(cutoffIso);
   let newlyOfflineCount = 0;
+  const alertsToPublish = [];
 
   for (const v of staleVehicles) {
     // Transition vehicle status to offline
@@ -48,7 +50,7 @@ const checkOfflineVehicles = db.transaction((cutoffIso, nowIso) => {
     // Open de-duplicated offline alert if none exists
     const activeAlert = getActiveOfflineAlertStmt.get(v.vehicle_id);
     if (!activeAlert) {
-      const silenceSec = Math.round((Date.now() - Date.parse(v.updated_at)) / 1000);
+      const silenceSec = Math.round((Date.parse(nowIso) - Date.parse(v.updated_at)) / 1000);
       const insertInfo = insertOfflineAlertStmt.run({
         vehicle_id: v.vehicle_id,
         details: JSON.stringify({
@@ -60,30 +62,38 @@ const checkOfflineVehicles = db.transaction((cutoffIso, nowIso) => {
       });
       const newAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(insertInfo.lastInsertRowid);
       if (newAlert) {
-        publishAlertChange(newAlert);
+        alertsToPublish.push(newAlert);
       }
       newlyOfflineCount++;
     }
   }
 
-  return { staleCount: staleVehicles.length, newlyOfflineCount };
+  return { staleCount: staleVehicles.length, newlyOfflineCount, alertsToPublish };
 }).immediate;
 
 /**
- * Executes a single offline check cycle
+ * Executes a single offline check cycle.
+ * Supports optional nowMs for injectable clock / deterministic unit testing.
+ * @param {number} thresholdSec Silence threshold in seconds (default 90)
+ * @param {number} nowMs Current server epoch ms (default Date.now())
  */
-function runOfflineCheck(thresholdSec = OFFLINE_THRESHOLD_SEC) {
-  const now = Date.now();
-  const cutoffMs = now - (thresholdSec * 1000);
+function runOfflineCheck(thresholdSec = OFFLINE_THRESHOLD_SEC, nowMs = Date.now()) {
+  const cutoffMs = nowMs - (thresholdSec * 1000);
   const cutoffIso = new Date(cutoffMs).toISOString();
-  const nowIso = new Date(now).toISOString();
+  const nowIso = new Date(nowMs).toISOString();
 
   try {
     const result = checkOfflineVehicles(cutoffIso, nowIso);
+    // Publish alert events strictly AFTER the transaction has committed!
+    if (result.alertsToPublish && result.alertsToPublish.length > 0) {
+      for (const alert of result.alertsToPublish) {
+        publishAlertChange(alert);
+      }
+    }
     if (result.newlyOfflineCount > 0) {
       console.log(`[OfflineWorker] Flagged ${result.newlyOfflineCount} silent vehicles as offline`);
     }
-    return result;
+    return { staleCount: result.staleCount, newlyOfflineCount: result.newlyOfflineCount };
   } catch (err) {
     console.error('[OfflineWorker Error]', err);
     return { staleCount: 0, newlyOfflineCount: 0, error: err.message };
