@@ -78,9 +78,14 @@ $$\text{Daily Storage} = 35{,}000{,}000 \times 220\text{ bytes} \approx 7.7\text
 
 | Threat | Attack Vector | Exact Implementation Defense |
 | :--- | :--- | :--- |
-| **1. Replay Attacks** | Eavesdropper captures signed batch and resends it repeatedly to manipulate vehicle position or flood the database. | `used_nonces` table in `backend/src/security.js`. Tracks signatures within a 5-minute window in an atomic transaction. Replays fail with `HTTP 401: "Replayed request signature"`. |
-| **2. Telemetry Forgery / Tampering** | Rogue actor attempts to falsify battery levels, simulate false crashes, or inject fake diagnostics. | `hmacAuth` in `security.js`. Requires valid `X-Signature` computed via `HMAC-SHA256(secret, "${timestamp}.${rawBody}")` and verified using `crypto.timingSafeEqual`. |
-| **3. Distributed DoS / Connection Flooding** | Attacker spams valid endpoints across multiple IPs to exhaust SQLite write locks and memory. | Shared SQLite token-bucket rate limiter in `security.js` (`rate_limits` table). Enforces burst capacity (40) and rate limit (20 req/s), emitting `HTTP 429` with `Retry-After`. |
+| **1. Unauthorized Request Tampering** | Rogue actor intercepts or crafts payload to falsify battery levels, simulate false crashes, or inject fake diagnostics. | `hmacAuth` in `security.js`. Requires valid `X-Signature` computed via `HMAC-SHA256(secret, "${timestamp}.${rawBody}")` and verified using `crypto.timingSafeEqual` over raw UTF-8 bytes. Secret is never leaked in memory or responses. |
+| **2. Stale Request Injection** | Attacker captures packets and delays transmission to corrupt telemetry ordering. | `hmacAuth` 5-minute validity window (`Math.abs(serverNow - reqTimeMs) <= 300000ms`). Requests older than 5 minutes or > 5 minutes in future fail with `HTTP 401`. |
+| **3. Replay Attacks** | Eavesdropper captures valid signed batch and resends it repeatedly to manipulate vehicle position or flood the database. | `used_nonces` table in `security.js`. Stores signatures (`PRIMARY KEY`) within validity window. Duplicate signature insertion fails (`info.changes === 0`) and returns `HTTP 401: "Replayed request signature"`. Expired nonces are purged via throttled 60s background sweeps. |
+| **4. Distributed DoS & Resource Exhaustion** | Abusive clients spam endpoints across multiple IPs to exhaust CPU or SQLite write locks. | Shared SQLite token bucket in `security.js` (`rate_limits` table). Enforces per-key burst capacity (40) and refill rate (20 req/s), emitting `HTTP 429` with `Retry-After: <sec>`. Rate-limited requests do not consume tokens. |
+
+### Multi-Instance Coordination & SQLite Storage Limitations
+* **Two-Instance Transaction Coordination**: When two API instances run behind a load balancer on the same host, both mount the shared volume containing `voltgrid.db`. Both `used_nonces` and `rate_limits` updates execute inside `BEGIN IMMEDIATE` transactions. SQLite's OS-level file lock (`WAL` mode + `busy_timeout = 5000ms`) serializes write reservations across process boundaries. Neither instance can over-consume tokens or accept a duplicate replay.
+* **Remaining Limitations with SQLite Deployment**: Shared SQLite requires shared local disk on a single host. It cannot run across independent machines or over network filesystems (NFS/SMB) due to unreliable byte-range file locking and cache coherence bugs. Scaling to distributed, multi-server infrastructure requires migrating shared rate-limiting to Redis and telemetry storage to clustered PostgreSQL/TimescaleDB.
 
 ---
 

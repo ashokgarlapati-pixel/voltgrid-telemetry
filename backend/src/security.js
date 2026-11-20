@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const db = require('./db');
 
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
+const CLEANUP_INTERVAL_MS = 60 * 1000; // Clean expired nonces at most once every 60 seconds
 
 // Prepared statements for api_keys lookup
 const getApiKeyStmt = db.prepare('SELECT api_key, secret, rate_limit_per_sec, burst_capacity FROM api_keys WHERE api_key = ?');
@@ -20,15 +21,25 @@ const upsertRateLimitStmt = db.prepare(`
     last_refill_ms = excluded.last_refill_ms
 `);
 
-// Atomic transaction to record and verify request nonce
+// Atomic transaction to record and verify request signature uniqueness (BEGIN IMMEDIATE)
 const recordNonceTx = db.transaction((sig, now) => {
-  purgeExpiredNoncesStmt.run(now);
   const expiresAt = now + FIVE_MINUTES_MS;
   const info = insertNonceStmt.run(sig, expiresAt);
   return info.changes > 0;
 });
 
-// Atomic transaction to check and consume a rate limit token
+// Periodic, throttled cleanup of expired nonces (does NOT run on every request)
+let lastCleanupMs = 0;
+function maybeCleanExpiredNonces(now) {
+  if (now - lastCleanupMs > CLEANUP_INTERVAL_MS) {
+    lastCleanupMs = now;
+    try {
+      purgeExpiredNoncesStmt.run(now);
+    } catch (_) {}
+  }
+}
+
+// Atomic transaction to check and consume a rate limit token (BEGIN IMMEDIATE)
 const consumeTokenTx = db.transaction((apiKey, rateLimitPerSec, burstCapacity, now) => {
   const row = getRateLimitStmt.get(apiKey);
 
@@ -45,16 +56,36 @@ const consumeTokenTx = db.transaction((apiKey, rateLimitPerSec, burstCapacity, n
   const refilledTokens = Math.min(burstCapacity, tokens + (elapsedSec * rateLimitPerSec));
 
   if (refilledTokens < 1) {
-    const retryAfterSec = Math.max(1, Math.ceil((1 - refilledTokens) / rateLimitPerSec));
+    const needed = 1 - refilledTokens;
+    const retryAfterSec = Math.max(1, Math.ceil(needed / Math.max(0.001, rateLimitPerSec)));
     return { allowed: false, retryAfterSec };
   }
 
-  // Consume exactly 1 token
-  const updatedTokens = refilledTokens - 1;
+  // Consume exactly 1 token and preserve non-negative balance
+  const updatedTokens = Math.max(0, refilledTokens - 1);
   upsertRateLimitStmt.run(apiKey, updatedTokens, now);
 
   return { allowed: true };
 });
+
+/**
+ * Resilient transaction runner that catches transient SQLITE_BUSY contention
+ * across multiple API processes and safely retries before bubbling up.
+ */
+function executeWithBusyRetry(fn, maxRetries = 3) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return fn();
+    } catch (err) {
+      if ((err.code === 'SQLITE_BUSY' || (err.message && err.message.includes('busy'))) && attempt < maxRetries - 1) {
+        const start = Date.now();
+        while (Date.now() - start < 10) {} // 10ms jittered spin
+        continue;
+      }
+      throw err;
+    }
+  }
+}
 
 /**
  * Express middleware for HMAC-SHA256 request authentication and replay protection.
@@ -77,11 +108,19 @@ function hmacAuth(req, res, next) {
       return res.status(401).json({ error: 'Invalid or unknown API key' });
     }
 
-    // 5-minute timestamp window check (handles epoch ms or ISO strings)
-    const parsedNum = Number(rawTimestamp);
-    const reqTimeMs = (!isNaN(parsedNum) && parsedNum > 1000000000) ? parsedNum : Date.parse(rawTimestamp);
-    const nowMs = Date.now();
+    // Parse and validate request timestamp: supports epoch ms (13 digits), epoch sec (10 digits), and ISO strings
+    let reqTimeMs = NaN;
+    if (typeof rawTimestamp === 'string' && rawTimestamp.trim().length > 0) {
+      const trimmed = rawTimestamp.trim();
+      if (/^\d+$/.test(trimmed)) {
+        const num = Number(trimmed);
+        reqTimeMs = num < 10000000000 ? num * 1000 : num;
+      } else {
+        reqTimeMs = Date.parse(trimmed);
+      }
+    }
 
+    const nowMs = Date.now();
     if (isNaN(reqTimeMs) || Math.abs(nowMs - reqTimeMs) > FIVE_MINUTES_MS) {
       return res.status(401).json({
         error: 'Request timestamp is outside the allowed 5-minute window'
@@ -102,13 +141,22 @@ function hmacAuth(req, res, next) {
     }
 
     // Replay protection: Ensure signature has not been seen within validity window
-    const isNew = recordNonceTx.immediate(String(rawSignature).trim(), nowMs);
+    const cleanSig = String(rawSignature).trim();
+    const isNew = executeWithBusyRetry(() => recordNonceTx.immediate(cleanSig, nowMs));
     if (!isNew) {
       return res.status(401).json({ error: 'Replayed request signature' });
     }
 
-    // Attach authenticated API key information for downstream middleware
-    req.apiKey = apiKeyRow;
+    // Run throttled cleanup of expired nonces in background (never blocks on every request)
+    maybeCleanExpiredNonces(nowMs);
+
+    // Attach sanitized API key information for downstream middleware (never leak secret)
+    req.apiKey = {
+      api_key: apiKeyRow.api_key,
+      rate_limit_per_sec: Number(apiKeyRow.rate_limit_per_sec),
+      burst_capacity: Number(apiKeyRow.burst_capacity)
+    };
+
     next();
   } catch (err) {
     console.error('[HMAC Auth Error]', err);
@@ -118,18 +166,20 @@ function hmacAuth(req, res, next) {
 
 /**
  * Express middleware for distributed per-key token-bucket rate limiting.
- * Synchronizes state via SQLite rate_limits table across instances.
+ * Synchronizes state via shared SQLite rate_limits table across instances.
  */
 function rateLimiter(req, res, next) {
   try {
     const apiKey = req.apiKey?.api_key || 'voltgrid-dev-key';
-    const rateLimitPerSec = req.apiKey?.rate_limit_per_sec || 20;
-    const burstCapacity = req.apiKey?.burst_capacity || 40;
+    const rateLimitPerSec = req.apiKey?.rate_limit_per_sec ?? 20;
+    const burstCapacity = req.apiKey?.burst_capacity ?? 40;
 
-    const result = consumeTokenTx.immediate(apiKey, rateLimitPerSec, burstCapacity, Date.now());
+    const result = executeWithBusyRetry(() =>
+      consumeTokenTx.immediate(apiKey, rateLimitPerSec, burstCapacity, Date.now())
+    );
 
     if (!result.allowed) {
-      res.setHeader('Retry-After', result.retryAfterSec);
+      res.setHeader('Retry-After', String(result.retryAfterSec));
       return res.status(429).json({
         error: 'Rate limit exceeded',
         retry_after_sec: result.retryAfterSec
@@ -145,5 +195,8 @@ function rateLimiter(req, res, next) {
 
 module.exports = {
   hmacAuth,
-  rateLimiter
+  rateLimiter,
+  consumeTokenTx,
+  recordNonceTx,
+  maybeCleanExpiredNonces
 };

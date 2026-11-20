@@ -282,7 +282,8 @@ app.get('/v1/stream', sseStreamHandler);
 
 // Start Express server
 const server = app.listen(PORT, () => {
-  console.log(`[VoltGrid API] Listening on port ${PORT}`);
+  const actualPort = server.address()?.port || PORT;
+  console.log(`[VoltGrid API] Listening on port ${actualPort}`);
   // Start background offline detection worker
   startOfflineWorker();
 });

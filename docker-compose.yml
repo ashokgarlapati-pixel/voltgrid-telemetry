@@ -1,6 +1,7 @@
 version: '3.8'
 
 services:
+  # Primary API Instance
   api:
     build:
       context: ./backend
@@ -10,6 +11,23 @@ services:
       - "3000:3000"
     environment:
       - PORT=3000
+      - DB_PATH=/data/voltgrid.db
+      - NODE_ENV=production
+    volumes:
+      - sqlite_data:/data
+    restart: unless-stopped
+
+  # Secondary API Instance for Multi-Instance / Load-Balanced Testing (A2)
+  # Shares the exact same SQLite database file via named volume mount
+  api2:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: voltgrid-api2
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
       - DB_PATH=/data/voltgrid.db
       - NODE_ENV=production
     volumes:

@@ -116,6 +116,52 @@ Every reading in `POST /v1/telemetry/batch` is individually validated using `Num
   $$\text{Completeness} = \frac{\text{received\_count}}{\text{max\_seq} - \text{min\_seq} + 1}$$
 * **Limitation Note**: Sequence gap tracking establishes completeness strictly within the observed interval $[\text{min\_seq}, \text{max\_seq}]$. Sequences dropped prior to the first observed reading cannot be determined without an external provisioning baseline (we do not assume sequence 0 or 1 without justification). Single-vehicle gaps are queryable via `GET /v1/completeness?vehicle_id=VG-xxx`.
 
+### Security & Abuse Protection Specification (Part A2)
+
+#### 1. HMAC-SHA256 Request Authentication
+Every request to `POST /v1/telemetry/batch` requires three cryptographic headers:
+* `X-API-Key`: Public client identifier (e.g. `voltgrid-dev-key`).
+* `X-Timestamp`: Client submission timestamp in epoch milliseconds (e.g. `1763630000000`) or ISO-8601 string.
+* `X-Signature`: Hex-encoded HMAC-SHA256 digest computed as:
+  $$\text{X-Signature} = \text{HMAC-SHA256}(\text{secret}, \text{X-Timestamp} \mathbin{\Vert} \text{"."} \mathbin{\Vert} \text{rawBody})$$
+Signatures are validated using constant-time comparison (`crypto.timingSafeEqual`) to prevent timing side-channel attacks. Secrets are loaded from the `api_keys` table and never exposed in responses or memory dumps.
+
+#### 2. 5-Minute Request Timestamp Window
+* Requests are checked against the server's current wall clock: $|\text{server\_time} - \text{X-Timestamp}| \le 300{,}000\text{ ms}$ (5 minutes).
+* Stale requests older than 5 minutes or future-dated requests exceeding 5 minutes are rejected with `HTTP 401 Unauthorized`.
+
+#### 3. Database-Level Replay Protection
+* The `used_nonces` table stores all processed signatures (`PRIMARY KEY`) alongside their expiration time (`expires_at = now + 5 min`).
+* If a signature is reused within the validity window, SQLite's primary key constraint rejects the insert, returning `HTTP 401: "Replayed request signature"`.
+* Expired nonces are purged periodically via throttled 60-second background maintenance, avoiding expensive `DELETE` queries on every incoming request.
+
+#### 4. Shared SQLite Token-Bucket Rate Limiter
+* Rate limits are enforced on a per-API-key basis via the persistent `rate_limits` table (`tokens REAL`, `last_refill_ms INTEGER`).
+* Tokens refill dynamically according to elapsed time:
+  $$\text{tokens}_{\text{new}} = \min\left(\text{capacity}, \text{tokens}_{\text{current}} + \Delta t \times \text{refill\_rate}\right)$$
+* Default configuration: Burst Capacity = 40 tokens, Refill Rate = 20 tokens/sec.
+* Rate-limited requests return `HTTP 429 Too Many Requests` with a calculated `Retry-After: <seconds>` header:
+  $$\text{Retry-After} = \max\left(1, \left\lceil \frac{1 - \text{tokens}_{\text{new}}}{\text{refill\_rate}} \right\rceil\right)$$
+* Requests rejected with `HTTP 429` do NOT consume tokens.
+
+#### 5. Two-Instance Multi-Process Architecture
+```text
+                 Load Balancer
+                       │
+              ─────────┴─────────
+              │                 │
+           API 1             API 2
+         (Port 3000)       (Port 3001)
+              │                 │
+              ─────────┬─────────
+                       │
+             Shared SQLite Database
+             (/data/voltgrid.db)
+```
+* Both `api` and `api2` containers share the exact same SQLite database file through a shared mounted Docker volume (`sqlite_data:/data`).
+* SQLite's `BEGIN IMMEDIATE` write transactions and file-locking primitives guarantee that atomic token subtractions and signature recordings remain fully serialized across both processes with zero race conditions, lost updates, or over-consumption.
+* **Storage Note**: This architecture requires local shared storage on the same host operating system. Network filesystems (NFS/SMB) are not supported due to unsafe remote POSIX lock semantics.
+
 ---
 
 ## 4. Running Tests
