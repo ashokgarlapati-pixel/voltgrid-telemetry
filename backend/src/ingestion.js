@@ -3,11 +3,24 @@ const { evaluateAlertsForVehicles } = require('./alertEngine');
 const { publishVehicleUpdate, publishAlertChange } = require('./stream');
 
 /**
- * Validates a single telemetry reading according to Phase 1 rules.
+ * Documented Acceptable Telemetry Ranges:
+ * - vehicle_id: non-empty string, trimmed length >= 1
+ * - seq: non-negative integer (0 <= seq)
+ * - ts: valid ISO-8601 timestamp string (parseable by Date.parse)
+ * - soc_pct: finite number between 0.0% and 100.0%
+ * - battery_temp_c: finite number between -40.0°C and 120.0°C (extreme automotive operating envelope)
+ * - speed_kmh: finite number between 0.0 km/h and 200.0 km/h
+ * - lat: finite latitude between -90.0° and +90.0°
+ * - lng: finite longitude between -180.0° and +180.0°
+ * - odometer_km: finite non-negative number (>= 0.0)
+ * - charging: boolean (true or false)
+ * - fault_codes: array where every element is a valid string
+ * 
+ * Validates a single telemetry reading individually.
  * Returns null if valid, or an error message string if invalid.
  */
 function validateReading(reading) {
-  if (!reading || typeof reading !== 'object') {
+  if (!reading || typeof reading !== 'object' || Array.isArray(reading)) {
     return 'Reading must be a non-null object';
   }
   if (typeof reading.vehicle_id !== 'string' || reading.vehicle_id.trim().length === 0) {
@@ -16,32 +29,32 @@ function validateReading(reading) {
   if (typeof reading.seq !== 'number' || !Number.isInteger(reading.seq) || reading.seq < 0) {
     return 'seq must be a non-negative integer';
   }
-  if (typeof reading.ts !== 'string' || reading.ts.trim().length === 0 || isNaN(Date.parse(reading.ts))) {
+  if (typeof reading.ts !== 'string' || reading.ts.trim().length === 0 || isNaN(Date.parse(reading.ts)) || isNaN(new Date(reading.ts).getTime())) {
     return 'ts must be a valid ISO timestamp string';
   }
-  if (typeof reading.soc_pct !== 'number' || isNaN(reading.soc_pct) || reading.soc_pct < 0 || reading.soc_pct > 100) {
-    return 'soc_pct must be a number between 0 and 100';
+  if (!Number.isFinite(reading.soc_pct) || reading.soc_pct < 0 || reading.soc_pct > 100) {
+    return 'soc_pct must be a finite number between 0 and 100';
   }
-  if (typeof reading.battery_temp_c !== 'number' || isNaN(reading.battery_temp_c) || reading.battery_temp_c < -40 || reading.battery_temp_c > 120) {
-    return 'battery_temp_c must be a number between -40 and 120';
+  if (!Number.isFinite(reading.battery_temp_c) || reading.battery_temp_c < -40 || reading.battery_temp_c > 120) {
+    return 'battery_temp_c must be a finite number between -40 and 120';
   }
-  if (typeof reading.speed_kmh !== 'number' || isNaN(reading.speed_kmh) || reading.speed_kmh < 0 || reading.speed_kmh > 200) {
-    return 'speed_kmh must be a number between 0 and 200';
+  if (!Number.isFinite(reading.speed_kmh) || reading.speed_kmh < 0 || reading.speed_kmh > 200) {
+    return 'speed_kmh must be a finite number between 0 and 200';
   }
-  if (typeof reading.lat !== 'number' || isNaN(reading.lat) || reading.lat < -90 || reading.lat > 90) {
-    return 'lat must be a number between -90 and 90';
+  if (!Number.isFinite(reading.lat) || reading.lat < -90 || reading.lat > 90) {
+    return 'lat must be a finite number between -90 and 90';
   }
-  if (typeof reading.lng !== 'number' || isNaN(reading.lng) || reading.lng < -180 || reading.lng > 180) {
-    return 'lng must be a number between -180 and 180';
+  if (!Number.isFinite(reading.lng) || reading.lng < -180 || reading.lng > 180) {
+    return 'lng must be a finite number between -180 and 180';
   }
-  if (typeof reading.odometer_km !== 'number' || isNaN(reading.odometer_km) || reading.odometer_km < 0) {
-    return 'odometer_km must be a non-negative number';
+  if (!Number.isFinite(reading.odometer_km) || reading.odometer_km < 0) {
+    return 'odometer_km must be a finite non-negative number';
   }
   if (typeof reading.charging !== 'boolean') {
     return 'charging must be a boolean';
   }
-  if (!Array.isArray(reading.fault_codes)) {
-    return 'fault_codes must be an array';
+  if (!Array.isArray(reading.fault_codes) || !reading.fault_codes.every(code => typeof code === 'string')) {
+    return 'fault_codes must be an array of strings';
   }
   return null;
 }
@@ -70,15 +83,37 @@ const upsertVehicleStmt = db.prepare(`
     @seq, @seq, 1, @updated_at
   )
   ON CONFLICT(vehicle_id) DO UPDATE SET
-    last_ts = CASE WHEN excluded.last_ts > vehicles.last_ts THEN excluded.last_ts ELSE vehicles.last_ts END,
-    last_seq = CASE WHEN excluded.last_ts > vehicles.last_ts THEN excluded.last_seq ELSE vehicles.last_seq END,
-    soc_pct = CASE WHEN excluded.last_ts > vehicles.last_ts THEN excluded.soc_pct ELSE vehicles.soc_pct END,
-    battery_temp_c = CASE WHEN excluded.last_ts > vehicles.last_ts THEN excluded.battery_temp_c ELSE vehicles.battery_temp_c END,
-    speed_kmh = CASE WHEN excluded.last_ts > vehicles.last_ts THEN excluded.speed_kmh ELSE vehicles.speed_kmh END,
-    lat = CASE WHEN excluded.last_ts > vehicles.last_ts THEN excluded.lat ELSE vehicles.lat END,
-    lng = CASE WHEN excluded.last_ts > vehicles.last_ts THEN excluded.lng ELSE vehicles.lng END,
-    odometer_km = CASE WHEN excluded.last_ts > vehicles.last_ts THEN excluded.odometer_km ELSE vehicles.odometer_km END,
-    charging = CASE WHEN excluded.last_ts > vehicles.last_ts THEN excluded.charging ELSE vehicles.charging END,
+    -- Documented deterministic ordering rule:
+    -- 1. Reading with strictly higher device timestamp (last_ts) wins.
+    -- 2. If device timestamps are equal, monotonic sequence counter (last_seq) breaks ties.
+    -- Server arrival time is NEVER used to determine current vehicle state.
+    last_ts = CASE 
+      WHEN excluded.last_ts > vehicles.last_ts OR (excluded.last_ts = vehicles.last_ts AND excluded.last_seq > vehicles.last_seq) 
+      THEN excluded.last_ts ELSE vehicles.last_ts END,
+    last_seq = CASE 
+      WHEN excluded.last_ts > vehicles.last_ts OR (excluded.last_ts = vehicles.last_ts AND excluded.last_seq > vehicles.last_seq) 
+      THEN excluded.last_seq ELSE vehicles.last_seq END,
+    soc_pct = CASE 
+      WHEN excluded.last_ts > vehicles.last_ts OR (excluded.last_ts = vehicles.last_ts AND excluded.last_seq > vehicles.last_seq) 
+      THEN excluded.soc_pct ELSE vehicles.soc_pct END,
+    battery_temp_c = CASE 
+      WHEN excluded.last_ts > vehicles.last_ts OR (excluded.last_ts = vehicles.last_ts AND excluded.last_seq > vehicles.last_seq) 
+      THEN excluded.battery_temp_c ELSE vehicles.battery_temp_c END,
+    speed_kmh = CASE 
+      WHEN excluded.last_ts > vehicles.last_ts OR (excluded.last_ts = vehicles.last_ts AND excluded.last_seq > vehicles.last_seq) 
+      THEN excluded.speed_kmh ELSE vehicles.speed_kmh END,
+    lat = CASE 
+      WHEN excluded.last_ts > vehicles.last_ts OR (excluded.last_ts = vehicles.last_ts AND excluded.last_seq > vehicles.last_seq) 
+      THEN excluded.lat ELSE vehicles.lat END,
+    lng = CASE 
+      WHEN excluded.last_ts > vehicles.last_ts OR (excluded.last_ts = vehicles.last_ts AND excluded.last_seq > vehicles.last_seq) 
+      THEN excluded.lng ELSE vehicles.lng END,
+    odometer_km = CASE 
+      WHEN excluded.last_ts > vehicles.last_ts OR (excluded.last_ts = vehicles.last_ts AND excluded.last_seq > vehicles.last_seq) 
+      THEN excluded.odometer_km ELSE vehicles.odometer_km END,
+    charging = CASE 
+      WHEN excluded.last_ts > vehicles.last_ts OR (excluded.last_ts = vehicles.last_ts AND excluded.last_seq > vehicles.last_seq) 
+      THEN excluded.charging ELSE vehicles.charging END,
     status = 'online',
     min_seq = MIN(vehicles.min_seq, excluded.min_seq),
     max_seq = MAX(vehicles.max_seq, excluded.max_seq),
@@ -247,9 +282,16 @@ function ingestBatch(readings) {
   }
 
   return {
+    total: readings.length,
     accepted,
     duplicates,
     rejected,
+    summary: {
+      total: readings.length,
+      accepted,
+      duplicates,
+      rejected
+    },
     results
   };
 }

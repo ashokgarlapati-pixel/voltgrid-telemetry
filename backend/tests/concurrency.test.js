@@ -103,6 +103,65 @@ describe('Part A1 Concurrency & Idempotency Tests (20 Concurrent Clients)', () =
     assert.strictEqual(Number(sumRow.total_recv), 50, 'vehicles.received_count sum must be exactly 50');
   });
 
+  test('Overlapping batches across multiple concurrent clients: shared readings deduplicated, unique readings accepted', async () => {
+    const prefix = `CONC-OVERLAP-${Date.now()}`;
+    // 10 shared readings common to all clients
+    const sharedReadings = Array.from({ length: 10 }, (_, i) => ({
+      vehicle_id: `${prefix}-SHARED-${String(i + 1).padStart(3, '0')}`,
+      seq: 1,
+      ts: '2026-11-20T12:00:00.000Z',
+      soc_pct: 80.0,
+      battery_temp_c: 30.0,
+      speed_kmh: 25.0,
+      lat: 13.08,
+      lng: 80.27,
+      odometer_km: 50.0,
+      charging: false,
+      fault_codes: []
+    }));
+
+    // 5 concurrent clients, each has the 10 shared readings + 10 distinct unique readings (20 total per client)
+    const clientBatches = Array.from({ length: 5 }, (_, clientIdx) => {
+      const uniqueReadings = Array.from({ length: 10 }, (_, i) => ({
+        vehicle_id: `${prefix}-CLIENT${clientIdx}-V${String(i + 1).padStart(3, '0')}`,
+        seq: 1,
+        ts: '2026-11-20T12:00:00.000Z',
+        soc_pct: 80.0,
+        battery_temp_c: 30.0,
+        speed_kmh: 25.0,
+        lat: 13.08,
+        lng: 80.27,
+        odometer_km: 50.0,
+        charging: false,
+        fault_codes: []
+      }));
+      return [...sharedReadings, ...uniqueReadings];
+    });
+
+    const responses = await Promise.all(clientBatches.map(batch => postSignedBatch(batch)));
+
+    let totalAccepted = 0;
+    let totalDuplicates = 0;
+
+    for (const res of responses) {
+      assert.strictEqual(res.status, 200);
+      totalAccepted += res.body.accepted;
+      totalDuplicates += res.body.duplicates;
+    }
+
+    // 10 shared + 5*10 unique = 60 unique total readings.
+    // 4 clients see the 10 shared readings as duplicates (4 * 10 = 40 duplicates).
+    assert.strictEqual(totalAccepted, 60, 'Exactly 60 unique readings must be accepted across all overlapping batches');
+    assert.strictEqual(totalDuplicates, 40, 'Exactly 40 duplicate readings must be reported');
+
+    // DB Verification
+    const countRow = db.prepare('SELECT COUNT(*) AS total FROM telemetry_history WHERE vehicle_id LIKE ?').get(`${prefix}%`);
+    assert.strictEqual(Number(countRow.total), 60, 'DB history must contain exactly 60 rows');
+
+    const sumRow = db.prepare('SELECT SUM(received_count) AS total_recv FROM vehicles WHERE vehicle_id LIKE ?').get(`${prefix}%`);
+    assert.strictEqual(Number(sumRow.total_recv), 60, 'DB vehicles received_count must equal 60 with zero double-counting');
+  });
+
   test('Concurrent out-of-order batches: final state strictly reflects highest device timestamp', async () => {
     const vid = `CONC-OOO-${Date.now()}`;
     const baseTime = Date.parse('2026-11-20T12:00:00.000Z');

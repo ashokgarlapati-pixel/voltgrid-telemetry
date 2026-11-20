@@ -83,7 +83,7 @@ All requests to `POST /v1/telemetry/batch` must include HMAC-SHA256 authenticati
 
 | Method | Endpoint | Description | Status Codes |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/v1/telemetry/batch` | Ingests up to 500 readings with individual validation & idempotency | `200` OK, `207` Multi-Status, `401` Unauthorized, `429` Rate Limited |
+| `POST` | `/v1/telemetry/batch` | Ingests up to 500 readings with individual validation & idempotency | `200` OK, `207` Multi-Status, `400` Bad Request, `401` Unauthorized, `429` Rate Limited |
 | `GET` | `/v1/vehicles` | Keyset-paginated vehicle listing (`?limit=50&cursor=VG-00042&status=online`) | `200` OK |
 | `GET` | `/v1/vehicles/:id/history` | Peak-preserving min/max downsampled time-series (`?from=&to=&points=200`) | `200` OK |
 | `GET` | `/v1/fleet/summary` | Sub-150ms fleet summary (aggregates only from `vehicles` & `alerts`) | `200` OK |
@@ -92,7 +92,29 @@ All requests to `POST /v1/telemetry/batch` must include HMAC-SHA256 authenticati
 | `GET` | `/v1/stream` | Server-Sent Events (SSE) live feed (supports `Last-Event-ID` resume) | `200` OK (`text/event-stream`) |
 | `GET` | `/health` | Service health status and timestamp | `200` OK |
 | `GET` | `/metrics` | Operational metrics (requests total, errors, uptime, DB row counts) | `200` OK |
-| `GET` | `/v1/completeness` | Fleet-wide packet sequence completeness percentage | `200` OK |
+| `GET` | `/v1/completeness` | Fleet-wide or single-vehicle sequence completeness & gap detection (`?vehicle_id=VG-00042`) | `200` OK, `404` Not Found |
+
+### Telemetry Field Validation Specification
+Every reading in `POST /v1/telemetry/batch` is individually validated using `Number.isFinite()` and strict bounds:
+* `vehicle_id`: Non-empty string (`trimmed length >= 1`).
+* `seq`: Non-negative integer (`Number.isInteger(seq) && seq >= 0`).
+* `ts`: Valid ISO-8601 timestamp string (`!isNaN(Date.parse(ts))`).
+* `soc_pct`: Finite percentage `[0.0, 100.0]`.
+* `battery_temp_c`: Finite temperature `[-40.0°C, 120.0°C]` (automotive thermal envelope).
+* `speed_kmh`: Finite speed `[0.0, 200.0] km/h`.
+* `lat` / `lng`: Finite coordinates `[-90.0, +90.0]` and `[-180.0, +180.0]`.
+* `odometer_km`: Finite non-negative number (`>= 0.0`).
+* `charging`: Strict boolean (`typeof charging === 'boolean'`).
+* `fault_codes`: Array containing only strings (`code => typeof code === 'string'`).
+
+### State Ordering & Tie-Breaking Specification
+* **Highest Device Timestamp**: Current vehicle state in `vehicles` always reflects the reading with the highest device `ts`, NOT server arrival time.
+* **Deterministic Tie-Breaking**: If two distinct readings from a vehicle have the exact same millisecond timestamp (`ts1 == ts2`), the higher sequence counter (`seq1 > seq2`) deterministically wins the state upsert. Server arrival order never alters state.
+
+### Sequence Gap Detection & Limitation
+* **Observed Interval Completeness**: Completeness is measured as:
+  $$\text{Completeness} = \frac{\text{received\_count}}{\text{max\_seq} - \text{min\_seq} + 1}$$
+* **Limitation Note**: Sequence gap tracking establishes completeness strictly within the observed interval $[\text{min\_seq}, \text{max\_seq}]$. Sequences dropped prior to the first observed reading cannot be determined without an external provisioning baseline (we do not assume sequence 0 or 1 without justification). Single-vehicle gaps are queryable via `GET /v1/completeness?vehicle_id=VG-xxx`.
 
 ---
 

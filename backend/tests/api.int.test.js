@@ -123,6 +123,147 @@ describe('Part A1, A4, A6 Integration Tests (Real Temp SQLite DB)', () => {
       const compBody = await compRes.json();
       assert.strictEqual(compRes.status, 200);
       assert.ok(compBody.completeness_pct <= 100);
+
+      // Verify detailed vehicle-level gap identification via GET /v1/completeness?vehicle_id=
+      const vCompRes = await fetch(`${baseUrl}/v1/completeness?vehicle_id=${vid}`);
+      assert.strictEqual(vCompRes.status, 200);
+      const vComp = await vCompRes.json();
+      assert.strictEqual(vComp.min_seq, 1);
+      assert.strictEqual(vComp.max_seq, 4);
+      assert.strictEqual(vComp.received_count, 3);
+      assert.strictEqual(vComp.expected_count, 4);
+      assert.strictEqual(vComp.missing_count, 1);
+      assert.deepStrictEqual(vComp.missing_sequences, [3]);
+      assert.strictEqual(vComp.completeness_pct, 75.0);
+    });
+
+    test('Deterministic tie-breaking: identical timestamp resolves by higher seq regardless of arrival order', async () => {
+      const vid = `VG-TIE-${Date.now()}`;
+      const sharedTs = '2026-11-20T10:00:00.000Z';
+
+      // Reading with lower seq (seq: 5, soc: 90)
+      const rLowerSeq = { vehicle_id: vid, seq: 5, ts: sharedTs, soc_pct: 90.0, battery_temp_c: 30, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] };
+      // Reading with higher seq (seq: 6, soc: 85)
+      const rHigherSeq = { vehicle_id: vid, seq: 6, ts: sharedTs, soc_pct: 85.0, battery_temp_c: 30, speed_kmh: 25, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] };
+
+      // Ingest lower seq first, then higher seq
+      await postSignedBatch([rLowerSeq]);
+      let vState = db.prepare('SELECT soc_pct, last_seq FROM vehicles WHERE vehicle_id = ?').get(vid);
+      assert.strictEqual(vState.last_seq, 5);
+      assert.strictEqual(vState.soc_pct, 90.0);
+
+      await postSignedBatch([rHigherSeq]);
+      vState = db.prepare('SELECT soc_pct, last_seq FROM vehicles WHERE vehicle_id = ?').get(vid);
+      assert.strictEqual(vState.last_seq, 6, 'Higher seq must win tie when device timestamps are equal');
+      assert.strictEqual(vState.soc_pct, 85.0);
+
+      // Now test inverted arrival on a second vehicle: higher seq arrives first, then lower seq arrives
+      const vid2 = `VG-TIE2-${Date.now()}`;
+      const rLower2 = { ...rLowerSeq, vehicle_id: vid2 };
+      const rHigher2 = { ...rHigherSeq, vehicle_id: vid2 };
+
+      await postSignedBatch([rHigher2]);
+      await postSignedBatch([rLower2]);
+
+      const vState2 = db.prepare('SELECT soc_pct, last_seq FROM vehicles WHERE vehicle_id = ?').get(vid2);
+      assert.strictEqual(vState2.last_seq, 6, 'Higher seq state must be preserved when lower seq arrives later');
+      assert.strictEqual(vState2.soc_pct, 85.0);
+    });
+
+    test('Batch size validation: enforces bounds [1, 500] and rejects malformed batch structure', async () => {
+      // Empty batch -> 400
+      const emptyRes = await postSignedBatch([]);
+      assert.strictEqual(emptyRes.status, 400, 'Empty batch must return HTTP 400');
+      assert.match(emptyRes.body.error, /Batch size must be between 1 and 500/);
+
+      // Single reading batch -> 200
+      const singleVid = `VG-SINGLE-${Date.now()}`;
+      const singleRes = await postSignedBatch([
+        { vehicle_id: singleVid, seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }
+      ]);
+      assert.strictEqual(singleRes.status, 200, 'Batch of 1 reading must return HTTP 200');
+      assert.strictEqual(singleRes.body.accepted, 1);
+
+      // Exactly 500 readings batch -> 200
+      const prefix500 = `VG-500-${Date.now()}`;
+      const batch500 = Array.from({ length: 500 }, (_, i) => ({
+        vehicle_id: `${prefix500}-${i}`,
+        seq: 1,
+        ts: '2026-11-20T10:00:00Z',
+        soc_pct: 80,
+        battery_temp_c: 25,
+        speed_kmh: 0,
+        lat: 13.08,
+        lng: 80.27,
+        odometer_km: 1,
+        charging: false,
+        fault_codes: []
+      }));
+      const res500 = await postSignedBatch(batch500);
+      assert.strictEqual(res500.status, 200, 'Batch of 500 readings must return HTTP 200');
+      assert.strictEqual(res500.body.accepted, 500);
+
+      // 501 readings batch -> 400
+      const batch501 = Array.from({ length: 501 }, (_, i) => ({
+        vehicle_id: `VG-501-${i}`,
+        seq: 1,
+        ts: '2026-11-20T10:00:00Z',
+        soc_pct: 80,
+        battery_temp_c: 25,
+        speed_kmh: 0,
+        lat: 13.08,
+        lng: 80.27,
+        odometer_km: 1,
+        charging: false,
+        fault_codes: []
+      }));
+      const res501 = await postSignedBatch(batch501);
+      assert.strictEqual(res501.status, 400, 'Batch of 501 readings must return HTTP 400');
+      assert.match(res501.body.error, /Batch size must be between 1 and 500/);
+    });
+
+    test('Field validation edge cases: rejects Infinity, NaN, negative odometer, invalid coordinates, bad fault_codes', async () => {
+      const vid = `VG-EDGE-${Date.now()}`;
+      const mixedBatch = [
+        // 0: Valid reading
+        { vehicle_id: vid, seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 90.0, battery_temp_c: 28.0, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        // 1: Null item
+        null,
+        // 2: Missing vehicle_id
+        { seq: 2, ts: '2026-11-20T10:00:05Z', soc_pct: 90.0, battery_temp_c: 28.0, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        // 3: Invalid timestamp
+        { vehicle_id: vid, seq: 3, ts: 'not-a-timestamp', soc_pct: 90.0, battery_temp_c: 28.0, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        // 4: soc_pct is Infinity
+        { vehicle_id: vid, seq: 4, ts: '2026-11-20T10:00:10Z', soc_pct: Infinity, battery_temp_c: 28.0, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        // 5: Latitude out of range (> 90)
+        { vehicle_id: vid, seq: 5, ts: '2026-11-20T10:00:15Z', soc_pct: 90.0, battery_temp_c: 28.0, speed_kmh: 15, lat: 95.0, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        // 6: Negative odometer
+        { vehicle_id: vid, seq: 6, ts: '2026-11-20T10:00:20Z', soc_pct: 90.0, battery_temp_c: 28.0, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: -5, charging: false, fault_codes: [] },
+        // 7: fault_codes contains non-string elements
+        { vehicle_id: vid, seq: 7, ts: '2026-11-20T10:00:25Z', soc_pct: 90.0, battery_temp_c: 28.0, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [123, null] },
+        // 8: Valid reading
+        { vehicle_id: vid, seq: 8, ts: '2026-11-20T10:00:30Z', soc_pct: 88.0, battery_temp_c: 29.0, speed_kmh: 18, lat: 13.09, lng: 80.28, odometer_km: 10.5, charging: false, fault_codes: ['P0A80'] }
+      ];
+
+      const res = await postSignedBatch(mixedBatch);
+      assert.strictEqual(res.status, 207, 'Mixed valid and invalid readings must return HTTP 207');
+      assert.strictEqual(res.body.accepted, 2);
+      assert.strictEqual(res.body.rejected, 7);
+      assert.strictEqual(res.body.results.length, 9);
+
+      // Verify original index preservation
+      assert.strictEqual(res.body.results[0].status, 'accepted');
+      assert.strictEqual(res.body.results[0].index, 0);
+
+      assert.strictEqual(res.body.results[1].status, 'rejected');
+      assert.strictEqual(res.body.results[1].index, 1);
+
+      assert.strictEqual(res.body.results[7].status, 'rejected');
+      assert.strictEqual(res.body.results[7].index, 7);
+      assert.strictEqual(res.body.results[7].error, 'fault_codes must be an array of strings');
+
+      assert.strictEqual(res.body.results[8].status, 'accepted');
+      assert.strictEqual(res.body.results[8].index, 8);
     });
   });
 

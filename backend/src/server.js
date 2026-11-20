@@ -93,11 +93,61 @@ app.post('/v1/telemetry/batch', hmacAuth, rateLimiter, (req, res) => {
 
 /**
  * GET /v1/completeness
- * Calculates fleet-wide sequence completeness:
+ * Calculates sequence completeness fleet-wide or for an individual vehicle:
  * total_received vs total_expected = SUM(max_seq - min_seq + 1)
  */
 app.get('/v1/completeness', (req, res) => {
   try {
+    const { vehicle_id } = req.query;
+
+    if (vehicle_id) {
+      const v = db.prepare(`
+        SELECT vehicle_id, min_seq, max_seq, received_count, updated_at
+        FROM vehicles
+        WHERE vehicle_id = ?
+      `).get(vehicle_id);
+
+      if (!v) {
+        return res.status(404).json({ error: `Vehicle ${vehicle_id} not found` });
+      }
+
+      const expectedCount = v.max_seq - v.min_seq + 1;
+      const missingCount = Math.max(0, expectedCount - v.received_count);
+      const completenessPct = expectedCount > 0
+        ? Number(((v.received_count / expectedCount) * 100).toFixed(2))
+        : 100.0;
+
+      // Identify specific missing sequence numbers within observed [min_seq, max_seq] range
+      let missingSequences = [];
+      if (missingCount > 0 && expectedCount <= 5000) {
+        const rows = db.prepare(`
+          SELECT seq FROM telemetry_history
+          WHERE vehicle_id = ? AND seq >= ? AND seq <= ?
+          ORDER BY seq ASC
+        `).all(vehicle_id, v.min_seq, v.max_seq);
+
+        const seenSeqs = new Set(rows.map(r => r.seq));
+        for (let s = v.min_seq; s <= v.max_seq; s++) {
+          if (!seenSeqs.has(s)) {
+            missingSequences.push(s);
+            if (missingSequences.length >= 100) break;
+          }
+        }
+      }
+
+      return res.json({
+        vehicle_id: v.vehicle_id,
+        min_seq: v.min_seq,
+        max_seq: v.max_seq,
+        received_count: v.received_count,
+        expected_count: expectedCount,
+        missing_count: missingCount,
+        missing_sequences: missingSequences,
+        completeness_pct: completenessPct,
+        note: 'Completeness is measured strictly within the observed range [min_seq, max_seq]. Missing sequences prior to min_seq cannot be inferred without an external baseline.'
+      });
+    }
+
     const row = db.prepare(`
       SELECT 
         COUNT(*) AS total_vehicles,

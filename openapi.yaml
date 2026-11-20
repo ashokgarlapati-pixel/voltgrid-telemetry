@@ -104,6 +104,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/BatchResponse'
+        '400':
+          description: Bad Request; batch size must be between 1 and 500, or payload format is invalid
         '401':
           description: Unauthorized; missing or invalid HMAC signature or expired timestamp window
         '429':
@@ -112,6 +114,29 @@ paths:
             Retry-After:
               schema:
                 type: integer
+
+  /v1/completeness:
+    get:
+      summary: Sequence gap completeness metrics
+      description: >
+        Calculates fleet-wide sequence completeness or detailed sequence gap detection
+        for an individual vehicle within the observed range [min_seq, max_seq].
+      parameters:
+        - in: query
+          name: vehicle_id
+          required: false
+          schema:
+            type: string
+            example: VG-00042
+      responses:
+        '200':
+          description: Completeness metrics
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: Vehicle not found
 
   /v1/vehicles:
     get:
@@ -376,6 +401,18 @@ components:
     BatchResponse:
       type: object
       properties:
+        total:
+          type: integer
+          example: 3
+        accepted:
+          type: integer
+          example: 2
+        duplicates:
+          type: integer
+          example: 0
+        rejected:
+          type: integer
+          example: 1
         summary:
           type: object
           properties:
@@ -394,8 +431,15 @@ components:
             properties:
               index:
                 type: integer
+                example: 0
               status:
                 type: string
                 enum: [accepted, duplicate, rejected]
-              reason:
+              vehicle_id:
+                type: string
+                example: VG-00417
+              seq:
+                type: integer
+                example: 1
+              error:
                 type: string
