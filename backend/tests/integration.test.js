@@ -109,6 +109,45 @@ async function runTests() {
   assert.strictEqual(offAlerts.body.total, 1, 'Offline alert should be automatically resolved on new reading');
   console.log('✓ Offline detection and automatic resolution verified.');
 
+  // --- Test 4: Concurrency & Idempotency Test (20 concurrent clients firing identical batch) ---
+  console.log('\n[Integration 4] Concurrency & Idempotency (20 simultaneous clients firing the same batch)...');
+  const concId = `TEST-CONC-${runSuffix}`;
+  const concurrentBatch = Array.from({ length: 25 }, (_, i) => ({
+    vehicle_id: `${concId}-${i}`,
+    seq: 1,
+    ts: '2026-11-20T11:30:00Z',
+    soc_pct: 75.0,
+    battery_temp_c: 30.0,
+    speed_kmh: 35.0,
+    lat: 13.0827,
+    lng: 80.2707,
+    odometer_km: 50.0,
+    charging: false,
+    fault_codes: []
+  }));
+
+  // Fire 20 concurrent client requests simultaneously
+  const concurrentClients = 20;
+  const promises = Array.from({ length: concurrentClients }, () => postBatch(concurrentBatch));
+  const results = await Promise.all(promises);
+
+  let totalAccepted = 0;
+  let totalDuplicates = 0;
+  for (const r of results) {
+    assert.strictEqual(r.status, 200);
+    totalAccepted += r.body.accepted;
+    totalDuplicates += r.body.duplicates;
+  }
+
+  // Exactly 25 readings must be accepted in total; remaining 475 must be marked duplicate
+  assert.strictEqual(totalAccepted, 25, 'Exactly 25 readings should be accepted across all 20 concurrent clients');
+  assert.strictEqual(totalDuplicates, 25 * (concurrentClients - 1), 'Remaining 475 readings must be identified as duplicates');
+
+  const db = require('../src/db');
+  const countRow = db.prepare('SELECT COUNT(*) AS c FROM telemetry_history WHERE vehicle_id LIKE ?').get(`${concId}%`);
+  assert.strictEqual(Number(countRow.c), 25, 'Database must store exactly 25 history rows (zero duplicates)');
+  console.log(`✓ 20 concurrent clients verified: ${totalAccepted} accepted, ${totalDuplicates} duplicates, 0 double-counts in DB.`);
+
   console.log('\n' + '='.repeat(70));
   console.log('ALL INTEGRATION TESTS PASSED PERFECTLY! 🚀');
   console.log('='.repeat(70));
