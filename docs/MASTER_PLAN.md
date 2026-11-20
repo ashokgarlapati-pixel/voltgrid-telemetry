@@ -1,6 +1,6 @@
-# VoltGrid Fleet Telemetry Service — Master Plan & Tutorial Guide (Phase 1, Phase 2 & Phase 3)
+# VoltGrid Fleet Telemetry Service — Master Plan & Tutorial Guide (Phases 1 to 4)
 
-This document is the complete architectural master plan and tutorial guide for **Phase 1** (Batch Ingestion, SQLite Storage, and Messy Traffic Simulator), **Phase 2** (Order-Independent Alert Engine, Alert Lifecycle, and Offline Detection Worker), and **Phase 3** (Query API, Keyset Pagination, Peak-Preserving Downsampling, Optimistic Concurrency, and Observability) of the VoltGrid Fleet Telemetry Service.
+This document is the complete architectural master plan and tutorial guide for **Phase 1** (Batch Ingestion, SQLite Storage, and Messy Traffic Simulator), **Phase 2** (Order-Independent Alert Engine, Alert Lifecycle, and Offline Detection Worker), **Phase 3** (Query API, Keyset Pagination, Peak-Preserving Downsampling, Optimistic Concurrency, and Observability), and **Phase 4** (HMAC Authentication, Replay Protection, Distributed Token-Bucket Rate Limiting, and Live SSE Streaming) of the VoltGrid Fleet Telemetry Service.
 
 Use this guide to explain the system end-to-end during code reviews, interviews, and technical demonstrations.
 
@@ -799,4 +799,172 @@ USE TEMP B-TREE FOR GROUP BY
 ### Q6: "How does your observability implementation aid in diagnosing production incidents?"
 > **Answer**:
 > *"Every incoming request is tagged with an `X-Request-Id` (propagating upstream client headers or generating a UUID), which is returned in the response header and embedded in every single-line structured JSON log. If a client reports a 500 error or unexpected 409 conflict, engineers can instantly grep the exact `request_id` across centralized log collectors to view exact execution duration, path, and database state."*
+
+<br/><br/>
+
+---
+
+# 🔐 PHASE 4: AUTH, RATE LIMITING (PART A2) & LIVE SSE STREAM (PART A5)
+
+---
+
+## 17. Phase 4 Architecture & Design Goals
+
+Phase 4 secures and exposes the VoltGrid Fleet Telemetry backend for real-world production deployment:
+1. **HMAC-SHA256 Authentication (Part A2)**: Validates per-device-group signatures over payload and timestamp, protecting against unauthorized access and data tampering.
+2. **Replay Protection & Drift Window (Part A2)**: Enforces a strict 5-minute validity window on device timestamps and logs seen signatures in SQLite to permanently block replay attacks.
+3. **Distributed Token-Bucket Rate Limiter (Part A2)**: Uses an atomic SQLite-backed token bucket algorithm (`rate_limits`) that stays consistent across multiple API worker instances, emitting `HTTP 429` with accurate `Retry-After` headers upon burst exhaustion.
+4. **Live SSE Streaming Feed (Part A5)**: Streams vehicle updates and alert changes over Server-Sent Events (`GET /v1/stream`) with monotonically increasing `id` headers.
+5. **Last-Event-ID Resume Support (Part A5)**: Maintains a 1,000-event in-memory ring buffer to immediately replay missed events upon client reconnection.
+6. **1-Second Update Coalescing (Part A5)**: Consolidates high-frequency telemetry (~400 readings/sec) into a periodic `vehicle_batch` frame once every 1,000ms, while pushing critical alert lifecycle events immediately.
+7. **Client Back-Pressure & Memory Safeguard (Part A5)**: Pauses writes when client TCP socket buffers fill (`res.write() === false`), skipping coalesced telemetry frames until `drain`, and cleanly disconnecting persistently stalled clients after 10 dropped flushes.
+
+```mermaid
+flowchart TD
+    subgraph ClientLayer ["Client & Simulator Layer"]
+        SIM["Simulator / Device Gateway"]
+        DASH["Operator Dashboard (Browser)"]
+    end
+
+    subgraph SecurityLayer ["Security Middleware (security.js — Part A2)"]
+        AUTH["1. hmacAuth Middleware\n- Headers: X-API-Key, X-Timestamp, X-Signature\n- 5-Min Window Check\n- HMAC-SHA256 Timing-Safe Comparison\n- Atomic used_nonces Insertion (Replay Check)"]
+        RL["2. rateLimiter Middleware\n- Distributed Token Bucket\n- Fractional Refill Calculation\n- Shared SQLite rate_limits Table\n- HTTP 429 + Retry-After Header"]
+    end
+
+    subgraph IngestAPI ["Ingestion API (server.js & ingestion.js)"]
+        BATCH["POST /v1/telemetry/batch (Up to 500 items)"]
+        NOTIFY_V["publishVehicleUpdate(vehicle)"]
+        NOTIFY_A["publishAlertChange(alert)"]
+    end
+
+    subgraph StreamHub ["Live SSE Stream Hub (stream.js — Part A5)"]
+        SSE_EP["GET /v1/stream (Server-Sent Events)"]
+        RING["1,000-Event In-Memory Ring Buffer"]
+        COALESCE["1,000ms Interval Coalescer\n(pendingVehicles Map -> vehicle_batch)"]
+        BP["Adaptive Back-Pressure & Drain Listener\n(Max 10 Dropped Flushes -> Clean Drop)"]
+        HB["15-Second Heartbeat (: heartbeat)"]
+    end
+
+    SIM -->|Signed Request| AUTH
+    AUTH -->|401 Unauthorized if invalid/replayed| SIM
+    AUTH -->|Valid| RL
+    RL -->|429 Rate Limited if tokens < 1| SIM
+    RL -->|Token Consumed| BATCH
+
+    BATCH --> NOTIFY_V
+    BATCH --> NOTIFY_A
+
+    NOTIFY_V --> COALESCE
+    NOTIFY_A -->|Immediate Alert Event| RING
+
+    COALESCE --> RING
+    RING --> BP
+    HB --> BP
+    BP -->|SSE Frames: id, event, data| DASH
+    DASH -.->|Reconnect with Last-Event-ID| SSE_EP
+    SSE_EP -.->|Replay Missed Events| DASH
+```
+
+---
+
+## 18. HMAC Authentication & Replay Protection (Part A2)
+
+### 1. Request Signing Scheme
+Every request sent to `POST /v1/telemetry/batch` must include three HTTP headers:
+* `X-API-Key`: Identifies the device group (e.g. `'voltgrid-dev-key'`).
+* `X-Timestamp`: Epoch millisecond timestamp or ISO date string generated at request creation.
+* `X-Signature`: Hex-encoded HMAC-SHA256 computed as:
+  $$\text{Signature} = \text{HMAC-SHA256}(\text{Secret}, \, \text{Timestamp} \mathbin{\Vert} \text{"."} \mathbin{\Vert} \text{RawBody})$$
+
+### 2. Verification Steps (`backend/src/security.js`)
+1. **Header Validation**: Checks presence of all 3 headers; returns `401 Unauthorized` if missing.
+2. **Credential Lookup**: Retrieves `secret`, `rate_limit_per_sec`, and `burst_capacity` from `api_keys` table.
+3. **5-Minute Validity Window**:
+   $$|\text{ServerTime} - \text{Timestamp}| \le 300{,}000\text{ ms}$$
+   Any request with a timestamp older than 5 minutes or ahead of server time by more than 5 minutes is rejected with `401`.
+4. **Timing-Safe HMAC Comparison**: Computes the expected HMAC-SHA256 over `${timestamp}.${rawBody}` using the secret, and compares buffers via `crypto.timingSafeEqual` to prevent side-channel timing attacks.
+5. **Atomic Replay Nonce Check**:
+   In an atomic `BEGIN IMMEDIATE` transaction:
+   * Deletes expired nonces (`expires_at < now`).
+   * Attempts `INSERT OR IGNORE INTO used_nonces (signature, expires_at) VALUES (?, now + 300000)`.
+   * If `changes === 0`, the signature was already processed; the request is rejected with `HTTP 401: "Replayed request signature"`.
+
+---
+
+## 19. Distributed Token-Bucket Rate Limiter (Part A2)
+
+### Why In-Memory Counters Fail Across Load Balancers
+In a production deployment, multiple instances of the API run behind an Nginx or ALB load balancer. In-memory counters (e.g. Node variables or local maps) allow a client to send double or triple their allowed rate simply by alternating requests between instances.
+
+### Shared Database Token Bucket Algorithm
+We store token bucket state in SQLite inside the `rate_limits` table:
+```sql
+CREATE TABLE IF NOT EXISTS rate_limits (
+    api_key TEXT PRIMARY KEY,
+    tokens REAL NOT NULL,
+    last_refill_ms INTEGER NOT NULL
+);
+```
+
+When a request arrives:
+1. In an atomic `BEGIN IMMEDIATE` transaction, fetch `(tokens, last_refill_ms)`.
+2. Compute elapsed time in seconds: $\Delta t = \max(0, (\text{now} - \text{last\_refill\_ms}) / 1000)$.
+3. Compute refilled tokens:
+   $$\text{refilled} = \min\left(\text{burst\_capacity}, \; \text{tokens} + \Delta t \times \text{rate\_limit\_per\_sec}\right)$$
+4. **Decision Logic**:
+   * If $\text{refilled} < 1$: The client has exhausted their allowance.
+     $$\text{retry\_after\_sec} = \max\left(1, \; \left\lceil \frac{1 - \text{refilled}}{\text{rate\_limit\_per\_sec}} \right\rceil\right)$$
+     The transaction rolls back, response header `Retry-After: <sec>` is set, and the API returns `HTTP 429 Too Many Requests`.
+   * If $\text{refilled} \ge 1$: Deduct 1 token ($\text{tokens} = \text{refilled} - 1$), update `last_refill_ms = now`, commit, and proceed to handler.
+
+---
+
+## 20. Live SSE Streaming Engine (Part A5)
+
+### 1. Monotonic Event IDs & Last-Event-ID Resume
+* Every dispatched event increments a global monotonic integer `nextEventId`.
+* An in-memory ring buffer retains the last 1,000 events (`{ id, type, data }`).
+* When a dashboard client disconnects (cellular blip, WiFi handoff) and reconnects to `GET /v1/stream` with a `Last-Event-ID` header (or `?lastEventId=` query parameter):
+  The server iterates the ring buffer and immediately streams all missed events where $\text{event.id} > \text{lastEventId}$.
+  This guarantees **zero lost events and zero duplicate events** across reconnects.
+
+### 2. High-Frequency Update Coalescing
+At full scale, 2,000 vehicles transmitting every 5 seconds produce **400 readings per second**. Sending 400 SSE messages per second to every connected browser client would overwhelm browser JavaScript event loops and crash browser tabs.
+* **Coalescing Strategy**: Incoming vehicle readings are stored in `pendingVehicles = new Map<vehicle_id, vehicle>()`.
+* A 1,000ms background timer drains the map and emits a single, consolidated `vehicle_batch` event containing the latest known state for each reporting vehicle.
+* **Alert Lifecycle Exemption**: Critical alert events (`alert_change` on open, acknowledge, resolve) bypass coalescing and are dispatched **immediately**.
+
+### 3. Adaptive Back-Pressure & Slow-Client Protection
+* When transmitting to a client, `res.write(payload)` returns `false` if the client's TCP socket buffer is full.
+* The client is marked `isPaused = true`.
+* While paused, the server drops non-critical periodic `vehicle_batch` frames for that client, preventing unbound memory growth.
+* A listener on `res.once('drain')` resets `isPaused = false` as soon as the client catches up.
+* If a stalled client fails to drain after **10 consecutive flushes** (10 seconds), the server cleanly terminates the socket (`res.end()`) to safeguard host memory.
+
+---
+
+## 21. Live Review Defense Guide — Phase 4 (Cheatsheet)
+
+### Q1: "How does your rate limiter stay correct if two instances of your API run behind a load balancer?"
+> **Answer**:
+> *"Instead of keeping in-memory counters per process, rate limit tokens are stored in the shared `rate_limits` table (`tokens REAL`, `last_refill_ms INTEGER`). Every rate limit check runs inside a `BEGIN IMMEDIATE` transaction in `security.js`. SQLite's write lock serializes the check across both API instances, calculating token refills and decrements atomically. Neither instance can over-allocate tokens or overwrite the other's refills."*
+
+### Q2: "A client reconnects to the SSE stream. How do you know it has not missed or doubled an event?"
+> **Answer**:
+> *"Each SSE event emitted carries a strictly monotonic integer `id: <num>`. Our stream hub (`stream.js`) stores the last 1,000 events in an in-memory ring buffer. When a client reconnects, it sends the standard `Last-Event-ID: <num>` header. The server queries the ring buffer and replays strictly those events with `id > Last-Event-ID`. Events with `id <= Last-Event-ID` are omitted, guaranteeing neither missed nor duplicated events."*
+
+### Q3: "What happens if a vehicle clock drifts by 25 seconds? What if it's wrong by a day?"
+> **Answer**:
+> *"1. If a clock drifts by 25 seconds, it falls well within our 5-minute validity window ($\pm 300$s). The HMAC timestamp check succeeds, and `ingestion.js` uses device timestamp `ts` for vehicle state ordering while recording current server time in `received_at`.
+> 2. If a vehicle clock is wrong by a day, the request timestamp fails the 5-minute window check:
+> `Math.abs(Date.now() - reqTimeMs) > 300000`
+> The request is rejected with `HTTP 401 Unauthorized` ('Request timestamp is outside the allowed 5-minute window'), protecting against replayed stale packets."*
+
+### Q4: "How does your system prevent 400 readings/sec from freezing connected browser dashboards?"
+> **Answer**:
+> *"In `backend/src/stream.js`, we coalesce vehicle telemetry using a `Map<vehicle_id, vehicle>`. Rather than firing individual messages per reading, an interval flushes once per second as a single `vehicle_batch` SSE event. Dashboards receive 1 coalesced update per second instead of 400 separate events, reducing browser DOM reflows and WebSocket/SSE parser overhead by 400x."*
+
+### Q5: "What happens if a slow mobile client stops reading from the SSE socket?"
+> **Answer**:
+> *"Node's `res.write()` returns `false` when the underlying TCP write buffer fills up. Our client wrapper flags the connection as `isPaused = true` and attaches a `drain` listener. While paused, periodic `vehicle_batch` frames are dropped for that client, preventing unbounded buffering in Node process memory. If the client fails to drain for more than 10 consecutive flushes (10 seconds), the connection is terminated cleanly (`res.end()`)."*
 

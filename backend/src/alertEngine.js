@@ -1,4 +1,5 @@
 const db = require('./db');
+const { publishAlertChange } = require('./stream');
 
 /**
  * Operating polygon coordinates for geofence rule (around Chennai city center).
@@ -260,12 +261,16 @@ function evaluateVehicleAlerts(vehicleId, nowIso = new Date().toISOString()) {
     if (outcome.triggered) {
       if (!activeAlert) {
         // No active alert exists -> Open new alert (version = 1, status = 'open')
-        insertAlertStmt.run({
+        const insertInfo = insertAlertStmt.run({
           vehicle_id: vehicleId,
           rule: ruleName,
           details: JSON.stringify(outcome.details || {}),
           now: nowIso
         });
+        const newAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(insertInfo.lastInsertRowid);
+        if (newAlert) {
+          publishAlertChange(newAlert);
+        }
       }
       // If already open or acknowledged, do not create a duplicate
     } else if (outcome.resolved) {
@@ -276,6 +281,10 @@ function evaluateVehicleAlerts(vehicleId, nowIso = new Date().toISOString()) {
           details: JSON.stringify(outcome.details || {}),
           now: nowIso
         });
+        const resolvedAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(activeAlert.id);
+        if (resolvedAlert) {
+          publishAlertChange(resolvedAlert);
+        }
       }
     }
   }

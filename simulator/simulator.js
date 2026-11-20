@@ -10,7 +10,11 @@
  * Uses standard Node.js native fetch (no external npm dependencies required).
  */
 
+const crypto = require('crypto');
+
 const API_URL = process.env.API_URL || 'http://localhost:3000/v1/telemetry/batch';
+const API_KEY = process.env.API_KEY || 'voltgrid-dev-key';
+const API_SECRET = process.env.API_SECRET || 'voltgrid-dev-secret';
 const NUM_VEHICLES = parseInt(process.env.NUM_VEHICLES || '2000', 10);
 const REPORT_INTERVAL_MS = parseInt(process.env.REPORT_INTERVAL_MS || '5000', 10);
 const DUPLICATE_RATE = parseFloat(process.env.DUPLICATE_RATE || '0.05');
@@ -136,14 +140,23 @@ function corruptPayload(reading) {
 }
 
 /**
- * Sends a single batch via HTTP POST to the ingestion API
+ * Sends a single batch via HTTP POST to the ingestion API, signed with HMAC-SHA256
  */
 async function sendBatch(batch) {
   try {
+    const rawBody = JSON.stringify(batch);
+    const timestamp = Date.now().toString();
+    const signature = crypto.createHmac('sha256', API_SECRET).update(`${timestamp}.${rawBody}`).digest('hex');
+
     const res = await fetch(API_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(batch)
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': API_KEY,
+        'X-Timestamp': timestamp,
+        'X-Signature': signature
+      },
+      body: rawBody
     });
 
     const body = await res.json();
@@ -159,6 +172,9 @@ async function sendBatch(batch) {
         `-> Accepted: ${body.accepted}, Duplicates: ${body.duplicates}, Rejected: ${body.rejected} ` +
         `| DelayedQueue: ${delayedQueue.length}`
       );
+    } else if (res.status === 429) {
+      const retryAfter = res.headers.get('retry-after') || '1';
+      console.warn(`[Simulator] Rate limit exceeded (HTTP 429)! Backing off for ${retryAfter}s`);
     } else {
       console.warn(`[Simulator] Batch returned unexpected status HTTP ${res.status}:`, body);
     }

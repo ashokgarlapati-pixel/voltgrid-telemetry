@@ -1,4 +1,5 @@
 const db = require('./db');
+const { publishAlertChange } = require('./stream');
 
 let workerInterval = null;
 
@@ -48,7 +49,7 @@ const checkOfflineVehicles = db.transaction((cutoffIso, nowIso) => {
     const activeAlert = getActiveOfflineAlertStmt.get(v.vehicle_id);
     if (!activeAlert) {
       const silenceSec = Math.round((Date.now() - Date.parse(v.updated_at)) / 1000);
-      insertOfflineAlertStmt.run({
+      const insertInfo = insertOfflineAlertStmt.run({
         vehicle_id: v.vehicle_id,
         details: JSON.stringify({
           silence_seconds: silenceSec,
@@ -57,6 +58,10 @@ const checkOfflineVehicles = db.transaction((cutoffIso, nowIso) => {
         }),
         now: nowIso
       });
+      const newAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(insertInfo.lastInsertRowid);
+      if (newAlert) {
+        publishAlertChange(newAlert);
+      }
       newlyOfflineCount++;
     }
   }

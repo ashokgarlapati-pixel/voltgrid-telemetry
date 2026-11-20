@@ -1,4 +1,5 @@
 const db = require('./db');
+const { publishAlertChange } = require('./stream');
 
 /**
  * Downsamples time-series telemetry rows while preserving peaks and troughs.
@@ -272,6 +273,9 @@ function ackAlertHandler(req, res) {
     if (updateResult.changes === 1) {
       // Successfully updated; fetch and return latest state
       const updatedAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(id);
+      if (updatedAlert) {
+        publishAlertChange(updatedAlert);
+      }
       return res.status(200).json({
         message: 'Alert acknowledged successfully',
         alert: {

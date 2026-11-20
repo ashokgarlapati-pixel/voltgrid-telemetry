@@ -9,6 +9,8 @@ const {
   getFleetSummaryHandler,
   ackAlertHandler
 } = require('./queries');
+const { hmacAuth, rateLimiter } = require('./security');
+const { sseStreamHandler } = require('./stream');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,8 +18,13 @@ const PORT = process.env.PORT || 3000;
 // Observability: attach/generate X-Request-Id and log structured JSON per request
 app.use(requestIdMiddleware);
 
-// Middleware for parsing JSON with generous payload limit for batches of 500
-app.use(express.json({ limit: '10mb' }));
+// Middleware for parsing JSON with rawBody preservation for HMAC signature verification
+app.use(express.json({
+  limit: '10mb',
+  verify: (req, res, buf) => {
+    req.rawBody = buf.toString('utf8');
+  }
+}));
 
 // Handle invalid JSON body syntax errors gracefully
 app.use((err, req, res, next) => {
@@ -48,8 +55,9 @@ app.get('/metrics', getMetricsHandler);
  * POST /v1/telemetry/batch
  * Ingests a batch of up to 500 telemetry readings with individual validation,
  * database-level idempotency, and timestamp-based vehicle state updating.
+ * Protected by HMAC authentication and distributed token-bucket rate limiting.
  */
-app.post('/v1/telemetry/batch', (req, res) => {
+app.post('/v1/telemetry/batch', hmacAuth, rateLimiter, (req, res) => {
   let readings;
 
   // Accept direct array or { readings: [...] } object
@@ -210,6 +218,17 @@ app.get('/v1/fleet/summary', getFleetSummaryHandler);
  * Optimistic concurrency acknowledgment for an alert (returns 409 on version conflict)
  */
 app.post('/v1/alerts/:id/ack', ackAlertHandler);
+
+/* ==========================================================================
+   PART A5: LIVE STREAMING (SERVER-SENT EVENTS)
+   ========================================================================== */
+
+/**
+ * GET /v1/stream
+ * Live Server-Sent Events (SSE) feed for coalesced vehicle updates and alert changes.
+ * Supports Last-Event-ID reconnection, client backpressure, and heartbeat keep-alive.
+ */
+app.get('/v1/stream', sseStreamHandler);
 
 // Start Express server
 const server = app.listen(PORT, () => {

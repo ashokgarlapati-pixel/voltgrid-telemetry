@@ -1,5 +1,6 @@
 const db = require('./db');
 const { evaluateAlertsForVehicles } = require('./alertEngine');
+const { publishVehicleUpdate, publishAlertChange } = require('./stream');
 
 /**
  * Validates a single telemetry reading according to Phase 1 rules.
@@ -160,10 +161,17 @@ const executeBatchTransaction = db.transaction((validItems, nowIso) => {
     });
 
     // Resolve any active 'offline' alert as the vehicle is now actively reporting
-    resolveOfflineAlertStmt.run({
-      vehicle_id: reading.vehicle_id,
-      now: nowIso
-    });
+    const activeOffline = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline' AND status != 'resolved'").get(reading.vehicle_id);
+    if (activeOffline) {
+      resolveOfflineAlertStmt.run({
+        vehicle_id: reading.vehicle_id,
+        now: nowIso
+      });
+      const resolvedAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(activeOffline.id);
+      if (resolvedAlert) {
+        publishAlertChange(resolvedAlert);
+      }
+    }
 
     transactionResults.push({
       index,
@@ -227,6 +235,14 @@ function ingestBatch(readings) {
     // Step 3: Trigger order-independent alert rule evaluation for vehicles with new readings
     if (txResult.acceptedVehicleIds && txResult.acceptedVehicleIds.size > 0) {
       evaluateAlertsForVehicles(txResult.acceptedVehicleIds, nowIso);
+
+      // Publish latest vehicle state to SSE stream (coalesced 1s buffer)
+      for (const vid of txResult.acceptedVehicleIds) {
+        const v = db.prepare('SELECT * FROM vehicles WHERE vehicle_id = ?').get(vid);
+        if (v) {
+          publishVehicleUpdate(v);
+        }
+      }
     }
   }
 

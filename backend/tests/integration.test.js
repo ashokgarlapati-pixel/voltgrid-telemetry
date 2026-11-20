@@ -3,25 +3,44 @@
  */
 
 const assert = require('assert');
+const crypto = require('crypto');
+
+// Use port 3001 for integration tests so it doesn't conflict with any running server on 3000
+process.env.PORT = process.env.TEST_PORT || '3001';
 const { app, server } = require('../src/server');
 const { runOfflineCheck } = require('../src/offlineWorker');
 
+const API_KEY = 'voltgrid-dev-key';
+const API_SECRET = 'voltgrid-dev-secret';
+let reqNonce = 0;
+
 async function runTests() {
   console.log('='.repeat(70));
-  console.log('RUNNING PHASE 2 END-TO-END INTEGRATION TESTS');
+  console.log('RUNNING VOLTGRID END-TO-END INTEGRATION TESTS');
   console.log('='.repeat(70));
 
   const PORT = process.env.PORT || 3000;
   const baseUrl = `http://localhost:${PORT}`;
 
-  // Helper to post batch
-  async function postBatch(readings) {
+  // Helper to post batch with valid HMAC headers by default
+  async function postBatch(readings, headersOverride = null) {
+    const rawBody = JSON.stringify(readings);
+    const timestamp = (Date.now() + (++reqNonce)).toString();
+    const signature = crypto.createHmac('sha256', API_SECRET).update(`${timestamp}.${rawBody}`).digest('hex');
+
+    const headers = headersOverride || {
+      'Content-Type': 'application/json',
+      'X-API-Key': API_KEY,
+      'X-Timestamp': timestamp,
+      'X-Signature': signature
+    };
+
     const res = await fetch(`${baseUrl}/v1/telemetry/batch`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(readings)
+      headers,
+      body: rawBody
     });
-    return { status: res.status, body: await res.json() };
+    return { status: res.status, headers: res.headers, body: await res.json() };
   }
 
   // Helper to query alerts
@@ -230,6 +249,78 @@ async function runTests() {
   assert.ok(typeof metrics.requests_total === 'number');
   assert.ok(typeof metrics.database.vehicles_total === 'number');
   console.log(`✓ Metrics endpoint verified (Uptime: ${metrics.uptime_sec}s, Requests: ${metrics.requests_total}).`);
+
+  // --- Test 10: HMAC Authentication & Replay Protection (Part A2) ---
+  console.log('\n[Integration 10] HMAC Authentication & Replay Protection...');
+  // 10a. Unsigned request -> 401
+  const unsignedRes = await postBatch([], { 'Content-Type': 'application/json' });
+  assert.strictEqual(unsignedRes.status, 401, 'Unsigned request must be rejected with 401');
+
+  // 10b. Invalid HMAC signature -> 401
+  const badSigRes = await postBatch([], {
+    'Content-Type': 'application/json',
+    'X-API-Key': API_KEY,
+    'X-Timestamp': Date.now().toString(),
+    'X-Signature': 'deadbeef00000000000000000000000000000000000000000000000000000000'
+  });
+  assert.strictEqual(badSigRes.status, 401, 'Tampered HMAC signature must return 401');
+
+  // 10c. Expired timestamp (> 5 mins) -> 401
+  const expiredTs = (Date.now() - 6 * 60 * 1000).toString();
+  const expiredSig = crypto.createHmac('sha256', API_SECRET).update(`${expiredTs}.[]`).digest('hex');
+  const expiredRes = await postBatch([], {
+    'Content-Type': 'application/json',
+    'X-API-Key': API_KEY,
+    'X-Timestamp': expiredTs,
+    'X-Signature': expiredSig
+  });
+  assert.strictEqual(expiredRes.status, 401, 'Stale timestamp outside 5-minute window must return 401');
+
+  // 10d. Replay protection: Resending the exact same signature must be blocked
+  const replayId = `TEST-REP-${runSuffix}`;
+  const replayBatch = [
+    { vehicle_id: replayId, seq: 1, ts: '2026-11-20T11:00:00Z', soc_pct: 60, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] }
+  ];
+  const rTs = Date.now().toString();
+  const rRaw = JSON.stringify(replayBatch);
+  const rSig = crypto.createHmac('sha256', API_SECRET).update(`${rTs}.${rRaw}`).digest('hex');
+  const rHeaders = {
+    'Content-Type': 'application/json',
+    'X-API-Key': API_KEY,
+    'X-Timestamp': rTs,
+    'X-Signature': rSig
+  };
+
+  const firstPost = await postBatch(replayBatch, rHeaders);
+  assert.strictEqual(firstPost.status, 200, 'First signed request must succeed');
+
+  const replayedPost = await postBatch(replayBatch, rHeaders);
+  assert.strictEqual(replayedPost.status, 401, 'Replayed signature must be rejected with 401');
+  assert.strictEqual(replayedPost.body.error, 'Replayed request signature');
+  console.log('✓ HMAC signing, timestamp window, and signature replay protection verified.');
+
+  // --- Test 11: Distributed Token-Bucket Rate Limiter (Part A2) ---
+  console.log('\n[Integration 11] Token-Bucket Rate Limiter & Retry-After...');
+  // Burst 50 requests rapidly to exceed burst capacity (burst_capacity = 40)
+  const burstBatch = [
+    { vehicle_id: `TEST-BURST-${runSuffix}`, seq: 999, ts: '2026-11-20T11:00:00Z', soc_pct: 50, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] }
+  ];
+  const burstPromises = Array.from({ length: 45 }, () => postBatch(burstBatch));
+  const burstResults = await Promise.all(burstPromises);
+
+  const rateLimited = burstResults.find(r => r.status === 429);
+  assert.ok(rateLimited, 'Rapid burst exceeding capacity must produce HTTP 429 Too Many Requests');
+  assert.ok(rateLimited.headers.get('retry-after'), 'Rate-limited response must include Retry-After header');
+  console.log(`✓ Token-bucket rate limiter verified (Produced HTTP 429 with Retry-After: ${rateLimited.headers.get('retry-after')}s).`);
+
+  // --- Test 12: Live SSE Stream (Part A5) ---
+  console.log('\n[Integration 12] Live SSE Stream (GET /v1/stream)...');
+  const controller = new AbortController();
+  const sseRes = await fetch(`${baseUrl}/v1/stream`, { signal: controller.signal });
+  assert.strictEqual(sseRes.status, 200);
+  assert.ok(sseRes.headers.get('content-type').includes('text/event-stream'), 'Content-Type must be text/event-stream');
+  controller.abort(); // Close client connection
+  console.log('✓ Live SSE stream endpoint verified (text/event-stream headers, connection accepted).');
 
   console.log('\n' + '='.repeat(70));
   console.log('ALL INTEGRATION TESTS PASSED PERFECTLY! 🚀');
