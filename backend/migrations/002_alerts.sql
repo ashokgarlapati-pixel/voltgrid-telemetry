@@ -1,0 +1,28 @@
+-- VoltGrid Fleet Telemetry Service - Migration 002
+-- Schema setup for Alert Engine and Lifecycle Management
+
+CREATE TABLE IF NOT EXISTS alerts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    vehicle_id  TEXT NOT NULL,
+    rule        TEXT NOT NULL, -- 'overheat', 'rapid_discharge', 'geofence_breach', 'offline'
+    status      TEXT NOT NULL DEFAULT 'open', -- 'open', 'acknowledged', 'resolved'
+    version     INTEGER NOT NULL DEFAULT 1, -- Optimistic concurrency control for A4/ack
+    details     TEXT, -- JSON context (e.g. peak temp, drop points, coordinates)
+    opened_at   TEXT NOT NULL,
+    resolved_at TEXT,
+    updated_at  TEXT NOT NULL
+);
+
+-- Partial unique index guarantees that at most ONE active (open or acknowledged)
+-- alert can exist per (vehicle_id, rule) at any point in time.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_active_unique 
+    ON alerts (vehicle_id, rule) 
+    WHERE status != 'resolved';
+
+-- Index for filtering alerts by lifecycle status and rule type
+CREATE INDEX IF NOT EXISTS idx_alerts_status_rule 
+    ON alerts (status, rule);
+
+-- Index for fetching active alerts for a specific vehicle
+CREATE INDEX IF NOT EXISTS idx_alerts_vehicle_status 
+    ON alerts (vehicle_id, status);

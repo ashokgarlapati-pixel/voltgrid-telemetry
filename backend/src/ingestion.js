@@ -1,4 +1,5 @@
 const db = require('./db');
+const { evaluateAlertsForVehicles } = require('./alertEngine');
 
 /**
  * Validates a single telemetry reading according to Phase 1 rules.
@@ -56,6 +57,7 @@ const insertHistoryStmt = db.prepare(`
     @fault_codes, @received_at
   )
 `);
+
 const upsertVehicleStmt = db.prepare(`
   INSERT INTO vehicles (
     vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c,
@@ -83,12 +85,23 @@ const upsertVehicleStmt = db.prepare(`
     updated_at = excluded.updated_at
 `);
 
+// Resolves any active offline alert when new data arrives
+const resolveOfflineAlertStmt = db.prepare(`
+  UPDATE alerts
+  SET status = 'resolved',
+      resolved_at = @now,
+      version = version + 1,
+      updated_at = @now
+  WHERE vehicle_id = @vehicle_id AND rule = 'offline' AND status != 'resolved'
+`);
+
 /**
  * Transaction wrapped in db.transaction(...).immediate() (BEGIN IMMEDIATE)
  * to acquire write locks upfront and prevent deadlocks under high concurrency.
  */
 const executeBatchTransaction = db.transaction((validItems, nowIso) => {
   const transactionResults = [];
+  const acceptedVehicleIds = new Set();
   let accepted = 0;
   let duplicates = 0;
 
@@ -129,6 +142,8 @@ const executeBatchTransaction = db.transaction((validItems, nowIso) => {
 
     // Newly accepted reading -> upsert vehicle state
     accepted++;
+    acceptedVehicleIds.add(reading.vehicle_id);
+
     upsertVehicleStmt.run({
       vehicle_id: reading.vehicle_id,
       last_ts: normalizedTs,
@@ -144,6 +159,12 @@ const executeBatchTransaction = db.transaction((validItems, nowIso) => {
       updated_at: nowIso
     });
 
+    // Resolve any active 'offline' alert as the vehicle is now actively reporting
+    resolveOfflineAlertStmt.run({
+      vehicle_id: reading.vehicle_id,
+      now: nowIso
+    });
+
     transactionResults.push({
       index,
       vehicle_id: reading.vehicle_id,
@@ -152,13 +173,13 @@ const executeBatchTransaction = db.transaction((validItems, nowIso) => {
     });
   }
 
-  return { accepted, duplicates, transactionResults };
+  return { accepted, duplicates, transactionResults, acceptedVehicleIds };
 }).immediate;
 
 /**
  * Ingests a batch of telemetry readings.
  * Validates each reading individually, handles idempotency and timestamp ordering,
- * and tracks sequence min/max gaps.
+ * tracks sequence gaps, and triggers order-independent alert evaluations.
  */
 function ingestBatch(readings) {
   const nowIso = new Date().toISOString();
@@ -201,6 +222,11 @@ function ingestBatch(readings) {
 
     for (const item of txResult.transactionResults) {
       results[item.index] = item;
+    }
+
+    // Step 3: Trigger order-independent alert rule evaluation for vehicles with new readings
+    if (txResult.acceptedVehicleIds && txResult.acceptedVehicleIds.size > 0) {
+      evaluateAlertsForVehicles(txResult.acceptedVehicleIds, nowIso);
     }
   }
 

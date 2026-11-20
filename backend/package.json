@@ -4,7 +4,8 @@
   "description": "VoltGrid Fleet Telemetry Service - Phase 1 Backend",
   "main": "src/server.js",
   "scripts": {
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "test": "node tests/alerts.test.js && node tests/integration.test.js"
   },
   "dependencies": {
     "express": "^4.21.2"

@@ -54,15 +54,22 @@ try {
   };
 }
 
-// Run initial database migrations automatically on startup
+// Run database migrations automatically in sorted alphabetical order
 function runMigrations() {
-  const migrationPath = path.resolve(__dirname, '../migrations/001_init.sql');
-  if (fs.existsSync(migrationPath)) {
-    const migrationSql = fs.readFileSync(migrationPath, 'utf8');
-    db.exec(migrationSql);
-    console.log(`[DB] Applied migration: ${path.basename(migrationPath)}`);
+  const migrationsDir = path.resolve(__dirname, '../migrations');
+  if (fs.existsSync(migrationsDir)) {
+    const sqlFiles = fs.readdirSync(migrationsDir)
+      .filter(file => file.endsWith('.sql'))
+      .sort();
+
+    for (const file of sqlFiles) {
+      const filePath = path.join(migrationsDir, file);
+      const sql = fs.readFileSync(filePath, 'utf8');
+      db.exec(sql);
+      console.log(`[DB] Applied migration: ${file}`);
+    }
   } else {
-    console.warn(`[DB] Warning: Migration file not found at ${migrationPath}`);
+    console.warn(`[DB] Warning: Migrations directory not found at ${migrationsDir}`);
   }
 }
 

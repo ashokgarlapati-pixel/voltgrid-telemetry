@@ -1,6 +1,7 @@
 const express = require('express');
 const db = require('./db');
 const { ingestBatch } = require('./ingestion');
+const { startOfflineWorker, stopOfflineWorker } = require('./offlineWorker');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -103,14 +104,81 @@ app.get('/v1/completeness', (req, res) => {
   }
 });
 
+/**
+ * GET /v1/alerts
+ * Quick inspection endpoint for Phase 2 verification.
+ * Filters by optional query parameters: status, rule, vehicle_id.
+ */
+app.get('/v1/alerts', (req, res) => {
+  try {
+    const { status, rule, vehicle_id, limit = '100' } = req.query;
+    const conditions = [];
+    const params = [];
+
+    if (status) {
+      conditions.push('status = ?');
+      params.push(status);
+    }
+    if (rule) {
+      conditions.push('rule = ?');
+      params.push(rule);
+    }
+    if (vehicle_id) {
+      conditions.push('vehicle_id = ?');
+      params.push(vehicle_id);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const safeLimit = Math.min(500, Math.max(1, parseInt(limit, 10) || 100));
+
+    const sql = `
+      SELECT id, vehicle_id, rule, status, version, details, opened_at, resolved_at, updated_at
+      FROM alerts
+      ${whereClause}
+      ORDER BY opened_at DESC, id DESC
+      LIMIT ?
+    `;
+
+    params.push(safeLimit);
+    const rows = db.prepare(sql).all(...params);
+
+    // Format details JSON field
+    const alerts = rows.map(r => {
+      let parsedDetails = null;
+      try {
+        parsedDetails = r.details ? JSON.parse(r.details) : null;
+      } catch (_) {
+        parsedDetails = r.details;
+      }
+      return {
+        ...r,
+        details: parsedDetails
+      };
+    });
+
+    res.json({
+      total: alerts.length,
+      alerts
+    });
+  } catch (err) {
+    console.error('[Alerts Query Error]', err);
+    res.status(500).json({
+      error: 'Failed to query alerts'
+    });
+  }
+});
+
 // Start Express server
 const server = app.listen(PORT, () => {
   console.log(`[VoltGrid API] Listening on port ${PORT}`);
+  // Start background offline detection worker
+  startOfflineWorker();
 });
 
 // Graceful shutdown handling
 function handleShutdown(signal) {
-  console.log(`[VoltGrid API] Received ${signal}, closing server and database...`);
+  console.log(`[VoltGrid API] Received ${signal}, closing server, background workers, and database...`);
+  stopOfflineWorker();
   server.close(() => {
     try {
       db.close();
