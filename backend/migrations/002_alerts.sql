@@ -1,5 +1,5 @@
 -- VoltGrid Fleet Telemetry Service - Migration 002
--- Schema setup for Alert Engine and Lifecycle Management
+-- Schema setup for Alert Engine, Lifecycle Management, and Query Optimization
 
 CREATE TABLE IF NOT EXISTS alerts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,6 +35,15 @@ CREATE INDEX IF NOT EXISTS idx_history_vehicle_ts_seq
 CREATE INDEX IF NOT EXISTS idx_vehicles_status_updated 
     ON vehicles (status, updated_at);
 
+-- Composite index for keyset pagination with status filter (eliminates temporary B-tree sorting)
+CREATE INDEX IF NOT EXISTS idx_vehicles_status_id 
+    ON vehicles (status, vehicle_id);
+
 -- Index for chronologically sorting alert queries (GET /v1/alerts)
 CREATE INDEX IF NOT EXISTS idx_alerts_opened_at 
     ON alerts (opened_at DESC, id DESC);
+
+-- Partial index for active alert grouping in fleet summary (GET /v1/fleet/summary)
+CREATE INDEX IF NOT EXISTS idx_alerts_active_rule 
+    ON alerts (rule) 
+    WHERE status != 'resolved';

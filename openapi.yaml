@@ -146,7 +146,7 @@ paths:
           name: status
           schema:
             type: string
-            enum: [online, offline]
+            enum: [online, offline, maintenance]
         - in: query
           name: min_lat
           schema:

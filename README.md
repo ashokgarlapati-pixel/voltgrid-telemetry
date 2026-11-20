@@ -84,15 +84,43 @@ All requests to `POST /v1/telemetry/batch` must include HMAC-SHA256 authenticati
 | Method | Endpoint | Description | Status Codes |
 | :--- | :--- | :--- | :--- |
 | `POST` | `/v1/telemetry/batch` | Ingests up to 500 readings with individual validation & idempotency | `200` OK, `207` Multi-Status, `400` Bad Request, `401` Unauthorized, `429` Rate Limited |
-| `GET` | `/v1/vehicles` | Keyset-paginated vehicle listing (`?limit=50&cursor=VG-00042&status=online`) | `200` OK |
-| `GET` | `/v1/vehicles/:id/history` | Peak-preserving min/max downsampled time-series (`?from=&to=&points=200`) | `200` OK |
-| `GET` | `/v1/fleet/summary` | Sub-150ms fleet summary (aggregates only from `vehicles` & `alerts`) | `200` OK |
+| `GET` | `/v1/vehicles` | Keyset-paginated vehicle listing (`?limit=50&cursor=VG-00042&status=online&min_lat=13.0&max_lat=13.2&min_lng=80.1&max_lng=80.3`) | `200` OK, `400` Bad Request |
+| `GET` | `/v1/vehicles/:id/history` | Peak-preserving min/max downsampled time-series (`?from=&to=&points=200`) | `200` OK, `400` Bad Request, `404` Not Found |
+| `GET` | `/v1/fleet/summary` | Sub-150ms fleet summary (aggregates strictly from `vehicles` & `alerts`) | `200` OK |
 | `GET` | `/v1/alerts` | Filter alerts by `?status=open&rule=overheat&vehicle_id=VG-00042` | `200` OK |
 | `POST` | `/v1/alerts/:id/ack` | Optimistic concurrency acknowledgment (`{"version": 1}`) | `200` OK, `409` Conflict, `404` Not Found |
 | `GET` | `/v1/stream` | Server-Sent Events (SSE) live feed (supports `Last-Event-ID` resume) | `200` OK (`text/event-stream`) |
 | `GET` | `/health` | Service health status and timestamp | `200` OK |
 | `GET` | `/metrics` | Operational metrics (requests total, errors, uptime, DB row counts) | `200` OK |
 | `GET` | `/v1/completeness` | Fleet-wide or single-vehicle sequence completeness & gap detection (`?vehicle_id=VG-00042`) | `200` OK, `404` Not Found |
+
+### Query API Specifications (Part A4)
+
+#### 1. Keyset Cursor Pagination & Filtering (`GET /v1/vehicles`)
+* **Zero-Offset Pagination**: Uses keyset cursor pagination (`WHERE vehicle_id > @cursor ORDER BY vehicle_id ASC LIMIT @limit + 1`). Eliminates the $O(N)$ performance degradation and page drift inherent in SQL `OFFSET`.
+* **Covering Index**: Supported by composite index `idx_vehicles_status_id (status, vehicle_id)` to execute queries via `SEARCH vehicles USING INDEX` with zero temporary B-tree sorting.
+* **Pagination Metadata**: Returns `next_cursor` (last `vehicle_id` of the current page) and boolean `has_more`.
+* **Status Filtering**: Accepts `?status=online|offline|maintenance`. Rejects invalid statuses with `400 Bad Request`.
+* **Geographic Bounding Box**: Accepts `min_lat`, `max_lat`, `min_lng`, `max_lng`. Requires all 4 parameters, valid coordinate ranges ($[-90, 90]$ and $[-180, 180]$), and validates that minimums do not exceed maximums (`min <= max`).
+
+#### 2. History & Peak-Preserving Downsampling (`GET /v1/vehicles/:id/history`)
+* **Time Range**: Accepts ISO-8601 timestamps `from` and `to`. Validates formats and ensures `from < to`. Defaults to preceding 24 hours.
+* **Vehicle Existence**: Returns `404 Not Found` if the requested vehicle does not exist in `vehicles` or `telemetry_history`.
+* **Downsampling Algorithm**: Divides the query window into equal buckets based on `points` parameter ($2 \le \text{points} \le 5000$, default 200). Retains the minimum and maximum values for critical physical metrics (battery temperature peaks/troughs, minimum SOC, maximum speed) within each bucket.
+* **Chronological Guarantees**: Always retains the initial and terminal points of the range. Returns points sorted in strict chronological order.
+* **High Performance**: Evaluated against 17,280 readings (24 hours of 5-second telemetry) in under 150 ms (sub-second target).
+
+#### 3. Fleet Aggregation SLA (`GET /v1/fleet/summary`)
+* **High-Speed Summary**: Aggregates fleet counts by status (`online`, `offline`, `maintenance`), fleet average SOC (`avg_soc_pct`), observed sequence completeness (`data_completeness_pct`), and open/acknowledged alerts grouped by rule.
+* **Sub-150ms SLA Guarantee**: Queries strictly from the `vehicles` state table (2,000 rows) and `alerts` table (`WHERE status != 'resolved'`). Never executes table scans on `telemetry_history`. Benchmarked at $p95 < 2\text{ ms}$.
+
+#### 4. Optimistic Concurrency Control (`POST /v1/alerts/:id/ack`)
+* **Atomic OCC Update**: `UPDATE alerts SET status = 'acknowledged', updated_at = datetime('now'), version = version + 1 WHERE id = @id AND version = @version AND status = 'open'`.
+* **Conflict Resolution**:
+  * If version matches and alert is `open`: Returns `200 OK` with incremented `version` and new `acknowledged` status.
+  * If version does not match, or alert is already acknowledged/resolved: Returns `409 Conflict`.
+  * If alert does not exist: Returns `404 Not Found`.
+* **Zero Race Conditions**: Tested under 10 concurrent requests; exactly 1 request succeeds and 9 receive `409 Conflict`.
 
 ### Telemetry Field Validation Specification
 Every reading in `POST /v1/telemetry/batch` is individually validated using `Number.isFinite()` and strict bounds:

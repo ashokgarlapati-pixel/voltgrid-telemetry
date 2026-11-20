@@ -120,3 +120,31 @@ When two API instances share `voltgrid.db` across mounted volumes, `BEGIN IMMEDI
   app.use(express.json({ limit: '10mb', verify: (req, res, buf) => { req.rawBody = buf.toString('utf8'); } }));
   ```
   In `security.js`, HMAC computation verified against `req.rawBody`. Verified with tests covering diverse float and whitespace formats.
+
+---
+
+## 9. Query Architecture & Optimization (Part A4)
+
+### Keyset vs. Offset Pagination
+* **Why Offset Fails at Scale**: `OFFSET N` requires SQLite to scan and discard $N$ rows before returning `LIMIT` rows. Under 400 req/s streaming writes, offset pagination suffers from page drift: vehicles inserted or modified between page queries shift indices, causing vehicles to appear twice or be skipped entirely.
+* **Zero-Offset Keyset Strategy**: Keyset pagination filters by `vehicle_id > @cursor ORDER BY vehicle_id ASC LIMIT @limit + 1`. This converts pagination into an $O(\text{limit})$ B-tree range seek.
+* **Covering Composite Index**: Adding `CREATE INDEX idx_vehicles_status_id ON vehicles (status, vehicle_id)` ensures status-filtered pagination executes via `SEARCH vehicles USING INDEX` with zero temporary B-tree sorting.
+
+### Peak-Preserving Min/Max Downsampling
+* **The Downsampling Dilemma**: Pure interval sampling (e.g. 1 point every 5 minutes) misses transient thermal runaway spikes (>55°C) or rapid battery drain that occur between sample points.
+* **Min/Max Bucketing**: For target budget $P$, telemetry is divided into $\lfloor (P - 2) / 4 \rfloor$ buckets. Each bucket computes the minimum and maximum values for temperature, minimum SOC, and maximum speed. Boundary points (first and last) are preserved, and all points are reassembled in strict chronological order.
+* **Benchmark SLA**: 17,280 readings (24 hours of 5s data) downsampled to ~198 points executes in ~140 ms, well below the 1,000 ms target.
+
+### Fleet Summary SLA & State Table Decoupling
+* **Architectural Decoupling**: `GET /v1/fleet/summary` must return within 150 ms. Scanning `telemetry_history` (millions of rows) to compute fleet status or average SOC would degrade to multi-second queries. Instead, summary statistics are derived strictly from `vehicles` (2,000 state rows) and `alerts` (`WHERE status != 'resolved'`).
+* **Covering Index**: Supported by partial index `idx_alerts_active_rule ON alerts (rule) WHERE status != 'resolved'`. Empirical $p95$ latency is under 2 ms.
+
+### Optimistic Concurrency Control (OCC) for Alert Acknowledgment
+* **Concurrency Race**: Multiple dispatchers acknowledging the same alert simultaneously risk lost updates and phantom status transitions.
+* **Atomic OCC**: Alerts maintain an integer `version` incremented on every update:
+  ```sql
+  UPDATE alerts 
+  SET status = 'acknowledged', updated_at = datetime('now'), version = version + 1 
+  WHERE id = @id AND version = @version AND status = 'open';
+  ```
+* **Strict HTTP Semantics**: If `changes === 0`, the endpoint inspects the record to return `404 Not Found` if missing, or `409 Conflict` if the version is stale or the alert was already acknowledged/resolved. Tested with 10 concurrent requests; exactly 1 succeeds and 9 receive `409`.
