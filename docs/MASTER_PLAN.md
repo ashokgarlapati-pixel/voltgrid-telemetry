@@ -105,9 +105,18 @@ flowchart TD
     OFF_TX --> AL
 ```
 
+<br><br>
+
+---
 ---
 
-## 3. Database Architecture & Dual-Table Design (Phase 1)
+# 📦 PHASE 1: BATCH INGESTION, STORAGE & SIMULATOR
+### (Part A1 & Simulator: SQLite WAL, Dual-Table Schema, Timestamp Ordering & Idempotency)
+
+---
+<br>
+
+## 3. Database Architecture & Dual-Table Design
 
 The persistence layer uses SQLite via `better-sqlite3`. SQLite was selected for zero-latency in-process querying, but requires specific configuration to handle high concurrency.
 
@@ -262,7 +271,16 @@ ON CONFLICT(vehicle_id) DO UPDATE SET
 * Sequence expected count: $\text{Total Expected} = \sum (\text{max\_seq} - \text{min\_seq} + 1)$
 * Completeness: $\text{Completeness \%} = \frac{\sum \text{received\_count}}{\text{Total Expected}} \times 100$
 
+<br><br><br>
+
 ---
+---
+
+# 🚨 PHASE 2: ALERT ENGINE & OFFLINE WORKER
+### (Part A3: Order-Independent Rule Evaluator, Alert Lifecycle & Background Silence Detector)
+
+---
+<br>
 
 ## 5. Phase 2: Order-Independent Alert Engine & Rules
 
