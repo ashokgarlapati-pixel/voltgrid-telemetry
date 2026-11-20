@@ -32,6 +32,14 @@ function isPointInPolygon(lat, lng, polygon = CHENNAI_OPERATING_POLYGON) {
   return inside;
 }
 
+function normalizeReadings(readings) {
+  if (!readings || readings.length === 0) return [];
+  return [...readings].sort((a, b) => {
+    const diff = Date.parse(a.ts) - Date.parse(b.ts);
+    return diff !== 0 ? diff : ((a.seq || 0) - (b.seq || 0));
+  });
+}
+
 /**
  * Rule 1: Overheat
  * - Trigger: 3 consecutive readings with battery_temp_c > 55°C.
@@ -39,7 +47,8 @@ function isPointInPolygon(lat, lng, polygon = CHENNAI_OPERATING_POLYGON) {
  * - Between 50°C and 55°C, maintain previous state (hysteresis).
  */
 function evaluateOverheat(readings) {
-  if (!readings || readings.length === 0) {
+  const sorted = normalizeReadings(readings);
+  if (sorted.length === 0) {
     return { triggered: false, resolved: false };
   }
 
@@ -47,7 +56,7 @@ function evaluateOverheat(readings) {
   let hotStreak = 0;
   let coolStreak = 0;
 
-  for (const r of readings) {
+  for (const r of sorted) {
     if (r.battery_temp_c > 55.0) {
       hotStreak++;
       coolStreak = 0;
@@ -67,7 +76,7 @@ function evaluateOverheat(readings) {
     }
   }
 
-  const latest = readings[readings.length - 1];
+  const latest = sorted[sorted.length - 1];
   if (state === 'triggered') {
     return {
       triggered: true,
@@ -100,11 +109,12 @@ function evaluateOverheat(readings) {
  * - Resolve: The 5-minute drop rate returns to <= 8 points (or the vehicle starts charging).
  */
 function evaluateRapidDischarge(readings) {
-  if (!readings || readings.length === 0) {
+  const sorted = normalizeReadings(readings);
+  if (sorted.length === 0) {
     return { triggered: false, resolved: false };
   }
 
-  const latest = readings[readings.length - 1];
+  const latest = sorted[sorted.length - 1];
 
   // If vehicle is currently charging, rapid discharge is resolved
   if (Boolean(latest.charging)) {
@@ -119,7 +129,7 @@ function evaluateRapidDischarge(readings) {
   const fiveMinWindowStart = latestTimeMs - (5 * 60 * 1000);
 
   // Filter non-charging readings within the 5-minute window
-  const windowReadings = readings.filter(r =>
+  const windowReadings = sorted.filter(r =>
     !r.charging &&
     Date.parse(r.ts) >= fiveMinWindowStart &&
     Date.parse(r.ts) <= latestTimeMs
@@ -169,11 +179,12 @@ function evaluateRapidDischarge(readings) {
  * - Resolve: Latest reading by ts is back inside the polygon.
  */
 function evaluateGeofenceBreach(readings) {
-  if (!readings || readings.length === 0) {
+  const sorted = normalizeReadings(readings);
+  if (sorted.length === 0) {
     return { triggered: false, resolved: false };
   }
 
-  const latest = readings[readings.length - 1];
+  const latest = sorted[sorted.length - 1];
   const isInside = isPointInPolygon(latest.lat, latest.lng);
 
   if (!isInside) {

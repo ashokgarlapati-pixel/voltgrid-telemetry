@@ -1,7 +1,7 @@
 {
   "name": "voltgrid-backend",
   "version": "1.0.0",
-  "description": "VoltGrid Fleet Telemetry Service - Phase 1 Backend",
+  "description": "VoltGrid Fleet Telemetry Service Backend",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
