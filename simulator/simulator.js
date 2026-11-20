@@ -162,6 +162,12 @@ async function sendBatch(batch) {
     const body = await res.json();
 
     if (res.status === 200 || res.status === 207) {
+      if (totalSentCount === 0 && batch.length > 0) {
+        console.log('[Simulator] Sample live telemetry reading generated:');
+        console.log(JSON.stringify(batch[0], null, 2));
+        console.log('-'.repeat(70));
+      }
+
       totalSentCount += batch.length;
       totalAcceptedCount += body.accepted;
       totalDuplicatesCount += body.duplicates;
