@@ -34,15 +34,19 @@ function signRequest(payloadJson) {
   };
 }
 
+const vehicleSeqCounters = new Map();
+
 // Generate a random batch of 100 vehicle readings
 function generateBatch(size = 100) {
   const now = new Date().toISOString();
   return Array.from({ length: size }, (_, i) => {
     const vNum = Math.floor(Math.random() * 2000) + 1;
     const vid = `VG-${String(vNum).padStart(5, '0')}`;
+    const nextSeq = (vehicleSeqCounters.get(vid) || 100) + 1;
+    vehicleSeqCounters.set(vid, nextSeq);
     return {
       vehicle_id: vid,
-      seq: Math.floor(Math.random() * 50000) + 1,
+      seq: nextSeq,
       ts: now,
       soc_pct: Math.round((40 + Math.random() * 55) * 10) / 10,
       battery_temp_c: Math.round((25 + Math.random() * 20) * 10) / 10,
