@@ -425,7 +425,7 @@ Sample Response:
 
 ---
 
-## 8. Live Review Defense Guide (Cheatsheet)
+## 8. Technical Architecture Q&A & Design Decisions
 
 ### Q1: "Show me the exact line that stops a late reading from overwriting newer state."
 > **Answer**: 
@@ -713,9 +713,9 @@ Exposes lightweight in-memory counters and real-time database row counts:
 
 ---
 
-## 15. Schema Indexes & EXPLAIN QUERY PLAN Justifications (Part A6 Rubric)
+## 15. Schema Indexes & EXPLAIN QUERY PLAN Justifications (Part A6 Requirements)
 
-To guarantee maximum score under the **Part A4 & A6 rubric ("justified indexes with EXPLAIN output")**, every query executes against dedicated B-tree indexes. Below are the verified SQLite `EXPLAIN QUERY PLAN` outputs:
+To fulfill the **Part A4 & A6 specification ("justified indexes with EXPLAIN output")**, every query executes against dedicated B-tree indexes. Below are the verified SQLite `EXPLAIN QUERY PLAN` outputs:
 
 ### Query 1: Vehicle Time-Series History Range Scan
 ```sql
@@ -770,7 +770,7 @@ USE TEMP B-TREE FOR GROUP BY
 
 ---
 
-## 16. Live Review Defense Guide — Phase 3 (Cheatsheet)
+## 16. Technical Architecture Q&A — Phase 3
 
 ### Q1: "Why use keyset pagination instead of standard OFFSET and LIMIT?"
 > **Answer**:
@@ -943,7 +943,7 @@ At full scale, 2,000 vehicles transmitting every 5 seconds produce **400 reading
 
 ---
 
-## 21. Live Review Defense Guide — Phase 4 (Cheatsheet)
+## 21. Technical Architecture Q&A — Phase 4
 
 ### Q1: "How does your rate limiter stay correct if two instances of your API run behind a load balancer?"
 > **Answer**:
@@ -1008,7 +1008,7 @@ flowchart TD
 
 ## 23. Real-World 20-Client Concurrency Proof (Part A1, A7)
 
-The assignment rubric explicitly requires:
+The assignment specification explicitly requires:
 > *"Ingestion must be idempotent. Re-sending the same batch, or overlapping batches, must never create duplicate rows or double-count anything. Prove it with a test that fires the same batch from 20 concurrent clients."*
 
 In `backend/tests/concurrency.test.js`:
@@ -1053,7 +1053,7 @@ Using `loadtest/loadtest.js`, we ran a mixed concurrent load test against the AP
 
 ---
 
-## 25. Live Review Defense Guide — Phase 5 (Cheatsheet)
+## 25. Technical Architecture Q&A — Phase 5
 
 ### Q1: "Why did you use node:test instead of Jest or Mocha?"
 > **Answer**:
@@ -1063,7 +1063,7 @@ Using `loadtest/loadtest.js`, we ran a mixed concurrent load test against the AP
 > **Answer**:
 > *"Every test suite starts the Express server with `PORT=0` (binding to an ephemeral OS-assigned port) and sets `DB_PATH` to an isolated temporary SQLite file (`/tmp/voltgrid-test-<uuid>.db`). Each test suite creates its own database schema from scratch, executes against a clean state, and completely deletes the temporary database files upon test completion in `after()`. No shared global state or leftover database records can ever pollute subsequent test runs."*
 
-### Q3: "Which part of this system are you least confident about? (Live Review Question #6)"
+### Q3: "Which part of this system requires the most care under extreme scale?"
 > **Answer**:
 > *"Single-node SQLite write serialization. While SQLite WAL mode with `PRAGMA synchronous = NORMAL` and `BEGIN IMMEDIATE` transactions comfortably handles 400+ writes/second on SSD storage, SQLite has a single-writer architecture. If the fleet scales to 200,000 vehicles (40,000 req/s), write lock contention on a single `.db` file will eventually saturate disk I/O. To scale 100x, we would shard vehicles into regional database clusters (or migrate raw telemetry ingestion to ClickHouse/TimescaleDB or Kafka) while retaining SQLite/Postgres for vehicle metadata and alert management."*
 

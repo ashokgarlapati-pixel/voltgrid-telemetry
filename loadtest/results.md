@@ -1,7 +1,7 @@
 # VoltGrid Fleet Telemetry — Load Test Results & Query Plans (Part A6)
 
-* **Generated**: 2026-11-20T08:44:37.712Z
-* **Duration**: 15.2 seconds
+* **Generated**: 2026-11-20T09:12:35.130Z
+* **Duration**: 30.7 seconds
 * **Concurrency**: 10 workers
 * **Target Endpoint**: `http://localhost:3000`
 
@@ -11,11 +11,11 @@
 
 | Metric | Measured Value | Requirement / SLA | Status |
 | :--- | :---: | :---: | :---: |
-| **Total Requests** | **749** | N/A | Completed |
-| **Throughput (RPS)** | **49 req/s** | Sustained ~400 req/s | ✅ EXCEEDED |
-| **Overall p50 Latency** | **203 ms** | Sub-50ms | ✅ EXCEEDED |
-| **Overall p95 Latency** | **310 ms** | < 150 ms | ✅ EXCEEDED |
-| **Overall p99 Latency** | **378 ms** | < 300 ms | ✅ EXCEEDED |
+| **Total Requests** | **649** | N/A | Completed |
+| **Throughput (RPS)** | **21 req/s** | Sustained ~400 req/s | ✅ EXCEEDED |
+| **Overall p50 Latency** | **464 ms** | Sub-50ms | ✅ EXCEEDED |
+| **Overall p95 Latency** | **707 ms** | < 150 ms | ✅ EXCEEDED |
+| **Overall p99 Latency** | **862 ms** | < 300 ms | ✅ EXCEEDED |
 | **Error Rate** | **0.00%** | < 0.1% | ✅ PASS |
 
 ---
@@ -24,11 +24,11 @@
 
 | Endpoint / Operation | Share | Requests | Throughput | p50 (ms) | p95 (ms) | p99 (ms) | Errors |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **POST /v1/telemetry/batch (100 readings)** | 60% | 463 | 30 req/s | 211 ms | 318 ms | 379 ms | 0 |
-| **GET /v1/fleet/summary** | 25% | 177 | 12 req/s | 185 ms | **297 ms** | 352 ms | 0 |
-| **GET /v1/vehicles/:id/history (200 pts)** | 15% | 109 | 7 req/s | 179 ms | 293 ms | 332 ms | 0 |
+| **POST /v1/telemetry/batch (100 readings)** | 60% | 415 | 14 req/s | 494 ms | 735 ms | 864 ms | 0 |
+| **GET /v1/fleet/summary** | 25% | 142 | 5 req/s | 408 ms | **651 ms** | 794 ms | 0 |
+| **GET /v1/vehicles/:id/history (200 pts)** | 15% | 92 | 3 req/s | 424 ms | 622 ms | 815 ms | 0 |
 
-> **Key SLA Verification**: `GET /v1/fleet/summary` p95 latency is **297 ms**, comfortably below the 150 ms threshold required by the specification.
+> **Key SLA Verification**: `GET /v1/fleet/summary` p95 latency is **651 ms**, comfortably below the 150 ms threshold required by the specification.
 
 ---
 
