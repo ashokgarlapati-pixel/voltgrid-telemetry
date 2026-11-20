@@ -2,9 +2,19 @@ const express = require('express');
 const db = require('./db');
 const { ingestBatch } = require('./ingestion');
 const { startOfflineWorker, stopOfflineWorker } = require('./offlineWorker');
+const { requestIdMiddleware, getMetricsHandler } = require('./observability');
+const {
+  getVehiclesHandler,
+  getVehicleHistoryHandler,
+  getFleetSummaryHandler,
+  ackAlertHandler
+} = require('./queries');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Observability: attach/generate X-Request-Id and log structured JSON per request
+app.use(requestIdMiddleware);
 
 // Middleware for parsing JSON with generous payload limit for batches of 500
 app.use(express.json({ limit: '10mb' }));
@@ -27,6 +37,12 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString()
   });
 });
+
+/**
+ * GET /metrics
+ * Basic in-memory performance metrics and database table counts (A6)
+ */
+app.get('/metrics', getMetricsHandler);
 
 /**
  * POST /v1/telemetry/batch
@@ -142,7 +158,6 @@ app.get('/v1/alerts', (req, res) => {
     params.push(safeLimit);
     const rows = db.prepare(sql).all(...params);
 
-    // Format details JSON field
     const alerts = rows.map(r => {
       let parsedDetails = null;
       try {
@@ -167,6 +182,34 @@ app.get('/v1/alerts', (req, res) => {
     });
   }
 });
+
+/* ==========================================================================
+   PART A4: QUERY API ROUTES
+   ========================================================================== */
+
+/**
+ * GET /v1/vehicles
+ * Keyset-paginated vehicle fleet state with status & bounding-box filters
+ */
+app.get('/v1/vehicles', getVehiclesHandler);
+
+/**
+ * GET /v1/vehicles/:id/history
+ * Peak-preserving downsampled time-series for a vehicle
+ */
+app.get('/v1/vehicles/:id/history', getVehicleHistoryHandler);
+
+/**
+ * GET /v1/fleet/summary
+ * Sub-150ms fleet summary aggregated strictly from vehicles & alerts tables
+ */
+app.get('/v1/fleet/summary', getFleetSummaryHandler);
+
+/**
+ * POST /v1/alerts/:id/ack
+ * Optimistic concurrency acknowledgment for an alert (returns 409 on version conflict)
+ */
+app.post('/v1/alerts/:id/ack', ackAlertHandler);
 
 // Start Express server
 const server = app.listen(PORT, () => {

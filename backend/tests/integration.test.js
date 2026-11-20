@@ -148,6 +148,89 @@ async function runTests() {
   assert.strictEqual(Number(countRow.c), 25, 'Database must store exactly 25 history rows (zero duplicates)');
   console.log(`✓ 20 concurrent clients verified: ${totalAccepted} accepted, ${totalDuplicates} duplicates, 0 double-counts in DB.`);
 
+  // --- Test 5: Keyset Pagination (GET /v1/vehicles) ---
+  console.log('\n[Integration 5] Keyset Pagination (GET /v1/vehicles)...');
+  const page1Res = await fetch(`${baseUrl}/v1/vehicles?limit=3`);
+  assert.strictEqual(page1Res.status, 200);
+  assert.ok(page1Res.headers.get('x-request-id'), 'Must attach X-Request-Id header');
+  const page1 = await page1Res.json();
+  assert.strictEqual(page1.data.length, 3);
+  assert.ok(page1.next_cursor, 'Page 1 must return a next_cursor');
+
+  const page2Res = await fetch(`${baseUrl}/v1/vehicles?limit=3&cursor=${page1.next_cursor}`);
+  assert.strictEqual(page2Res.status, 200);
+  const page2 = await page2Res.json();
+  assert.strictEqual(page2.data.length, 3);
+
+  // Assert keyset continuity and zero overlap between pages
+  const overlap = page1.data.some(d1 => page2.data.some(d2 => d1.vehicle_id === d2.vehicle_id));
+  assert.strictEqual(overlap, false, 'Keyset pagination must have zero overlap between consecutive pages');
+  console.log(`✓ Keyset pagination verified (Page 1 cursor: ${page1.next_cursor}, zero overlap).`);
+
+  // --- Test 6: Peak-Preserving History Downsampling ---
+  console.log('\n[Integration 6] Downsampled History (GET /v1/vehicles/:id/history)...');
+  const histRes = await fetch(`${baseUrl}/v1/vehicles/${concId}-0/history?points=5`);
+  assert.strictEqual(histRes.status, 200);
+  const histBody = await histRes.json();
+  assert.strictEqual(histBody.vehicle_id, `${concId}-0`);
+  assert.ok(Array.isArray(histBody.points));
+  console.log(`✓ Vehicle history downsampling verified (raw: ${histBody.raw_count}, returned: ${histBody.returned_count}).`);
+
+  // --- Test 7: Fleet Summary Aggregate (GET /v1/fleet/summary) ---
+  console.log('\n[Integration 7] Fleet Summary Aggregate (GET /v1/fleet/summary)...');
+  const summaryRes = await fetch(`${baseUrl}/v1/fleet/summary`);
+  assert.strictEqual(summaryRes.status, 200);
+  const summary = await summaryRes.json();
+  assert.ok(typeof summary.total_vehicles === 'number');
+  assert.ok(typeof summary.avg_soc_pct === 'number');
+  assert.ok(summary.counts_by_status && typeof summary.counts_by_status.online === 'number');
+  assert.ok(summary.open_alerts_by_rule && typeof summary.open_alerts_by_rule.overheat === 'number');
+  assert.ok(typeof summary.data_completeness_pct === 'number');
+  console.log(`✓ Fleet summary aggregate verified (Total: ${summary.total_vehicles}, Avg SoC: ${summary.avg_soc_pct}%).`);
+
+  // --- Test 8: Optimistic Alert Ack (POST /v1/alerts/:id/ack) ---
+  console.log('\n[Integration 8] Optimistic Concurrency Alert Ack (POST /v1/alerts/:id/ack)...');
+  const ackTestId = `ACK-TEST-${runSuffix}`;
+  db.prepare(`
+    INSERT INTO alerts (vehicle_id, rule, status, version, opened_at, updated_at)
+    VALUES (?, 'overheat', 'open', 1, datetime('now'), datetime('now'))
+  `).run(ackTestId);
+
+  const newAlert = db.prepare('SELECT id, version FROM alerts WHERE vehicle_id = ? AND status = ?').get(ackTestId, 'open');
+
+  // Ack with correct version 1 -> HTTP 200
+  const ackSuccessRes = await fetch(`${baseUrl}/v1/alerts/${newAlert.id}/ack`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ version: 1 })
+  });
+  assert.strictEqual(ackSuccessRes.status, 200);
+  const ackSuccessBody = await ackSuccessRes.json();
+  assert.strictEqual(ackSuccessBody.alert.status, 'acknowledged');
+  assert.strictEqual(ackSuccessBody.alert.version, 2);
+
+  // Ack again with stale version 1 -> HTTP 409 Conflict
+  const ackConflictRes = await fetch(`${baseUrl}/v1/alerts/${newAlert.id}/ack`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ version: 1 })
+  });
+  assert.strictEqual(ackConflictRes.status, 409);
+  const ackConflictBody = await ackConflictRes.json();
+  assert.strictEqual(ackConflictBody.current_version, 2);
+  assert.strictEqual(ackConflictBody.current_status, 'acknowledged');
+  console.log(`✓ Optimistic concurrency ack verified (v1 -> HTTP 200, retry v1 -> HTTP 409 Conflict).`);
+
+  // --- Test 9: Observability & Metrics (GET /metrics) ---
+  console.log('\n[Integration 9] Observability & Metrics (GET /metrics)...');
+  const metricsRes = await fetch(`${baseUrl}/metrics`);
+  assert.strictEqual(metricsRes.status, 200);
+  const metrics = await metricsRes.json();
+  assert.ok(typeof metrics.uptime_sec === 'number');
+  assert.ok(typeof metrics.requests_total === 'number');
+  assert.ok(typeof metrics.database.vehicles_total === 'number');
+  console.log(`✓ Metrics endpoint verified (Uptime: ${metrics.uptime_sec}s, Requests: ${metrics.requests_total}).`);
+
   console.log('\n' + '='.repeat(70));
   console.log('ALL INTEGRATION TESTS PASSED PERFECTLY! 🚀');
   console.log('='.repeat(70));
