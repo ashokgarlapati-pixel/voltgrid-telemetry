@@ -54,22 +54,51 @@ try {
   };
 }
 
-// Run database migrations automatically in sorted alphabetical order
+// Run database migrations automatically in sorted alphabetical order with schema_migrations tracking
 function runMigrations() {
   const migrationsDir = path.resolve(__dirname, '../migrations');
-  if (fs.existsSync(migrationsDir)) {
-    const sqlFiles = fs.readdirSync(migrationsDir)
-      .filter(file => file.endsWith('.sql'))
-      .sort();
-
-    for (const file of sqlFiles) {
-      const filePath = path.join(migrationsDir, file);
-      const sql = fs.readFileSync(filePath, 'utf8');
-      db.exec(sql);
-      console.log(`[DB] Applied migration: ${file}`);
-    }
-  } else {
+  if (!fs.existsSync(migrationsDir)) {
     console.warn(`[DB] Warning: Migrations directory not found at ${migrationsDir}`);
+    return;
+  }
+
+  // 1. Ensure migration tracking table exists
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version TEXT PRIMARY KEY,
+      applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  // 2. Query already applied migration versions
+  const rows = db.prepare('SELECT version FROM schema_migrations').all();
+  const applied = new Set(rows.map(r => r.version));
+
+  // 3. Scan and execute pending migrations in alphabetical order
+  const sqlFiles = fs.readdirSync(migrationsDir)
+    .filter(file => file.endsWith('.sql'))
+    .sort();
+
+  for (const file of sqlFiles) {
+    if (applied.has(file)) {
+      continue;
+    }
+
+    const filePath = path.join(migrationsDir, file);
+    const sql = fs.readFileSync(filePath, 'utf8');
+
+    // Execute migration inside an atomic block
+    db.exec('BEGIN IMMEDIATE;');
+    try {
+      db.exec(sql);
+      db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, datetime('now'))").run(file);
+      db.exec('COMMIT;');
+      console.log(`[DB] Applied migration: ${file}`);
+    } catch (err) {
+      db.exec('ROLLBACK;');
+      console.error(`[DB] Migration failed on ${file}:`, err);
+      throw err;
+    }
   }
 }
 

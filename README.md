@@ -312,7 +312,70 @@ Events adhere to standard SSE wire framing (`id: <id>\nevent: <type>\ndata: <jso
 
 ---
 
-## 7. Running Tests
+## 7. Database Model, Indexing & EXPLAIN QUERY PLAN
+
+### 1. Migrations & Version Tracking
+Database migrations are strictly versioned and executed in alphabetical order within transactional blocks. Applied migrations are recorded in `schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`:
+* **Fresh Boot**: Sequentially applies `001_init.sql`, `002_alerts.sql`, `003_security.sql`, and `004_stream.sql`.
+* **Idempotency**: Running migrations repeatedly skips already recorded versions, preventing redundant DDL or table locking.
+* **Failure Safety**: If a migration script errors, the entire script is rolled back via `ROLLBACK`, preventing corrupted partial schema states.
+
+### 2. EXPLAIN QUERY PLAN Verification (Top 2 Critical Queries)
+
+#### Query 1: Vehicle Telemetry History Downsampling Query
+```sql
+EXPLAIN QUERY PLAN 
+SELECT seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging 
+FROM telemetry_history 
+WHERE vehicle_id = 'VG-00001' AND ts >= '2026-11-20T00:00:00Z' AND ts <= '2026-11-21T00:00:00Z' 
+ORDER BY ts ASC, seq ASC;
+```
+**Actual SQLite Query Plan Output:**
+```text
+SEARCH telemetry_history USING INDEX idx_history_vehicle_ts_seq (vehicle_id=? AND ts>? AND ts<?)
+```
+* **Index Used**: `idx_history_vehicle_ts_seq (vehicle_id, ts DESC, seq DESC)`.
+* **Analysis**: Zero full table scan. SQLite executes a range seek on `vehicle_id` and temporal slice `ts`, reading only the required rows for the requested vehicle window.
+
+#### Query 2: Keyset Paginated Vehicle Listing with Status Filter
+```sql
+EXPLAIN QUERY PLAN 
+SELECT vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at 
+FROM vehicles 
+WHERE status = 'online' AND vehicle_id > 'VG-00100' 
+ORDER BY vehicle_id ASC LIMIT 51;
+```
+**Actual SQLite Query Plan Output:**
+```text
+SEARCH vehicles USING INDEX idx_vehicles_status_id (status=? AND vehicle_id>?)
+```
+* **Index Used**: `idx_vehicles_status_id (status, vehicle_id)`.
+* **Analysis**: Zero table scan and zero temporary B-tree sorting. SQLite utilizes the composite index to filter by `status` and seek directly to `vehicle_id > cursor`, returning rows in index order.
+
+---
+
+## 8. Repeatable Multi-Endpoint Load Testing
+
+The service includes a native load testing tool (`scripts/loadtest.js`) simulating realistic mixed operational workloads:
+* 50% Telemetry batch ingestion with HMAC signatures, duplicate sequences, and malformed readings.
+* 25% Vehicle fleet listing (`GET /v1/vehicles`) with keyset pagination.
+* 15% Vehicle time-series history (`GET /v1/vehicles/:id/history`).
+* 10% Fleet health summary (`GET /v1/fleet/summary`).
+
+### Run Load Test
+```bash
+cd backend
+npm run loadtest
+```
+
+Configurable environment options:
+```bash
+VUS=10 DURATION_SEC=15 WARMUP_SEC=2 BATCH_SIZE=50 node scripts/loadtest.js
+```
+
+---
+
+## 9. Running Tests
 
 The test suite uses Node's native test runner (`node:test` and `node:assert/strict`) with zero external test dependencies:
 
@@ -322,6 +385,7 @@ npm test
 ```
 
 ### Test Coverage Highlights:
+* **Database Migration Tests (`backend/tests/migrations.test.js`)**: Verifies fresh database initialization, `schema_migrations` tracking, table constraints, index existence, and idempotent re-execution.
 * **Live SSE Stream Tests (`backend/tests/stream.int.test.js`)**: Real HTTP SSE testing for connection handshake, canonical event formatting, monotonic `Last-Event-ID` replay, restart resilience, atomic replay-to-live handoff race conditions, slow-client backpressure disconnection, 1s vehicle coalescing, and 400 req/s high-throughput benchmark.
 * **Query API Tests (`backend/tests/queries.int.test.js`)**: Keyset cursor pagination, bounding box boundary/inversion validation, 17,280-reading 24h history downsampling benchmark, fleet summary p95 SLA latency benchmark, and 10-client concurrent OCC alert ack race test.
 * **Alert Integration Tests (`backend/tests/alerts.int.test.js`)**: Real HTTP batch ingestion testing chronological vs reverse vs random arrival convergence, >100 readings history scan, hysteresis persistence, offline worker recovery on telemetry resumption, alert ack optimistic locking, and rapid discharge window expiration.
@@ -332,6 +396,6 @@ npm test
 
 ---
 
-## 8. Architecture & System Design Document
+## 10. Architecture & System Design Document
 
 Read **[DESIGN.md](DESIGN.md)** for detailed engineering answers to scale, delivery guarantees, clock drift, storage retention, threat modeling, and trade-offs.
