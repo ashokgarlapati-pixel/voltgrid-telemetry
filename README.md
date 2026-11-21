@@ -303,15 +303,16 @@ To scale horizontally across multiple physical or virtual machines, replace the 
 4. **Worker Coordination & Leader Election**:
    * Coordinate background sweeps (`offlineWorker`) and retention pruning using distributed leader election (Kubernetes Leases, etcd, or Redis Redlock) so only a single active leader executes background tasks.
 
-### 6. Production Credential Safety & Rejection of Development Defaults
-* **Development Seed Isolation**: The seeded credentials (`voltgrid-dev-key` / `voltgrid-dev-secret` in migration `003_security.sql`) are strictly intended for offline unit tests and local development (`NODE_ENV !== 'production'`).
-* **Production Startup Safeguards (`validateAndInitSecurityCredentials()`)**: When `NODE_ENV=production`, the application validates required security credentials before binding ports or accepting traffic:
-  * **Explicit Configuration Required**: Production credentials must be supplied via environment variables: `API_KEY` and `API_SECRET` (or `VOLTGRID_API_KEYS` JSON array for multiple device groups).
-  * **Rejection of Unsafe Defaults**: Startup immediately throws a fatal configuration error if `API_KEY` is `'voltgrid-dev-key'`, if `API_SECRET` is `'voltgrid-dev-secret'`, or if the secret is shorter than 16 characters.
-  * **Automatic Dev Key Purge**: Any legacy development credentials in the database `api_keys` table are unconditionally purged on startup in production.
-  * **Failure Over Fallback**: If production credentials are missing or unsafe, the process exits with an error code rather than silently falling back to insecure defaults.
-  * **Runtime Defense-in-Depth**: In `hmacAuth`, any authentication attempt presenting `'voltgrid-dev-key'` or signed with `'voltgrid-dev-secret'` in production returns `HTTP 401 Unauthorized` (`"Development credentials are not permitted in production"`), and `rateLimiter` never defaults to development keys.
-  * **Zero Credential Leaks**: Raw secrets are never logged in console outputs, error responses, or metrics.
+### 6. Deployment Credential Safety & Rejection of Development Defaults
+* **Development & Test Environment Isolation**: The seeded credentials (`voltgrid-dev-key` / `voltgrid-dev-secret` in migration `003_security.sql`) are explicitly permitted **only** in local development and offline automated testing environments (`NODE_ENV === 'development'` or `'test'`).
+* **Deployment & Unknown Environment Safeguards (`validateAndInitSecurityCredentials()`)**: In all deployment environments (`production`, `staging`, `qa`, `uat`) as well as any unknown or unsupported `NODE_ENV` value, the application enforces strict startup credential validation before binding ports:
+  * **Mandatory Explicit Configuration**: Credentials must be explicitly provided through environment variables (`API_KEY` & `API_SECRET` or `VOLTGRID_API_KEYS` JSON array). Unsupported environments never silently fall back to development defaults.
+  * **Distinction of Length Baseline vs. Cryptographic Entropy**: Enforces a structural minimum length of 16 characters (structural baseline) alongside character diversity validation ($\ge 8$ unique characters, ensuring unpredictability) to reject repetitive patterns (e.g. `'aaaaaaaaaaaaaaaa'`, `'abababababababab'`) while seamlessly accepting legitimate cryptographic hex, base64, and alphanumeric keys. Length alone is explicitly not treated as proof of entropy.
+  * **Credential Array Validation (`VOLTGRID_API_KEYS`)**: Rejects development key IDs, development secrets, duplicate key IDs, missing or malformed secrets, and non-positive/non-finite rate limit and burst capacity values.
+  * **Automatic Development Key Purge**: Any legacy development credentials in the database `api_keys` table are unconditionally deleted on startup in deployment environments.
+  * **Failure Over Fallback**: If credentials are missing, duplicate, or unsafe, the process exits with a non-zero exit code rather than silently running with insecure defaults.
+  * **Runtime Defense-in-Depth**: In `hmacAuth`, any authentication attempt presenting `'voltgrid-dev-key'` or signed with `'voltgrid-dev-secret'` in non-dev environments returns `HTTP 401 Unauthorized` (`"Development credentials are not permitted in this environment"`), and `rateLimiter` never defaults to development keys.
+  * **Zero Credential Leaks**: Raw secrets are never logged in console outputs, error responses, exception traces, or metrics.
 
 ---
 
