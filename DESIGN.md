@@ -132,13 +132,31 @@ Re-evaluating the rule over this chronological slice reconstructs the exact stat
 
 ## 5. Storage Economics (~35M Rows/Day)
 
-Each row in `telemetry_history` is ~120 bytes plus ~100 bytes of index overhead (~220 bytes total).
-At 400 readings/sec, that is $35{,}000{,}000 \times 220\text{ B} \approx 7.7\text{ GB/day}$ (~230 GB/month).
+### Implementation Reality vs. Production Architecture
+The current VoltGrid prototype stores all ingested telemetry as raw records in SQLite `telemetry_history`. It does **not** implement automated background rollups, warm-tier aggregation tables, or cold-tier Parquet archival (only `stream_events` implements retention pruning, capped at 10,000 events). The tiered model below outlines the proposed production lifecycle.
 
-### Tiered Retention Strategy
-1. **Hot Tier (0–7 Days)**: Full raw 5-second readings in SQLite/NVMe for live operations and triage (~54 GB).
-2. **Warm Tier (8–90 Days)**: Automated nightly rollups downsampling into 1-minute `min/max/avg` buckets for SOC, battery temperature, and speed (~15 GB).
-3. **Cold Tier (91–365 Days)**: Hourly rollups exported to compressed Parquet files on S3 Glacier ($0.0036/GB/month). Drop old raw partitions.
+### Raw Telemetry Volume (Current Implementation)
+* **Ingestion Workload**: 2,000 vehicles generating 1 reading every 5 seconds = 400 readings/sec.
+* **Daily Ingestion Volume**: $400\text{ readings/s} \times 86{,}400\text{ s/day} = 34{,}560{,}000\text{ readings/day}$ (~34.56M, rounded to ~35M rows/day).
+* **Storage Footprint Breakdown per Row**:
+  * *Raw Data Payload*: ~120 bytes (`vehicle_id`, `seq`, `ts`, `soc_pct`, `battery_temp_c`, `speed_kmh`, `lat`, `lng`, `odometer_km`, `charging`, `fault_codes`, `received_at`).
+  * *Index Overhead*: ~100 bytes across `PRIMARY KEY (vehicle_id, seq)` (~40 B) and `idx_history_vehicle_ts (vehicle_id, ts)` (~60 B).
+  * *Total Uncompressed Database Footprint*: ~220 bytes/row.
+  * *B-Tree & Page Fill Factor*: SQLite B-tree pages operate at 75–85% fill factor, resulting in an empirical on-disk footprint of ~260–275 bytes/row (verified by our 5M-reading benchmark: 5,000,000 rows occupy 1,302.05 MB $\approx 273$ bytes/row).
+  * *WAL & Ephemeral Space*: SQLite WAL mode introduces transient `-wal` file overhead (typically 4–32 MB with regular checkpoints, expanding under uncheckpointed write bursts).
+* **Daily & 7-Day Raw Storage**:
+  * *Daily Raw Storage*: $34.56\text{M rows} \times 220\text{ B} \approx 7.60\text{ GB/day}$ ($35\text{M} \times 220\text{ B} \approx 7.7\text{ GB/day}$).
+  * *7-Day Raw Storage (Hot Tier)*: $7 \times 7.60\text{ GB} \approx 53.2\text{ GB}$ (or $7 \times 7.7\text{ GB} \approx 53.9\text{ GB} \approx 54\text{ GB}$).
+
+### Tiered Retention Strategy (Architectural Proposal)
+1. **Hot Tier (0–7 Days)**: Full raw 5-second readings in SQLite/NVMe for live operations and triage (~54 GB raw data + index footprint).
+2. **Warm Tier (8–90 Days — Illustrative Estimate)**: Proposed nightly rollups downsampling into 1-minute `min/max/avg` buckets (SOC, temperature, speed):
+   * *Rollup Volume*: $2{,}000\text{ vehicles} \times 1{,}440\text{ min/day} = 2{,}880{,}000\text{ rollup rows/day}$. Over 83 days (days 8–90), this yields $239{,}040{,}000\text{ rows}$ (or $259.2\text{M rows}$ for 90 days).
+   * *Uncompressed Reality*: An uncompressed SQLite rollup table (~160 B/row with indexes) requires **~38–41 GB**, not 15 GB.
+   * *Derivation of the ~15 GB Figure*: The original ~15 GB estimate is an **unverified design target** that assumes either:
+     - **Columnar/compressed storage** (e.g. Parquet or zstd compression achieving $\ge 2.5:1$ ratio, yielding ~60 B/row: $239\text{M} \times 60\text{ B} \approx 14.3\text{ GB} \approx 15\text{ GB}$), or
+     - A smaller baseline fleet of **1,000 vehicles** ($1{,}000 \times 1{,}440 \times 90 \times 116\text{ B} \approx 15.0\text{ GB}$).
+3. **Cold Tier (91–365 Days)**: Hourly rollups exported to compressed Parquet files on S3 Glacier ($0.0036/GB/month). Drop raw partitions.
 *Trade-off*: Downsampling loses sub-minute transient thermal spikes and fine-grained sequence gap detection.
 
 ---
