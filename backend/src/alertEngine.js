@@ -277,6 +277,20 @@ const getActiveAlertStmt = db.prepare(`
   WHERE vehicle_id = ? AND rule = ? AND status != 'resolved'
 `);
 
+const getLastAlertStmt = db.prepare(`
+  SELECT id, status, version, opened_at, resolved_at
+  FROM alerts
+  WHERE vehicle_id = ? AND rule = ?
+  ORDER BY id DESC
+  LIMIT 1
+`);
+
+const getAlertByOpenedAtStmt = db.prepare(`
+  SELECT id, status, version, opened_at, resolved_at
+  FROM alerts
+  WHERE vehicle_id = ? AND rule = ? AND opened_at = ?
+`);
+
 const getActiveOfflineAlertStmt = db.prepare(`
   SELECT id, status, version, details
   FROM alerts
@@ -356,16 +370,25 @@ const evaluateVehicleAlertsTx = db.transaction((vehicleId, nowIso) => {
 
     if (outcome.triggered) {
       if (!activeAlert) {
-        // No active alert exists -> Open new alert (version = 1, status = 'open')
-        const insertInfo = insertAlertStmt.run({
-          vehicle_id: vehicleId,
-          rule: ruleName,
-          details: JSON.stringify(outcome.details || {}),
-          now: outcome.openedAt || nowIso
-        });
-        const newAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(insertInfo.lastInsertRowid);
-        if (newAlert) {
-          changedAlerts.push(newAlert);
+        // Prevent duplicate alerts for historical incidents that were already resolved
+        const lastAlert = getLastAlertStmt.get(vehicleId, ruleName);
+        const incidentOpenedAt = outcome.openedAt || nowIso;
+        const alreadyResolved = lastAlert && lastAlert.status === 'resolved' &&
+          lastAlert.resolved_at && incidentOpenedAt <= lastAlert.resolved_at;
+        const alreadyExists = getAlertByOpenedAtStmt.get(vehicleId, ruleName, incidentOpenedAt);
+
+        if (!alreadyResolved && !alreadyExists) {
+          // Genuinely new incident -> Open new alert (version = 1, status = 'open')
+          const insertInfo = insertAlertStmt.run({
+            vehicle_id: vehicleId,
+            rule: ruleName,
+            details: JSON.stringify(outcome.details || {}),
+            now: incidentOpenedAt
+          });
+          const newAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(insertInfo.lastInsertRowid);
+          if (newAlert) {
+            changedAlerts.push(newAlert);
+          }
         }
       }
       // If already open or acknowledged, maintain existing alert without duplication
@@ -383,18 +406,25 @@ const evaluateVehicleAlertsTx = db.transaction((vehicleId, nowIso) => {
           changedAlerts.push(resolvedAlert);
         }
       } else if (outcome.openedAt) {
-        // Out-of-order state reconstruction: alert opened and resolved within history
-        const insertInfo = insertResolvedAlertStmt.run({
-          vehicle_id: vehicleId,
-          rule: ruleName,
-          details: JSON.stringify(outcome.details || {}),
-          opened_at: outcome.openedAt,
-          resolved_at: outcome.resolvedAt || nowIso,
-          now: nowIso
-        });
-        const resolvedAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(insertInfo.lastInsertRowid);
-        if (resolvedAlert) {
-          changedAlerts.push(resolvedAlert);
+        // Out-of-order state reconstruction: only insert if this incident was NEVER previously recorded
+        const lastAlert = getLastAlertStmt.get(vehicleId, ruleName);
+        const alreadyResolved = lastAlert && lastAlert.status === 'resolved' &&
+          lastAlert.resolved_at && outcome.openedAt <= lastAlert.resolved_at;
+        const alreadyExists = getAlertByOpenedAtStmt.get(vehicleId, ruleName, outcome.openedAt);
+
+        if (!alreadyResolved && !alreadyExists) {
+          const insertInfo = insertResolvedAlertStmt.run({
+            vehicle_id: vehicleId,
+            rule: ruleName,
+            details: JSON.stringify(outcome.details || {}),
+            opened_at: outcome.openedAt,
+            resolved_at: outcome.resolvedAt || nowIso,
+            now: nowIso
+          });
+          const resolvedAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(insertInfo.lastInsertRowid);
+          if (resolvedAlert) {
+            changedAlerts.push(resolvedAlert);
+          }
         }
       }
     }

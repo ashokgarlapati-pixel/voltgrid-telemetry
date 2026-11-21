@@ -254,4 +254,159 @@ describe('A3 Comprehensive Alert Engine Edge Cases & Lifecycle Tests', () => {
       assert.ok(alertAfter.version >= 2, 'Version must increment upon resolution');
     });
   });
+
+  describe('Issue 2: Overheat Alert Lifecycle & De-duplication', () => {
+    test('Three consecutive readings above 55°C -> One alert opens', async () => {
+      const vid = `VG-ISSUE2-OPEN-${Date.now()}`;
+      const now = Date.now();
+      const readings = [
+        { vehicle_id: vid, seq: 1, ts: new Date(now - 15000).toISOString(), soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 10000).toISOString(), soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: new Date(now - 5000).toISOString(), soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.2, charging: false, fault_codes: [] }
+      ];
+
+      const res = await postSignedBatch(readings);
+      assert.strictEqual(res.status, 200);
+
+      const alerts = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").all(vid);
+      assert.strictEqual(alerts.length, 1, 'Exactly one alert must be created');
+      assert.strictEqual(alerts[0].status, 'open');
+      assert.strictEqual(alerts[0].version, 1);
+    });
+
+    test('Three consecutive readings at or below 50°C -> Alert resolves', async () => {
+      const vid = `VG-ISSUE2-RESOLVE-${Date.now()}`;
+      const now = Date.now();
+      // 3 hot readings open alert
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 1, ts: new Date(now - 30000).toISOString(), soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 25000).toISOString(), soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: new Date(now - 20000).toISOString(), soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.2, charging: false, fault_codes: [] }
+      ]);
+
+      assert.strictEqual(db.prepare("SELECT status FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").get(vid).status, 'open');
+
+      // 3 cool readings resolve alert
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 4, ts: new Date(now - 15000).toISOString(), soc_pct: 80, battery_temp_c: 49.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.3, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 5, ts: new Date(now - 10000).toISOString(), soc_pct: 80, battery_temp_c: 48.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.4, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 6, ts: new Date(now - 5000).toISOString(), soc_pct: 80, battery_temp_c: 47.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.5, charging: false, fault_codes: [] }
+      ]);
+
+      const alerts = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").all(vid);
+      assert.strictEqual(alerts.length, 1, 'Must still be exactly 1 alert row');
+      assert.strictEqual(alerts[0].status, 'resolved', 'Alert must transition to resolved');
+      assert.ok(alerts[0].resolved_at);
+      assert.strictEqual(alerts[0].version, 2, 'Version must increment to 2 upon resolution');
+    });
+
+    test('Additional cool readings -> No duplicate alert inserted', async () => {
+      const vid = `VG-ISSUE2-COOL-${Date.now()}`;
+      const now = Date.now();
+      // Episode: 3 hot -> open, 3 cool -> resolved
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 1, ts: new Date(now - 60000).toISOString(), soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 55000).toISOString(), soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: new Date(now - 50000).toISOString(), soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.2, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 4, ts: new Date(now - 45000).toISOString(), soc_pct: 80, battery_temp_c: 49.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.3, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 5, ts: new Date(now - 40000).toISOString(), soc_pct: 80, battery_temp_c: 48.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.4, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 6, ts: new Date(now - 35000).toISOString(), soc_pct: 80, battery_temp_c: 47.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.5, charging: false, fault_codes: [] }
+      ]);
+
+      const countBefore = db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").get(vid).total;
+      assert.strictEqual(countBefore, 1);
+
+      // Post 5 additional cool readings individually (the exact pattern that previously triggered duplicates)
+      for (let i = 7; i <= 11; i++) {
+        await postSignedBatch([
+          { vehicle_id: vid, seq: i, ts: new Date(now - (35000 - (i - 6) * 5000)).toISOString(), soc_pct: 80, battery_temp_c: 46.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.5 + i * 0.1, charging: false, fault_codes: [] }
+        ]);
+      }
+
+      const alertsAfter = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").all(vid);
+      assert.strictEqual(alertsAfter.length, 1, 'Additional cool readings must NOT create duplicate resolved alerts');
+      assert.strictEqual(alertsAfter[0].status, 'resolved');
+    });
+
+    test('New overheating episode -> New alert opens', async () => {
+      const vid = `VG-ISSUE2-NEW-${Date.now()}`;
+      const now = Date.now();
+      // Episode 1: 3 hot -> resolved
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 1, ts: new Date(now - 80000).toISOString(), soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 75000).toISOString(), soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: new Date(now - 70000).toISOString(), soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.2, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 4, ts: new Date(now - 65000).toISOString(), soc_pct: 80, battery_temp_c: 49.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.3, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 5, ts: new Date(now - 60000).toISOString(), soc_pct: 80, battery_temp_c: 48.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.4, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 6, ts: new Date(now - 55000).toISOString(), soc_pct: 80, battery_temp_c: 47.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.5, charging: false, fault_codes: [] }
+      ]);
+
+      const alertsEp1 = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").all(vid);
+      assert.strictEqual(alertsEp1.length, 1);
+      assert.strictEqual(alertsEp1[0].status, 'resolved');
+
+      // Intervening normal readings
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 7, ts: new Date(now - 50000).toISOString(), soc_pct: 80, battery_temp_c: 45.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.6, charging: false, fault_codes: [] }
+      ]);
+
+      // Episode 2: Genuinely new overheating episode (3 new hot readings)
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 8, ts: new Date(now - 45000).toISOString(), soc_pct: 80, battery_temp_c: 56.5, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.7, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 9, ts: new Date(now - 40000).toISOString(), soc_pct: 80, battery_temp_c: 57.5, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.8, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 10, ts: new Date(now - 35000).toISOString(), soc_pct: 80, battery_temp_c: 59.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.9, charging: false, fault_codes: [] }
+      ]);
+
+      const alertsEp2 = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat' ORDER BY id ASC").all(vid);
+      assert.strictEqual(alertsEp2.length, 2, 'Genuinely new overheating episode must create a second alert');
+      assert.strictEqual(alertsEp2[0].status, 'resolved', 'First alert remains resolved');
+      assert.strictEqual(alertsEp2[1].status, 'open', 'Second alert opens cleanly');
+    });
+
+    test('Same readings processed across multiple batches -> No duplicate', async () => {
+      const vid = `VG-ISSUE2-MULTI-${Date.now()}`;
+      const now = Date.now();
+      const batch1 = [
+        { vehicle_id: vid, seq: 1, ts: new Date(now - 40000).toISOString(), soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 35000).toISOString(), soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: new Date(now - 30000).toISOString(), soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.2, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 4, ts: new Date(now - 25000).toISOString(), soc_pct: 80, battery_temp_c: 49.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.3, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 5, ts: new Date(now - 20000).toISOString(), soc_pct: 80, battery_temp_c: 48.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.4, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 6, ts: new Date(now - 15000).toISOString(), soc_pct: 80, battery_temp_c: 47.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.5, charging: false, fault_codes: [] }
+      ];
+
+      await postSignedBatch(batch1);
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ?").get(vid).total, 1);
+
+      // Re-send the exact same batch: all marked duplicate, alert count must remain 1
+      const res2 = await postSignedBatch(batch1);
+      assert.strictEqual(res2.body.duplicates, 6);
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ?").get(vid).total, 1);
+    });
+
+    test('Restart engine after resolution -> No duplicate', async () => {
+      const vid = `VG-ISSUE2-RESTART-${Date.now()}`;
+      const now = Date.now();
+      // Seed an alert that was opened and resolved
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 1, ts: new Date(now - 30000).toISOString(), soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 25000).toISOString(), soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: new Date(now - 20000).toISOString(), soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.2, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 4, ts: new Date(now - 15000).toISOString(), soc_pct: 80, battery_temp_c: 49.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.3, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 5, ts: new Date(now - 10000).toISOString(), soc_pct: 80, battery_temp_c: 48.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.4, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 6, ts: new Date(now - 5000).toISOString(), soc_pct: 80, battery_temp_c: 47.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.5, charging: false, fault_codes: [] }
+      ]);
+
+      const alertsBefore = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ?").all(vid);
+      assert.strictEqual(alertsBefore.length, 1);
+      assert.strictEqual(alertsBefore[0].status, 'resolved');
+
+      // Simulate engine restart by invoking evaluateVehicleAlerts directly as on a fresh startup
+      const changedAfterRestart = evaluateVehicleAlerts(vid);
+      assert.strictEqual(changedAfterRestart.length, 0, 'Must produce zero changed alerts upon fresh evaluation after restart');
+
+      const alertsAfter = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ?").all(vid);
+      assert.strictEqual(alertsAfter.length, 1, 'Restarted engine evaluation must NOT duplicate resolved alerts');
+    });
+  });
 });
