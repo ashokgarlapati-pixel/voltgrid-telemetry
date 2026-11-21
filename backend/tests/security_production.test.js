@@ -573,6 +573,98 @@ describe('Part A2 / Issue 15: Production & Staging Credential Security Tests', (
       assert.strictEqual(west.rate_limit_per_sec, 30);
       assert.strictEqual(west.burst_capacity, 60);
     });
+
+    test('Rejects array entry with a 15-character secret (structural baseline failure)', () => {
+      assert.throws(
+        () => {
+          validateAndInitSecurityCredentials({
+            NODE_ENV: 'production',
+            VOLTGRID_API_KEYS: JSON.stringify([{ api_key: 'prod-fleet-short', secret: 'short1234567890' }])
+          });
+        },
+        (err) => {
+          assert.match(err.message, /Minimum length of 16 characters required/);
+          assert.match(err.message, /Minimum length is a structural baseline, not proof of cryptographic strength/);
+          assert.strictEqual(err.message.includes('short1234567890'), false);
+          return true;
+        }
+      );
+    });
+
+    test('Rejects array entry with 16 repeated characters (character-diversity heuristic failure)', () => {
+      assert.throws(
+        () => {
+          validateAndInitSecurityCredentials({
+            NODE_ENV: 'production',
+            VOLTGRID_API_KEYS: JSON.stringify([{ api_key: 'prod-fleet-repetitive', secret: 'aaaaaaaaaaaaaaaa' }])
+          });
+        },
+        (err) => {
+          assert.match(err.message, /Insufficient character diversity \(1 unique characters; minimum 8 required\)/);
+          assert.strictEqual(err.message.includes('aaaaaaaaaaaaaaaa'), false);
+          return true;
+        }
+      );
+    });
+
+    test('Accepts array entry with a valid 32-byte hexadecimal secret', () => {
+      const hexSecret = crypto.randomBytes(32).toString('hex');
+      const res = validateAndInitSecurityCredentials({
+        NODE_ENV: 'production',
+        VOLTGRID_API_KEYS: JSON.stringify([{ api_key: 'prod-fleet-hex', secret: hexSecret }])
+      });
+      assert.strictEqual(res.keysLoaded, 1);
+      const row = db.prepare('SELECT * FROM api_keys WHERE api_key = ?').get('prod-fleet-hex');
+      assert.ok(row);
+      assert.strictEqual(row.secret, hexSecret);
+    });
+
+    test('Accepts array entry with a valid base64 secret', () => {
+      const base64Secret = crypto.randomBytes(32).toString('base64');
+      const res = validateAndInitSecurityCredentials({
+        NODE_ENV: 'production',
+        VOLTGRID_API_KEYS: JSON.stringify([{ api_key: 'prod-fleet-b64', secret: base64Secret }])
+      });
+      assert.strictEqual(res.keysLoaded, 1);
+      const row = db.prepare('SELECT * FROM api_keys WHERE api_key = ?').get('prod-fleet-b64');
+      assert.ok(row);
+      assert.strictEqual(row.secret, base64Secret);
+    });
+
+    test('Rejects API_SECRET with a 15-character secret (structural baseline failure)', () => {
+      assert.throws(
+        () => {
+          validateAndInitSecurityCredentials({
+            NODE_ENV: 'production',
+            API_KEY: 'prod-single-short',
+            API_SECRET: 'short1234567890'
+          });
+        },
+        (err) => {
+          assert.match(err.message, /Minimum length of 16 characters required/);
+          assert.match(err.message, /Minimum length is a structural baseline, not proof of cryptographic strength/);
+          assert.strictEqual(err.message.includes('short1234567890'), false);
+          return true;
+        }
+      );
+    });
+
+    test('Rejects API_SECRET with 16 repeated characters (character-diversity heuristic failure)', () => {
+      assert.throws(
+        () => {
+          validateAndInitSecurityCredentials({
+            NODE_ENV: 'production',
+            API_KEY: 'prod-single-rep',
+            API_SECRET: 'bbbbbbbbbbbbbbbb'
+          });
+        },
+        (err) => {
+          assert.match(err.message, /Insufficient character diversity \(1 unique characters; minimum 8 required\)/);
+          assert.strictEqual(err.message.includes('bbbbbbbbbbbbbbbb'), false);
+          return true;
+        }
+      );
+    });
   });
 
   describe('4. Process-Level Server Startup & Authentication Rejection across Environments', () => {
