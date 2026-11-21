@@ -16,6 +16,12 @@ services:
     volumes:
       - sqlite_data:/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/health/ready', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
 
   # Secondary API Instance for Multi-Instance / Load-Balanced Testing (A2)
   # Shares the exact same SQLite database file via named volume mount
@@ -33,6 +39,12 @@ services:
     volumes:
       - sqlite_data:/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3001/health/ready', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
 
 volumes:
   sqlite_data:

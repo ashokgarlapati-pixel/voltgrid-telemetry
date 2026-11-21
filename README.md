@@ -90,8 +90,9 @@ All requests to `POST /v1/telemetry/batch` must include HMAC-SHA256 authenticati
 | `GET` | `/v1/alerts` | Filter alerts by `?status=open&rule=overheat&vehicle_id=VG-00042` | `200` OK |
 | `POST` | `/v1/alerts/:id/ack` | Optimistic concurrency acknowledgment (`{"version": 1}`) | `200` OK, `409` Conflict, `404` Not Found |
 | `GET` | `/v1/stream` | Server-Sent Events (SSE) live feed (supports `Last-Event-ID` resume) | `200` OK (`text/event-stream`) |
-| `GET` | `/health` | Service health status and timestamp | `200` OK |
-| `GET` | `/metrics` | Operational metrics (requests total, errors, uptime, DB row counts) | `200` OK |
+| `GET` | `/health` / `/health/live` | Liveness health check confirming application process is running | `200` OK |
+| `GET` | `/health/ready` | Readiness check probing active SQLite database connectivity | `200` OK, `503` Service Unavailable |
+| `GET` | `/metrics` | Process-local operational metrics (latency percentiles, request counts, errors, DB rows) | `200` OK |
 | `GET` | `/v1/completeness` | Fleet-wide or single-vehicle sequence completeness & gap detection (`?vehicle_id=VG-00042`) | `200` OK, `404` Not Found |
 
 ### Query API Specifications (Part A4)
@@ -370,12 +371,64 @@ npm run loadtest
 
 Configurable environment options:
 ```bash
-VUS=10 DURATION_SEC=15 WARMUP_SEC=2 BATCH_SIZE=50 node scripts/loadtest.js
+VUS=10 DURATION_SEC=10 WARMUP_SEC=2 BATCH_SIZE=50 node scripts/loadtest.js
 ```
+
+### Measured Multi-Endpoint Load Test Results (10 VUs, 10s Execution)
+
+Workload mix: 50% Batch Ingestion (HMAC signed), 25% Vehicles Keyset Listing, 15% Time-Series History, 10% Fleet Summary.
+
+| Metric | Measured Value |
+| :--- | :--- |
+| **Total Duration** | 10.20 seconds |
+| **Total Requests** | 100 |
+| **Successful Requests** | 100 (100.00%) |
+| **Failed Requests** | 0 (0.00%) |
+| **Overall Throughput** | 9.80 req/sec |
+| **Telemetry Ingestion Rate** | 2,250 readings (221 readings/sec) |
+
+#### Latency Percentiles by Endpoint:
+
+| Endpoint | Request Count | p50 (ms) | p95 (ms) | p99 (ms) | Max (ms) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| `POST /v1/telemetry/batch` | 45 | 895.85 | 1692.81 | 1693.20 | 1693.20 |
+| `GET /v1/vehicles` | 30 | 817.36 | 1156.94 | 1157.42 | 1157.42 |
+| `GET /v1/vehicles/:id/history` | 15 | 895.88 | 1692.88 | 1692.88 | 1692.88 |
+| `GET /v1/fleet/summary` | 10 | 839.88 | 1693.16 | 1693.16 | 1693.16 |
+| **Aggregated (All Endpoints)** | **100** | **840.36** | **1692.56** | **1693.16** | **1693.20** |
 
 ---
 
-## 9. Running Tests
+## 9. Observability, Structured Logging & Operational Health
+
+### 1. Request ID Correlation & Propagation
+* Every incoming request receives an `X-Request-Id` header (retaining an incoming client trace ID or generating a fresh UUID v4).
+* The ID is reflected in the HTTP response headers and propagated to all downstream log entries.
+
+### 2. Structured JSON Logging
+* All requests emit a single-line JSON log to standard output on completion:
+  ```json
+  {"ts":"2026-11-21T04:45:01.965Z","level":"info","request_id":"38c65a5b-847b-4747-8f01-de1cb7bbfc69","method":"GET","path":"/health","status":200,"duration_ms":3.78}
+  ```
+* **Security & Credential Redaction**: Authentication tokens, HMAC secrets, and `X-Signature` headers are never logged.
+
+### 3. Production Health Probes
+* **Liveness Probes (`GET /health` and `GET /health/live`)**: Return `200 OK` confirming the Node.js process is responsive.
+* **Readiness Probe (`GET /health/ready`)**: Actively tests SQLite connectivity via a lightweight `SELECT 1` probe. Returns `200 OK` (`{"status":"ready","database":"connected"}`) when ready, or `503 Service Unavailable` if database I/O fails.
+
+### 4. Process-Local Metrics (`GET /metrics`)
+Returns process health, request counts, error rates, latency percentiles, domain counters, and live SQLite row aggregates:
+* `process`: uptime, heap memory usage, Node version, scope.
+* `requests`: total requests, 5xx errors, status code breakdown, grouped endpoint counts.
+* `latency_ms`: min, avg, p50, p95, p99, and max.
+* `telemetry`: accepted, duplicate, and rejected readings.
+* `security`: auth failure count, rate-limit rejections count.
+* `stream`: active connected SSE client sockets.
+* `database`: live row counts from `vehicles`, `telemetry_history`, and active `alerts`.
+
+---
+
+## 10. Running Tests
 
 The test suite uses Node's native test runner (`node:test` and `node:assert/strict`) with zero external test dependencies:
 
@@ -384,7 +437,9 @@ cd backend
 npm test
 ```
 
-### Test Coverage Highlights:
+### Test Coverage Highlights (84 Tests Across 34 Suites):
+* **Observability & Probes Tests (`backend/tests/observability.test.js`)**: Tests `X-Request-Id` UUID generation and propagation, single-line structured JSON logs, sensitive credential redaction, `/health` and `/health/live` liveness probes, `/health/ready` database failure fallback to 503, and `/metrics` real-time counter incrementing.
+* **Load Test Smoke Tests (`backend/tests/loadtest.test.js`)**: Smoke tests `scripts/loadtest.js` in automated test pipelines, asserting summary calculation, throughput, and percentile reporting.
 * **Database Migration Tests (`backend/tests/migrations.test.js`)**: Verifies fresh database initialization, `schema_migrations` tracking, table constraints, index existence, and idempotent re-execution.
 * **Live SSE Stream Tests (`backend/tests/stream.int.test.js`)**: Real HTTP SSE testing for connection handshake, canonical event formatting, monotonic `Last-Event-ID` replay, restart resilience, atomic replay-to-live handoff race conditions, slow-client backpressure disconnection, 1s vehicle coalescing, and 400 req/s high-throughput benchmark.
 * **Query API Tests (`backend/tests/queries.int.test.js`)**: Keyset cursor pagination, bounding box boundary/inversion validation, 17,280-reading 24h history downsampling benchmark, fleet summary p95 SLA latency benchmark, and 10-client concurrent OCC alert ack race test.
@@ -392,10 +447,10 @@ npm test
 * **Alert Unit Tests (`backend/tests/alerts.unit.test.js`)**: Pure rule evaluation for Overheat (50°C–55°C hysteresis), Rapid Discharge (>8% drop in 5min), Geofence Breach (ray-casting polygon), and offline clock injection.
 * **Hermetic Integration Tests (`backend/tests/api.int.test.js`)**: Runs against an ephemeral port (`PORT=0`) with an isolated temporary SQLite database, verifying HTTP 207 partial success, latest-state timestamp resolution, sequence gap tracking, keyset pagination, peak downsampling, optimistic locking, and HMAC replay blocking.
 * **20-Client Concurrency Proof (`backend/tests/concurrency.test.js`)**: 20 concurrent clients simultaneously fire the identical 50-item batch. Mathematically asserts 50 accepted, 950 duplicates, 50 rows stored, 0 double counting.
-* **Two-Instance Shared DB Tests (`backend/tests/two_instances.test.js`)**: Verifies shared rate limiting, replay blocking, and concurrency across two distinct processes sharing the same SQLite database.
+* **Two-Instance Shared DB Tests (`backend/tests/security.two_instance.test.js`)**: Verifies shared rate limiting, replay blocking, and concurrency across two distinct processes sharing the same SQLite database.
 
 ---
 
-## 10. Architecture & System Design Document
+## 11. Architecture & System Design Document
 
 Read **[DESIGN.md](DESIGN.md)** for detailed engineering answers to scale, delivery guarantees, clock drift, storage retention, threat modeling, and trade-offs.

@@ -369,6 +369,8 @@ async function runLoadTest() {
     if (typeof spawnedStreamWorker === 'function') spawnedStreamWorker();
     spawnedServer.close();
   }
+
+  return metrics;
 }
 
 // Execute if invoked directly from CLI

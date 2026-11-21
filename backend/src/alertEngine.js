@@ -1,5 +1,6 @@
 const db = require('./db');
 const { publishAlertChange } = require('./stream');
+const { trackAlertCreated, trackAlertResolved } = require('./observability');
 
 /**
  * Operating polygon coordinates for geofence rule (around Chennai city center).
@@ -413,6 +414,11 @@ const evaluateVehicleAlertsTx = db.transaction((vehicleId, nowIso) => {
 function evaluateVehicleAlerts(vehicleId, nowIso = new Date().toISOString()) {
   const changedAlerts = evaluateVehicleAlertsTx(vehicleId, nowIso);
   for (const alert of changedAlerts) {
+    if (alert.status === 'open') {
+      trackAlertCreated();
+    } else if (alert.status === 'resolved') {
+      trackAlertResolved();
+    }
     publishAlertChange(alert);
   }
   return changedAlerts;

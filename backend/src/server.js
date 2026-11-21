@@ -2,7 +2,12 @@ const express = require('express');
 const db = require('./db');
 const { ingestBatch } = require('./ingestion');
 const { startOfflineWorker, stopOfflineWorker } = require('./offlineWorker');
-const { requestIdMiddleware, getMetricsHandler } = require('./observability');
+const {
+  requestIdMiddleware,
+  livenessHandler,
+  readinessHandler,
+  getMetricsHandler
+} = require('./observability');
 const {
   getVehiclesHandler,
   getVehicleHistoryHandler,
@@ -35,19 +40,17 @@ app.use((err, req, res, next) => {
 });
 
 /**
- * GET /health
- * Service health check endpoint
+ * Health Check Endpoints (Part A6)
+ * - GET /health and GET /health/live: Liveness check (process up)
+ * - GET /health/ready: Readiness check (database reachable)
  */
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    timestamp: new Date().toISOString()
-  });
-});
+app.get('/health', livenessHandler);
+app.get('/health/live', livenessHandler);
+app.get('/health/ready', readinessHandler);
 
 /**
  * GET /metrics
- * Basic in-memory performance metrics and database table counts (A6)
+ * Comprehensive in-memory performance metrics and database table counts (A6)
  */
 app.get('/metrics', getMetricsHandler);
 

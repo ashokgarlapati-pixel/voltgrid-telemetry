@@ -1,6 +1,7 @@
 const db = require('./db');
 const { evaluateAlertsForVehicles } = require('./alertEngine');
 const { publishVehicleUpdate, publishAlertChange } = require('./stream');
+const { trackTelemetryBatch } = require('./observability');
 
 /**
  * Documented Acceptable Telemetry Ranges:
@@ -280,6 +281,8 @@ function ingestBatch(readings) {
       }
     }
   }
+
+  trackTelemetryBatch(accepted, duplicates, rejected);
 
   return {
     total: readings.length,

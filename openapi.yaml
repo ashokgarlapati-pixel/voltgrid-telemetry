@@ -12,11 +12,11 @@ servers:
 paths:
   /health:
     get:
-      summary: Health check endpoint
-      description: Returns service status and ISO timestamp.
+      summary: Health check endpoint (Liveness)
+      description: Returns service status, uptime in seconds, and ISO timestamp.
       responses:
         '200':
-          description: Service is healthy
+          description: Service process is running
           content:
             application/json:
               schema:
@@ -25,37 +25,98 @@ paths:
                   status:
                     type: string
                     example: ok
+                  uptime_sec:
+                    type: integer
+                    example: 3600
+                  timestamp:
+                    type: string
+                    format: date-time
+
+  /health/live:
+    get:
+      summary: Liveness probe endpoint
+      description: Confirms the Node.js application process is healthy and serving requests.
+      responses:
+        '200':
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  uptime_sec:
+                    type: integer
+                    example: 3600
+                  timestamp:
+                    type: string
+                    format: date-time
+
+  /health/ready:
+    get:
+      summary: Readiness probe endpoint
+      description: Verifies active database connectivity (SELECT 1 probe on SQLite). Returns 503 if database check fails.
+      responses:
+        '200':
+          description: Database connected and ready to accept traffic
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ready
+                  database:
+                    type: string
+                    example: connected
+                  timestamp:
+                    type: string
+                    format: date-time
+        '503':
+          description: Database connectivity probe failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: not_ready
+                  error:
+                    type: string
                   timestamp:
                     type: string
                     format: date-time
 
   /metrics:
     get:
-      summary: Lightweight operational metrics
-      description: Returns in-memory request counters and live SQLite table row counts.
+      summary: Operational and process-local metrics
+      description: Returns process uptime, memory usage, request counts, latency percentiles (p50/p95/p99), telemetry counts, auth failures, and live SQLite row aggregates.
       responses:
         '200':
-          description: Metrics snapshot
+          description: Operational metrics snapshot
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  uptime_sec:
-                    type: integer
-                  requests_total:
-                    type: integer
-                  errors_total:
-                    type: integer
-                  db_stats:
+                  process:
                     type: object
-                    properties:
-                      total_vehicles:
-                        type: integer
-                      total_telemetry_rows:
-                        type: integer
-                      open_alerts:
-                        type: integer
+                  requests:
+                    type: object
+                  latency_ms:
+                    type: object
+                  telemetry:
+                    type: object
+                  security:
+                    type: object
+                  stream:
+                    type: object
+                  database:
+                    type: object
 
   /v1/telemetry/batch:
     post:

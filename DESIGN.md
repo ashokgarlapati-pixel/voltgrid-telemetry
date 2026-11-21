@@ -174,3 +174,20 @@ When two API instances share `voltgrid.db` across mounted volumes, `BEGIN IMMEDI
 ### Per-Client Back-Pressure & Slow-Client Disconnect
 * **TCP Socket Congestion**: If a client has a slow connection, Node's `res.write()` returns `false`, indicating that the operating system's kernel TCP buffer is saturated.
 * **Bounded Buffering & Safe Disconnect**: Frames are routed to a per-client buffer (`MAX_CLIENT_BUFFER = 100`) while awaiting socket `'drain'`. If a slow client exceeds 100 queued frames, the server cleanly disconnects the client with `: disconnected: client backpressure buffer overflow\n\n` and frees all memory. The client can reconnect with `Last-Event-ID` when ready. Fast clients and ingestion pipelines remain completely unblocked.
+
+---
+
+## 11. Database Schema Evolution & Observability
+
+### Transactional Migration Tracking
+* **Versioned Ordering**: Migrations are strictly versioned (`001_init.sql` through `004_stream.sql`) and tracked in `schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`.
+* **Atomic Idempotency**: Each unapplied script executes inside an atomic `BEGIN IMMEDIATE ... COMMIT` block. Re-running the application or running migrations across distributed replicas safely skips applied files with zero DDL locks.
+
+### Top Query Plans (EXPLAIN QUERY PLAN)
+* **History Time-Series Downsampling**: `WHERE vehicle_id = ? AND ts >= ? AND ts <= ? ORDER BY ts ASC, seq ASC` uses covering index `idx_history_vehicle_ts_seq (vehicle_id, ts DESC, seq DESC)`. SQLite reports `SEARCH telemetry_history USING INDEX` with zero full table scans.
+* **Keyset Pagination with Status Filter**: `WHERE status = ? AND vehicle_id > ? ORDER BY vehicle_id ASC LIMIT 51` uses composite index `idx_vehicles_status_id (status, vehicle_id)`. SQLite executes `SEARCH vehicles USING INDEX` with zero temporary B-tree sorts.
+
+### Observability & Health Design
+* **Trace Propagation**: Middleware generates or propagates `X-Request-Id` (UUID v4) across request lifecycles and emits structured single-line JSON logs (`level`, `request_id`, `path`, `status`, `duration_ms`), with credentials strictly sanitized.
+* **Separation of Liveness & Readiness**: `/health/live` confirms event loop responsiveness; `/health/ready` executes a live `SELECT 1` SQLite query, returning HTTP 503 if disk I/O or WAL contention fails, preventing upstream load balancers from routing traffic to impaired containers.
+* **Process-Local Metrics**: `GET /metrics` provides real-time latency percentiles (p50, p95, p99), telemetry counts (accepted, duplicate, rejected), security drops, active SSE sockets, and database row counts without external telemetry dependencies.

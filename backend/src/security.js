@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const db = require('./db');
+const { trackAuthFailure, trackRateLimitRejection } = require('./observability');
 
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 60 * 1000; // Clean expired nonces at most once every 60 seconds
@@ -98,6 +99,7 @@ function hmacAuth(req, res, next) {
     const rawSignature = req.headers['x-signature'] || req.headers['X-Signature'];
 
     if (!apiKey || !rawTimestamp || !rawSignature) {
+      trackAuthFailure();
       return res.status(401).json({
         error: 'Missing required authentication headers (X-API-Key, X-Timestamp, X-Signature)'
       });
@@ -105,6 +107,7 @@ function hmacAuth(req, res, next) {
 
     const apiKeyRow = getApiKeyStmt.get(apiKey);
     if (!apiKeyRow) {
+      trackAuthFailure();
       return res.status(401).json({ error: 'Invalid or unknown API key' });
     }
 
@@ -122,6 +125,7 @@ function hmacAuth(req, res, next) {
 
     const nowMs = Date.now();
     if (isNaN(reqTimeMs) || Math.abs(nowMs - reqTimeMs) > FIVE_MINUTES_MS) {
+      trackAuthFailure();
       return res.status(401).json({
         error: 'Request timestamp is outside the allowed 5-minute window'
       });
@@ -137,6 +141,7 @@ function hmacAuth(req, res, next) {
     const providedBuf = Buffer.from(String(rawSignature).trim(), 'utf8');
 
     if (expectedBuf.length !== providedBuf.length || !crypto.timingSafeEqual(expectedBuf, providedBuf)) {
+      trackAuthFailure();
       return res.status(401).json({ error: 'Invalid HMAC signature' });
     }
 
@@ -144,6 +149,7 @@ function hmacAuth(req, res, next) {
     const cleanSig = String(rawSignature).trim();
     const isNew = executeWithBusyRetry(() => recordNonceTx.immediate(cleanSig, nowMs));
     if (!isNew) {
+      trackAuthFailure();
       return res.status(401).json({ error: 'Replayed request signature' });
     }
 
@@ -179,6 +185,7 @@ function rateLimiter(req, res, next) {
     );
 
     if (!result.allowed) {
+      trackRateLimitRejection();
       res.setHeader('Retry-After', String(result.retryAfterSec));
       return res.status(429).json({
         error: 'Rate limit exceeded',
