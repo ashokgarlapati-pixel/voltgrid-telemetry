@@ -149,20 +149,33 @@ Every reading in `POST /v1/telemetry/batch` is individually validated using `Num
 Telemetry ingestion throughput depends fundamentally on batch size according to:
 $$\text{Batches/sec} = \frac{\text{Readings/sec}}{\text{Average readings per batch}}$$
 
+#### 1. Batch Size Limits & Simulator Configuration
 * **Maximum Permitted Batch Size (500 readings)**: Enforced strictly in `server.js` (`readings.length > 500` returns `HTTP 400 Bad Request`).
-* **Configured Simulator Batch Size (up to 500 readings)**: `simulator/simulator.js` defaults to `BATCH_SIZE = 500`. For the 2,000-vehicle baseline fleet emitting 400 readings/sec (5-second vehicle report intervals), readings are aggregated into **~1 batch/sec of ~400 readings**.
-* **Measured Average Batch Size in Benchmarks**:
-  * *Historical Mixed Load Test (`loadtest/loadtest.js`)*: Evaluated using fixed batches of **100 readings/batch** (415 batch requests over 30.7s = ~13.5 batches/s, ~1,350 readings/s).
-  * *Native Load Test (`scripts/loadtest.js`)*: Defaults to `BATCH_SIZE = 50` readings/batch.
-  * *In-Memory Streaming Benchmark (`tests/stream.int.test.js`)*: Ingests 400-reading bursts in 65–100 ms (~4,000–6,000 readings/sec).
-* **Theoretical Scale-Up Calculation vs. Benchmark Reality**:
-  * The **40,000 readings/sec** throughput figure is a **theoretical 100x projection** (200,000 vehicles @ 5s reporting interval), **not an empirical measurement**.
-  * At 40,000 readings/sec, write load varies by batch size:
-    * At **100 readings/batch** (historical load test average): $40{,}000 / 100 = \mathbf{400\text{ batches/sec}}$.
-    * At **500 readings/batch** (maximum permitted size): $40{,}000 / 500 = \mathbf{80\text{ batches/sec}}$.
-    * At **50 readings/batch** (`scripts/loadtest.js` default): $40{,}000 / 50 = \mathbf{800\text{ batches/sec}}$.
-    * **Unbatched** (1 reading per HTTP request): $40{,}000 / 1 = \mathbf{40{,}000\text{ req/sec}}$.
-  * Regardless of batching, single-writer SQLite WAL transactions bottleneck on disk commits under 40,000 readings/sec, requiring the production migration path outlined in Section 5.
+* **Simulator Batch Size Clarification**: In `simulator/simulator.js`, `BATCH_SIZE = 500` is a **maximum chunk size**, not a guaranteed average batch size. The generated batch can contain fewer than 500 readings. For the 2,000-vehicle baseline fleet emitting 400 readings/sec, each 1-second simulation tick aggregates ~400 readings into a single batch; when delayed queues or network anomalies split transmissions, chunks can be substantially smaller.
+
+#### 2. Actual Historical Mixed Load Test Measurements
+The historical mixed-workload load test (`loadtest/loadtest.js`) evaluated system behavior under concurrent writes and queries. These are **actual historical measured and configured results**, completely separate from theoretical scale projections:
+
+| Metric | Measured / Configured Value | Context / Notes |
+| :--- | :---: | :--- |
+| **Completed Batches** | **415 batches** | Total batch ingestion requests processed |
+| **Test Duration** | **30.7 seconds** | Active multi-endpoint load duration |
+| **Configured Batch Size** | **100 readings/batch** | Fixed batch size per ingestion payload |
+| **Ingestion Batch Rate** | **~13.5 batches/sec** | 415 batches / 30.7s ($60\%$ of total request traffic) |
+| **Ingestion Reading Throughput** | **~1,350 readings/sec** | 41,500 total readings ingested / 30.7s |
+| **Fleet Summary p95 Latency** | **651 ms** | **FAILED** against sub-150ms SLA under write transaction contention |
+
+#### 3. Theoretical 40,000 Readings/Sec Scenarios (Hypothetical Scale-Up)
+The **40,000 readings/sec** figure is a **theoretical 100x projection** (200,000 vehicles @ 5s reporting interval: $200{,}000 / 5 = 40{,}000\text{ readings/s}$). The system has **not** demonstrated 40,000 readings/sec throughput. The table below outlines **theoretical request-rate calculations** across different batching scenarios:
+
+| Scenario / Batch Size | Theoretical Readings/sec | Avg Readings/Batch | Theoretical Request Rate | Context / Notes |
+| :--- | :---: | :---: | :---: | :--- |
+| **Assumed 100 Readings/Batch** | 40,000 | 100 | **400 batches/sec** | Holds *only* when average batch size is 100 |
+| **Max Permitted Batch Size** | 40,000 | 500 | **80 batches/sec** | Hard ceiling enforced by `server.js` |
+| **Configured Load Test Size** | 40,000 | 50 | **800 batches/sec** | Default batch size in `scripts/loadtest.js` |
+| **Unbatched HTTP Telemetry** | 40,000 | 1 | **40,000 req/sec** | 1 HTTP request per vehicle reading |
+
+Regardless of batch size, serialized SQLite WAL writes queue up on disk commits under 40,000 readings/sec, requiring the production migration path outlined in Section 5.
 
 ---
 

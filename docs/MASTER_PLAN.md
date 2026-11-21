@@ -1063,13 +1063,46 @@ In `backend/tests/concurrency.test.js`:
 
 ## 24. Measured Load Test Results & SLA Validation (Part A6)
 
-Using `loadtest/loadtest.js`, we ran a mixed concurrent load test against the API. Below are the actual measured results:
+Telemetry ingestion throughput depends fundamentally on batch size according to:
+$$\text{Batches/sec} = \frac{\text{Readings/sec}}{\text{Average readings per batch}}$$
+
+### 1. Batch Size Limits & Simulator Configuration
+* **Maximum Permitted Batch Size (500 readings)**: Enforced strictly in `server.js` (`readings.length > 500` returns `HTTP 400 Bad Request`).
+* **Simulator Batch Size Clarification**: In `simulator/simulator.js`, `BATCH_SIZE = 500` is a **maximum chunk size**, not a guaranteed average batch size. The generated batch can contain fewer than 500 readings. For the 2,000-vehicle baseline fleet emitting 400 readings/sec, each 1-second simulation tick aggregates ~400 readings into a single batch; when delayed queues or network anomalies split transmissions, chunks can be substantially smaller.
+
+### 2. Actual Historical Mixed Load Test Measurements
+The historical mixed-workload load test (`loadtest/loadtest.js`) evaluated system behavior under concurrent writes and queries. These are **actual historical measured and configured results**, completely separate from theoretical scale projections:
+
+| Metric | Measured / Configured Value | Context / Notes |
+| :--- | :---: | :--- |
+| **Completed Batches** | **415 batches** | Total batch ingestion requests processed |
+| **Test Duration** | **30.7 seconds** | Active multi-endpoint load duration |
+| **Configured Batch Size** | **100 readings/batch** | Fixed batch size per ingestion payload |
+| **Ingestion Batch Rate** | **~13.5 batches/sec** | 415 batches / 30.7s ($60\%$ of total request traffic) |
+| **Ingestion Reading Throughput** | **~1,350 readings/sec** | 41,500 total readings ingested / 30.7s |
+| **Fleet Summary p95 Latency** | **651 ms** | **FAILED** against sub-150ms SLA under write transaction contention |
+
+### 3. Dedicated 5M Record Fleet Summary Performance Benchmark (Part A4 SLA)
+When isolated from write transaction lock contention, `GET /v1/fleet/summary` demonstrates compliance with the **sub-150ms p95 latency SLA** on the 5M record benchmark (`scripts/benchmark_5m.js`):
 
 | Metric | Measured Value | Requirement / SLA | Status |
 | :--- | :---: | :---: | :---: |
-| **Throughput** | **49+ req/s (4,900+ readings/sec)** | Sustained ~400 req/s | ✅ EXCEEDED |
-| **Fleet Summary p95 Latency** | **< 150 ms** | < 150 ms | ✅ EXCEEDED |
+| **Telemetry History Records** | **5,000,000** | 5,000,000 | Populated |
+| **Fleet Summary p95 Latency** | **8.64 ms** | < 150 ms | ✅ PASSED |
+| **Fleet Summary Internal DB Query** | **1.15 ms** | < 150 ms | ✅ PASSED |
 | **Overall Error Rate** | **0.00%** | < 0.1% | ✅ PASS |
+
+### 4. Theoretical 40,000 Readings/Sec Scenarios (Hypothetical Scale-Up)
+The **40,000 readings/sec** figure is a **theoretical 100x projection** (200,000 vehicles @ 5s reporting interval: $200{,}000 / 5 = 40{,}000\text{ readings/s}$). The system has **not** demonstrated 40,000 readings/sec throughput. The table below outlines **theoretical request-rate calculations** across different batching scenarios:
+
+| Scenario / Batch Size | Theoretical Readings/sec | Avg Readings/Batch | Theoretical Request Rate | Context / Notes |
+| :--- | :---: | :---: | :---: | :--- |
+| **Assumed 100 Readings/Batch** | 40,000 | 100 | **400 batches/sec** | Holds *only* when average batch size is 100 |
+| **Max Permitted Batch Size** | 40,000 | 500 | **80 batches/sec** | Hard ceiling enforced by `server.js` |
+| **Configured Load Test Size** | 40,000 | 50 | **800 batches/sec** | Default batch size in `scripts/loadtest.js` |
+| **Unbatched HTTP Telemetry** | 40,000 | 1 | **40,000 req/sec** | 1 HTTP request per vehicle reading |
+
+Regardless of batch size, serialized SQLite WAL writes queue up on disk commits under 40,000 readings/sec, requiring the production migration path outlined in Section 26 / DESIGN.md.
 
 ### SQLite EXPLAIN QUERY PLAN Output:
 * **History Range Scan**:
@@ -1111,7 +1144,7 @@ Using `loadtest/loadtest.js`, we ran a mixed concurrent load test against the AP
 The comprehensive engineering answers to all 7 Part C evaluation questions are authored in **[DESIGN.md](file:///c:/Users/garla/OneDrive/Desktop/Fleet%20telementary/voltgrid-telemetry/DESIGN.md)**:
 
 1. **Scale (100x Growth → 200,000 Vehicles / Theoretical ~40,000 Readings/sec)**:
-   * **Throughput & Batch Formula**: $\text{Batches/sec} = \text{Readings/sec} / \text{Average readings per batch}$. The ~400 batches/sec figure applies strictly when average batch size is 100 readings (from historical load test). At maximum permitted batch size (500), write load is 80 batches/s; at 50 readings/batch, 800 batches/s; and unbatched, 40,000 req/s. 40,000 readings/sec is a theoretical projection, not a measured benchmark.
+   * **Throughput & Batch Formula**: $\text{Batches/sec} = \text{Readings/sec} / \text{Average readings per batch}$. In contrast, 40,000 readings/s is a theoretical 100x projection for 200,000 vehicles, not demonstrated system throughput. The ~400 batches/sec figure applies strictly when average batch size is 100 readings. At maximum permitted chunk size (500), write load is 80 batches/s; at 50 readings/batch (`scripts/loadtest.js`), 800 batches/s; and unbatched, 40,000 req/s. In the simulator, `BATCH_SIZE = 500` is a maximum chunk size, and actual batches can contain fewer than 500 readings (e.g. ~400/tick). Meanwhile, actual historical tests measured 415 batches across 30.7s at 100 readings/batch (~13.5 batches/s, ~1,350 readings/s).
    * **First Bottleneck**: SQLite's single-writer lock on `BEGIN IMMEDIATE` transactions in `ingestion.js`.
    * **Next 3 Bottlenecks**: Single-threaded Node.js event-loop CPU saturation (HMAC + JSON parsing) $\rightarrow$ NVMe disk I/O & B-tree write amplification on `telemetry_history` (3.45B rows/day) $\rightarrow$ In-memory SSE fan-out & `offlineWorker` 10s table scans.
    * **Mitigations**: Stateless API cluster behind API Gateway $\rightarrow$ Kafka buffer + ClickHouse/TimescaleDB time-partitioned storage $\rightarrow$ Redis Sorted Sets for heartbeats and Redis Pub/Sub for SSE streaming.
