@@ -20,6 +20,7 @@ try {
   db.pragma('journal_mode = WAL');
   db.pragma('busy_timeout = 5000');
   db.pragma('synchronous = NORMAL');
+  db.pragma('cache_size = -64000');
 } catch (err) {
   // Resilient fallback: Node.js built-in SQLite (allows running directly on Windows without Docker/C++ toolchain)
   const { DatabaseSync } = require('node:sqlite');
@@ -28,6 +29,7 @@ try {
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA busy_timeout = 5000;');
   db.exec('PRAGMA synchronous = NORMAL;');
+  db.exec('PRAGMA cache_size = -64000;');
 
   // Polyfill transaction with immediate locking for node:sqlite
   db.transaction = function (fn) {
@@ -53,6 +55,8 @@ try {
     db.exec(statement);
   };
 }
+
+db.engineName = engineName;
 
 // Run database migrations automatically in sorted alphabetical order with schema_migrations tracking
 function runMigrations() {

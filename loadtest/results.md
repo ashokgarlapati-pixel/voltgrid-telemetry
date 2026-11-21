@@ -103,27 +103,27 @@ A reproducible performance benchmark (`scripts/benchmark_5m.js`) tests `GET /v1/
 * **Operating System**: Windows_NT 10.0.26200 x64
 * **Node.js**: v24.14.1
 * **Database Size**: 1,302.05 MB (5,000,000 rows in `telemetry_history`)
-* **SQLite Configuration**: WAL mode, `synchronous = NORMAL`, `busy_timeout = 5000ms`, `cache_size = -64000`
+* **SQLite Configuration**: Engine driver `node:sqlite` (fallback) / `better-sqlite3`, WAL mode, `synchronous = NORMAL`, `busy_timeout = 5000ms`, `cache_size = -64000`
 
 ### Empirical Measurement Results
 
-| Metric | Measured Value | Requirement / SLA | Status |
-| :--- | :---: | :---: | :---: |
-| **Telemetry History Records** | **5,000,000** | 5,000,000 | Populated |
-| **Fleet Vehicles** | **1,000** | Multi-vehicle | Populated |
-| **Database File Size** | **1,302.05 MB** | ~1.3 GB | Verified |
-| **Concurrency** | **10 VUs** | Concurrent | Completed |
-| **Total Measured Requests** | **500** (+ 50 warm-up) | 500 | Completed |
-| **Successful Requests** | **500 (100.0%)** | 100% | Completed |
-| **Error Rate** | **0.00%** | < 0.1% | PASSED |
-| **Throughput** | **1,768 req/s** | - | Completed |
-| **Min Latency** | **3.70 ms** | - | Completed |
-| **Average Latency** | **5.61 ms** | - | Completed |
-| **p50 Latency** | **5.56 ms** | - | Completed |
-| **p90 Latency** | **6.81 ms** | - | Completed |
-| **p95 Latency** | **7.23 ms** | **< 150.0 ms** | **PASSED (Target Satisfied)** |
-| **p99 Latency** | **9.89 ms** | - | Completed |
-| **Max Latency** | **10.37 ms** | - | Completed |
+| Metric | Initial Benchmark Run | Verification Benchmark Run | Requirement / SLA | Status |
+| :--- | :---: | :---: | :---: | :---: |
+| **Telemetry History Records** | **5,000,000** | **5,000,000** | 5,000,000 | Populated |
+| **Fleet Vehicles** | **1,000** | **1,000** | Multi-vehicle | Populated |
+| **Database File Size** | **1,302.05 MB** | **1,302.05 MB** | ~1.3 GB | Verified |
+| **Concurrency** | **10 VUs** | **10 VUs** | Concurrent | Completed |
+| **Total Measured Requests** | **500** (+ 50 warm-up) | **500** (+ 50 warm-up) | 500 | Completed |
+| **Successful Requests** | **500 (100.0%)** | **500 (100.0%)** | 100% | Completed |
+| **Error Rate** | **0.00%** | **0.00%** | < 0.1% | **PASSED** |
+| **Throughput** | **1,768 req/s** | **1,646 req/s** | - | Completed |
+| **Min Latency** | **3.70 ms** | **4.26 ms** | - | Completed |
+| **Average Latency** | **5.61 ms** | **6.03 ms** | - | Completed |
+| **p50 Latency** | **5.56 ms** | **5.99 ms** | - | Completed |
+| **p90 Latency** | **6.81 ms** | **7.26 ms** | - | Completed |
+| **p95 Latency** | **7.23 ms** | **8.64 ms** | **< 150.0 ms** | **PASSED (Target Satisfied)** |
+| **p99 Latency** | **9.89 ms** | **10.77 ms** | - | Completed |
+| **Max Latency** | **10.37 ms** | **11.29 ms** | - | Completed |
 
 ### Query Engine Justification & Optimization
 

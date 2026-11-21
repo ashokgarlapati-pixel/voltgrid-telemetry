@@ -90,19 +90,33 @@ async function ensureDataset() {
   console.log(`Target Readings      : ${TARGET_READINGS.toLocaleString()}`);
   console.log(`Target Vehicles      : ${VEHICLE_COUNT.toLocaleString()}`);
 
-  // Check current reading count
+  // Check current reading and vehicle counts
   const countRow = db.prepare('SELECT COUNT(*) AS count FROM telemetry_history').get();
   const currentCount = Number(countRow?.count || 0);
-  console.log(`Existing Readings    : ${currentCount.toLocaleString()}`);
 
-  if (currentCount >= TARGET_READINGS && !FORCE_GEN) {
-    console.log(`\n[Idempotency Check] Database already contains ${currentCount.toLocaleString()} readings (>= ${TARGET_READINGS.toLocaleString()}).`);
+  const vehicleCountRow = db.prepare('SELECT COUNT(DISTINCT vehicle_id) AS vCount FROM telemetry_history').get();
+  const currentVehicleCount = Number(vehicleCountRow?.vCount || 0);
+
+  const vehiclesTableCountRow = db.prepare('SELECT COUNT(*) AS count FROM vehicles').get();
+  const currentVehiclesTableCount = Number(vehiclesTableCountRow?.count || 0);
+
+  console.log(`Existing Readings    : ${currentCount.toLocaleString()} across ${currentVehicleCount.toLocaleString()} vehicles (vehicles table: ${currentVehiclesTableCount.toLocaleString()})`);
+
+  // Verify whether the exact intended benchmark dataset already exists
+  const isExactDataset = (currentCount === TARGET_READINGS) &&
+                         (currentVehicleCount === VEHICLE_COUNT) &&
+                         (currentVehiclesTableCount === VEHICLE_COUNT);
+
+  if (isExactDataset && !FORCE_GEN) {
+    console.log(`\n[Idempotency Check] Database already contains exactly ${currentCount.toLocaleString()} benchmark readings across ${currentVehicleCount.toLocaleString()} vehicles.`);
     console.log('Skipping dataset generation to avoid duplicate data.\n');
     return;
   }
 
-  if (FORCE_GEN && currentCount > 0) {
-    console.log('\n[Force Flag Detected] Purging existing telemetry, vehicles, and alerts for fresh generation...');
+  // If dirty, partial, or mismatched dataset exists (or force requested), clean before regenerating
+  if (currentCount > 0 || currentVehiclesTableCount > 0) {
+    console.log(`\n[Dataset Setup] Current record state (${currentCount.toLocaleString()} readings, ${currentVehiclesTableCount.toLocaleString()} vehicles) does not match benchmark target (${TARGET_READINGS.toLocaleString()} readings, ${VEHICLE_COUNT.toLocaleString()} vehicles).`);
+    console.log('Purging existing records to ensure clean, non-duplicate dataset...');
     db.exec('DELETE FROM telemetry_history;');
     db.exec('DELETE FROM vehicles;');
     db.exec('DELETE FROM alerts;');
@@ -117,12 +131,14 @@ async function ensureDataset() {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, datetime('now'))
   `);
 
-  const readingsPerVehicle = Math.ceil(TARGET_READINGS / VEHICLE_COUNT);
+  const basePerVehicle = Math.floor(TARGET_READINGS / VEHICLE_COUNT);
+  const remainder = TARGET_READINGS % VEHICLE_COUNT;
   const nowIso = new Date().toISOString();
 
   db.exec('BEGIN TRANSACTION');
   for (let v = 1; v <= VEHICLE_COUNT; v++) {
     const vid = `VG-${String(v).padStart(5, '0')}`;
+    const readingsForThisVehicle = basePerVehicle + (v <= remainder ? 1 : 0);
     const status = v <= Math.floor(VEHICLE_COUNT * 0.85)
       ? 'online'
       : (v <= Math.floor(VEHICLE_COUNT * 0.97) ? 'offline' : 'maintenance');
@@ -135,8 +151,8 @@ async function ensureDataset() {
     const charging = status === 'online' && (v % 8 === 0) ? 1 : 0;
 
     insertVehicle.run(
-      vid, nowIso, readingsPerVehicle, soc, temp, speed,
-      lat, lng, odo, charging, status, readingsPerVehicle, readingsPerVehicle
+      vid, nowIso, readingsForThisVehicle, soc, temp, speed,
+      lat, lng, odo, charging, status, readingsForThisVehicle, readingsForThisVehicle
     );
   }
   db.exec('COMMIT');
@@ -159,7 +175,7 @@ async function ensureDataset() {
   }
   db.exec('COMMIT');
 
-  // 3. Populate 5,000,000 Telemetry Readings
+  // 3. Populate Exact Telemetry Readings (guaranteed exactly TARGET_READINGS)
   console.log(`Inserting ${TARGET_READINGS.toLocaleString()} telemetry records into 'telemetry_history'...`);
   const insertTelemetry = db.prepare(`
     INSERT OR IGNORE INTO telemetry_history (
@@ -178,7 +194,9 @@ async function ensureDataset() {
 
   for (let v = 1; v <= VEHICLE_COUNT; v++) {
     const vid = `VG-${String(v).padStart(5, '0')}`;
-    for (let s = 1; s <= readingsPerVehicle; s++) {
+    const readingsForThisVehicle = basePerVehicle + (v <= remainder ? 1 : 0);
+
+    for (let s = 1; s <= readingsForThisVehicle; s++) {
       const ts = new Date(baseTs + s * 5000).toISOString();
       const soc = Number((95.0 - ((s % 500) * 0.1)).toFixed(1));
       const temp = Number((28.0 + ((s % 100) * 0.2)).toFixed(1));
@@ -211,8 +229,22 @@ async function ensureDataset() {
   db.exec('PRAGMA synchronous = NORMAL;'); // Restore safe durability mode
   db.exec('PRAGMA wal_checkpoint(PASSIVE);');
 
+  // Verify exact dataset counts
+  const verifyHistoryRow = db.prepare('SELECT COUNT(*) AS count FROM telemetry_history').get();
+  const finalHistoryCount = Number(verifyHistoryRow?.count || 0);
+
+  const verifyVehiclesRow = db.prepare('SELECT COUNT(*) AS count FROM vehicles').get();
+  const finalVehiclesCount = Number(verifyVehiclesRow?.count || 0);
+
+  if (finalHistoryCount !== TARGET_READINGS) {
+    throw new Error(`Dataset verification failed: expected exactly ${TARGET_READINGS} telemetry readings, but found ${finalHistoryCount}`);
+  }
+  if (finalVehiclesCount !== VEHICLE_COUNT) {
+    throw new Error(`Dataset verification failed: expected exactly ${VEHICLE_COUNT} vehicles, but found ${finalVehiclesCount}`);
+  }
+
   const genDuration = (Date.now() - startTime) / 1000;
-  console.log(`\n\nDataset generation complete: ${totalInserted.toLocaleString()} records in ${genDuration.toFixed(2)}s (${Math.round(totalInserted / genDuration).toLocaleString()} rows/s)`);
+  console.log(`\n\nDataset generation complete: Exactly ${finalHistoryCount.toLocaleString()} records across ${finalVehiclesCount.toLocaleString()} vehicles in ${genDuration.toFixed(2)}s (${Math.round(totalInserted / genDuration).toLocaleString()} rows/s)`);
 
   const fileStat = fs.statSync(BENCH_DB_PATH);
   console.log(`Database File Size on Disk: ${(fileStat.size / (1024 * 1024)).toFixed(2)} MB\n`);
@@ -361,6 +393,7 @@ async function runBenchmark() {
   console.log(`Database Size on Disk     : ${(dbStat.size / (1024 * 1024)).toFixed(2)} MB`);
   console.log(`Hardware Environment     : ${cpus[0]?.model || 'Generic CPU'} (${cpus.length} cores, ${(os.totalmem() / (1024**3)).toFixed(1)} GB RAM)`);
   console.log(`OS & Node.js Version      : ${os.type()} ${os.release()} | Node ${process.version}`);
+  console.log(`SQLite Engine Driver      : ${db.engineName || 'better-sqlite3'}`);
   console.log(`Concurrency & Requests    : ${CONCURRENCY} VUs | ${TOTAL_REQUESTS} requests (${WARMUP_REQUESTS} warm-up)`);
   console.log('-'.repeat(75));
   console.log(`Throughput                : ${throughput.toLocaleString()} req/s`);
@@ -388,7 +421,16 @@ async function runBenchmark() {
   console.log('\n[Sample Verified API Payload]');
   console.log(JSON.stringify(samplePayload, null, 2));
 
-  // Graceful Shutdown
+  // Graceful Shutdown: stop background workers first
+  try {
+    const { stopOfflineWorker } = require('../backend/src/offlineWorker');
+    stopOfflineWorker();
+  } catch (_) {}
+  try {
+    const { stopStreamWorker } = require('../backend/src/stream');
+    stopStreamWorker();
+  } catch (_) {}
+
   server.close(() => {
     try {
       db.close();
