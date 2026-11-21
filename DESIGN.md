@@ -102,7 +102,7 @@ At 400 readings/sec, that is $35{,}000{,}000 \times 220\text{ B} \approx 7.7\tex
 
 * **Keyset Pagination (`GET /v1/vehicles`)**: Avoided `OFFSET` because it requires scanning and dropping $N$ rows and drifts under streaming writes. Instead, we use `WHERE vehicle_id > @cursor ORDER BY vehicle_id ASC LIMIT @limit + 1`, backed by index `idx_vehicles_status_id (status, vehicle_id)`. `EXPLAIN QUERY PLAN` confirms zero temporary B-tree sorting.
 * **Peak-Preserving Downsampling**: Naive interval sampling skips sharp temperature spikes. We split the time window into $\lfloor (P - 2) / 4 \rfloor$ buckets and extract minimum and maximum values for temperature, minimum SOC, and maximum speed, preserving peaks under 140 ms for 17,280 readings.
-* **Fleet Summary SLA**: Derived strictly from `vehicles` (2,000 rows) and active `alerts` (`WHERE status != 'resolved'`). Never scans `telemetry_history`. $p95$ latency is under 2 ms.
+* **Fleet Summary SLA**: Derived strictly from `vehicles` (1,000–2,000 rows) and active `alerts` (`WHERE status != 'resolved'`). Never scans `telemetry_history`. SQLite query executes in < 1 ms (end-to-end HTTP $p95$ under 10 ms vs 150 ms SLA limit).
 * **Optimistic Locking on Alert Ack**: Dispatchers include `version` in `POST /v1/alerts/:id/ack`. The query runs `WHERE id = @id AND version = @version AND status = 'open'`. If another dispatcher already acknowledged it, SQLite updates 0 rows and returns `409 Conflict`.
 
 ---

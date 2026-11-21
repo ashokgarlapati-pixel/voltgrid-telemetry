@@ -251,11 +251,11 @@ async function main() {
 | Metric | Measured Value | Requirement / SLA | Status |
 | :--- | :---: | :---: | :---: |
 | **Total Requests** | **${stats.totalRequests.toLocaleString()}** | N/A | Completed |
-| **Throughput (RPS)** | **${throughput.toLocaleString()} req/s** | Sustained ~400 req/s | ✅ EXCEEDED |
-| **Overall p50 Latency** | **${p50} ms** | Sub-50ms | ✅ EXCEEDED |
-| **Overall p95 Latency** | **${p95} ms** | < 150 ms | ✅ EXCEEDED |
-| **Overall p99 Latency** | **${p99} ms** | < 300 ms | ✅ EXCEEDED |
-| **Error Rate** | **${errorRate}%** | < 0.1% | ✅ PASS |
+| **Throughput (RPS)** | **${throughput.toLocaleString()} req/s** | Sustained ~400 req/s | ${throughput >= 400 ? 'PASSED' : 'UNMET'} |
+| **Overall p50 Latency** | **${p50} ms** | Sub-50ms | ${p50 <= 50 ? 'PASSED' : 'EXCEEDED'} |
+| **Overall p95 Latency** | **${p95} ms** | < 150 ms | ${p95 <= 150 ? 'PASSED' : 'EXCEEDED'} |
+| **Overall p99 Latency** | **${p99} ms** | < 300 ms | ${p99 <= 300 ? 'PASSED' : 'EXCEEDED'} |
+| **Error Rate** | **${errorRate}%** | < 0.1% | ${stats.errors === 0 ? 'PASSED' : 'FAILED'} |
 
 ---
 
@@ -267,7 +267,7 @@ async function main() {
 | **GET /v1/fleet/summary** | 25% | ${stats.endpoints.summary.total.toLocaleString()} | ${Math.round(stats.endpoints.summary.total / totalDurationSec)} req/s | ${summaryP50} ms | **${summaryP95} ms** | ${summaryP99} ms | ${stats.endpoints.summary.errors} |
 | **GET /v1/vehicles/:id/history (200 pts)** | 15% | ${stats.endpoints.history.total.toLocaleString()} | ${Math.round(stats.endpoints.history.total / totalDurationSec)} req/s | ${historyP50} ms | ${historyP95} ms | ${historyP99} ms | ${stats.endpoints.history.errors} |
 
-> **Key SLA Verification**: \`GET /v1/fleet/summary\` p95 latency is **${summaryP95} ms**, comfortably below the 150 ms threshold required by the specification.
+> **SLA Evaluation (\`GET /v1/fleet/summary\`)**: p95 latency is **${summaryP95} ms** (${summaryP95 < 150.0 ? 'PASSED: Satisfies sub-150ms SLA requirement' : 'FAILED: Exceeds 150ms SLA limit under mixed write contention; see dedicated benchmark in scripts/benchmark_5m.js'}).
 
 ---
 

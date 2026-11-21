@@ -397,6 +397,8 @@ Workload mix: 50% Batch Ingestion (HMAC signed), 25% Vehicles Keyset Listing, 15
 | `GET /v1/fleet/summary` | 10 | 839.88 | 1693.16 | 1693.16 | 1693.16 |
 | **Aggregated (All Endpoints)** | **100** | **840.36** | **1692.56** | **1693.16** | **1693.20** |
 
+> **Note on Mixed-Workload Results**: In this multi-endpoint test, 50% of traffic consisted of concurrent batch ingestion writes running inside serialized SQLite write transactions (`BEGIN IMMEDIATE`). Read endpoints (including Fleet Summary at 1,693 ms p95) queued behind active disk commits. To measure Fleet Summary query efficiency under high volume independently of write lock contention, see the dedicated 5M benchmark below.
+
 ### 5 Million Readings Fleet Summary Performance Benchmark (Part A4 SLA)
 
 A reproducible benchmark runner (`scripts/benchmark_5m.js`) evaluates `GET /v1/fleet/summary` against 5,000,000 telemetry readings across 1,000 vehicles, demonstrating compliance with the **sub-150ms p95 latency SLA**:
@@ -407,18 +409,25 @@ npm run benchmark:5m
 ```
 
 #### Measured Benchmark Results (10 Concurrent VUs, 500 Requests, 50 Warm-Up):
+* **Environment**: 13th Gen Intel(R) Core(TM) i5-1335U (12 cores, 15.7 GB RAM), Windows_NT 10.0.26200 x64, Node.js v24.14.1
+* **Database Driver**: `node:sqlite (built-in fallback)` with WAL mode, `synchronous = NORMAL`, `busy_timeout = 5000ms`, `cache_size = -64000`
 
-| Metric | Measured Value | Requirement / SLA | Status |
-| :--- | :---: | :---: | :---: |
-| **Telemetry History Records** | **5,000,000** | 5,000,000 | Populated |
-| **Fleet Vehicles** | **1,000** | Multi-vehicle | Populated |
-| **Database File Size** | **1,302.05 MB** | ~1.3 GB | Verified |
-| **Throughput** | **1,768 req/s** | - | Completed |
-| **Error Rate** | **0.00%** | < 0.1% | PASSED |
-| **Average Latency** | **5.61 ms** | - | Completed |
-| **p50 Latency** | **5.56 ms** | - | Completed |
-| **p95 Latency** | **7.23 ms** | **< 150.0 ms** | **PASSED (Target Satisfied)** |
-| **p99 Latency** | **9.89 ms** | - | Completed |
+| Metric | Initial Benchmark Run | Latest Verified Benchmark Run | Requirement / SLA | Status |
+| :--- | :---: | :---: | :---: | :---: |
+| **Telemetry History Records** | **5,000,000** | **5,000,000** | 5,000,000 | Populated |
+| **Fleet Vehicles** | **1,000** | **1,000** | Multi-vehicle | Populated |
+| **Database File Size** | **1,302.05 MB** | **1,302.05 MB** | ~1.3 GB | Verified |
+| **Throughput** | **1,768 req/s** | **1,646 req/s** | - | Completed |
+| **Error Rate** | **0.00%** | **0.00%** | < 0.1% | **PASSED** |
+| **Average Latency** | **5.61 ms** | **6.03 ms** | - | Completed |
+| **p50 Latency** | **5.56 ms** | **5.99 ms** | - | Completed |
+| **p90 Latency** | **6.81 ms** | **7.26 ms** | - | Completed |
+| **p95 Latency** | **7.23 ms** | **8.64 ms** | **< 150.0 ms** | **PASSED (Target Satisfied)** |
+| **p99 Latency** | **9.89 ms** | **10.77 ms** | - | Completed |
+| **Max Latency** | **10.37 ms** | **11.29 ms** | - | Completed |
+
+* **Query Plan Optimization**: Aggregates directly from `vehicles` (1,000 rows) and `alerts` (filtered via `idx_alerts_active_rule`). `telemetry_history` (5,000,000 rows) is never scanned, ensuring $O(V)$ scaling instead of $O(N)$.
+* **Idempotency**: Repeated execution checks existing row counts before inserting, preventing duplicate rows or artificial inflation.
 
 * **Query Plan Optimization**: Aggregates directly from `vehicles` (1,000 rows) and `alerts` (filtered via `idx_alerts_active_rule`). `telemetry_history` (5,000,000 rows) is never scanned, ensuring $O(V)$ scaling instead of $O(N)$.
 * **Idempotency**: Repeated execution checks existing row counts before inserting, preventing duplicate rows or artificial inflation.
