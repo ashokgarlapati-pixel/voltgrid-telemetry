@@ -23,6 +23,10 @@ const {
   stopStreamWorker,
   getConnectedClientsCount
 } = require('../src/stream');
+const {
+  evaluateAlertsForVehicles,
+  evaluateVehicleAlerts
+} = require('../src/alertEngine');
 
 const API_KEY = 'voltgrid-dev-key';
 const API_SECRET = 'voltgrid-dev-secret';
@@ -801,8 +805,159 @@ describe('Part A5: Live Stream (SSE) Integration & Performance Tests', () => {
     });
   });
 
+  describe('Issue 11: evaluateAlertsForVehicles Transaction Ordering & Rollback Safety', () => {
+    test('Successful rule alert evaluation commits to DB before publishing to SSE and persisting to stream_events', async () => {
+      const vid = `VG-I11-SUCC-${Date.now()}`;
+      const now = Date.now();
+
+      const sseClient = createSseClient(`${baseUrl}/v1/stream?api_key=${API_KEY}`);
+      await sseClient.ready;
+      await new Promise(r => setTimeout(r, 50));
+
+      // Post 3 consecutive readings with battery_temp_c = 60°C (> 55°C threshold) to trigger Overheat
+      const readings = [
+        { vehicle_id: vid, seq: 1, ts: new Date(now - 15000).toISOString(), soc_pct: 80, battery_temp_c: 60.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 100, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 10000).toISOString(), soc_pct: 80, battery_temp_c: 62.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 101, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: new Date(now - 5000).toISOString(), soc_pct: 80, battery_temp_c: 65.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 102, charging: false, fault_codes: [] }
+      ];
+
+      const res = await postBatch(readings);
+      assert.strictEqual(res.status, 200);
+
+      // Wait for SSE broadcast
+      await new Promise(r => setTimeout(r, 100));
+
+      // 1. Verify alert in DB is committed with status='open', rule='overheat'
+      const alertInDb = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").get(vid);
+      assert.ok(alertInDb, 'Alert row must exist in DB');
+      assert.strictEqual(alertInDb.status, 'open');
+      assert.strictEqual(alertInDb.version, 1);
+
+      // 2. Verify SSE client received exactly 1 alert_change event
+      const alertEvents = sseClient.getEvents().filter(e => e.event === 'alert_change' && e.data && e.data.vehicle_id === vid);
+      assert.strictEqual(alertEvents.length, 1, 'Client must receive exactly 1 alert_change event');
+      assert.strictEqual(alertEvents[0].data.alert_id, alertInDb.id);
+      assert.strictEqual(alertEvents[0].data.rule, 'overheat');
+      assert.strictEqual(alertEvents[0].data.status, 'open');
+
+      // 3. Verify durable stream_events row exists and matches
+      const streamRow = db.prepare('SELECT * FROM stream_events WHERE id = ?').get(alertEvents[0].id);
+      assert.ok(streamRow, 'Stream event must be persisted to stream_events table');
+      assert.strictEqual(streamRow.event_type, 'alert_change');
+
+      sseClient.close();
+    });
+
+    test('Failed transaction rolls back cleanly with zero SSE events and zero durable stream_events records', async () => {
+      const vidFailed = `VG-I11-FAIL-${Date.now()}`;
+      const now = Date.now();
+
+      const sseClient = createSseClient(`${baseUrl}/v1/stream?api_key=${API_KEY}`);
+      await sseClient.ready;
+      await new Promise(r => setTimeout(r, 50));
+
+      const countBefore = db.prepare('SELECT COUNT(*) AS c FROM stream_events').get().c;
+
+      // Install a SQLite trigger that forces transaction rollback on alert insertion for this vehicle
+      db.exec(`
+        CREATE TRIGGER abort_eval_tx BEFORE INSERT ON alerts
+        WHEN NEW.vehicle_id = '${vidFailed}'
+        BEGIN
+          SELECT RAISE(ABORT, 'Simulated alert transaction abort');
+        END;
+      `);
+
+      try {
+        // Seed 3 hot readings directly in telemetry_history so evaluateVehicleAlerts would trigger overheat
+        for (let seq = 1; seq <= 3; seq++) {
+          db.prepare(`
+            INSERT INTO telemetry_history (vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, fault_codes, received_at)
+            VALUES (?, ?, ?, 80, 60.0, 0, 13.08, 80.27, 100, 0, '[]', ?)
+          `).run(vidFailed, seq, new Date(now - 10000 + seq * 1000).toISOString(), new Date(now).toISOString());
+        }
+
+        // Attempt alert evaluation: must throw and rollback cleanly
+        assert.throws(() => {
+          evaluateVehicleAlerts(vidFailed);
+        }, /Simulated alert transaction abort/);
+
+        // Verify alert row does NOT exist in DB (rolled back)
+        const alertInDb = db.prepare('SELECT * FROM alerts WHERE vehicle_id = ?').get(vidFailed);
+        assert.strictEqual(alertInDb, undefined, 'Alert row must be rolled back');
+
+        await new Promise(r => setTimeout(r, 100));
+
+        // Verify SSE client received zero events for failed vehicle
+        const clientEvents = sseClient.getEvents().filter(e => e.event === 'alert_change' && e.data && e.data.vehicle_id === vidFailed);
+        assert.strictEqual(clientEvents.length, 0, 'No SSE alert_change events must be emitted when transaction rolls back');
+
+        // Verify no stream_events rows were inserted
+        const countAfter = db.prepare('SELECT COUNT(*) AS c FROM stream_events').get().c;
+        assert.strictEqual(countAfter, countBefore, 'Zero rows must be added to stream_events table');
+      } finally {
+        db.exec('DROP TRIGGER IF EXISTS abort_eval_tx');
+        sseClient.close();
+      }
+    });
+
+    test('Multiple alert changes across vehicles are published strictly post-commit without duplicates', async () => {
+      const vid1 = `VG-I11-MULTI1-${Date.now()}`;
+      const vid2 = `VG-I11-MULTI2-${Date.now()}`;
+      const now = Date.now();
+
+      const sseClient = createSseClient(`${baseUrl}/v1/stream?api_key=${API_KEY}`);
+      await sseClient.ready;
+      await new Promise(r => setTimeout(r, 50));
+
+      // Batch with:
+      // - vid1: 3 readings triggering overheat
+      // - vid2: 1 reading outside Chennai polygon triggering geofence_breach
+      const readings = [
+        { vehicle_id: vid1, seq: 1, ts: new Date(now - 15000).toISOString(), soc_pct: 80, battery_temp_c: 60.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 100, charging: false, fault_codes: [] },
+        { vehicle_id: vid1, seq: 2, ts: new Date(now - 10000).toISOString(), soc_pct: 80, battery_temp_c: 62.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 101, charging: false, fault_codes: [] },
+        { vehicle_id: vid1, seq: 3, ts: new Date(now - 5000).toISOString(), soc_pct: 80, battery_temp_c: 65.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 102, charging: false, fault_codes: [] },
+        { vehicle_id: vid2, seq: 1, ts: new Date(now - 5000).toISOString(), soc_pct: 80, battery_temp_c: 30.0, speed_kmh: 30, lat: 10.0, lng: 75.0, odometer_km: 100, charging: false, fault_codes: [] }
+      ];
+
+      const res = await postBatch(readings);
+      assert.strictEqual(res.status, 200);
+
+      await new Promise(r => setTimeout(r, 100));
+
+      // 1. Verify alerts committed in DB
+      const alert1 = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").get(vid1);
+      assert.ok(alert1, 'vid1 overheat alert must exist in DB');
+      assert.strictEqual(alert1.status, 'open');
+
+      const alert2 = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'geofence_breach'").get(vid2);
+      assert.ok(alert2, 'vid2 geofence_breach alert must exist in DB');
+      assert.strictEqual(alert2.status, 'open');
+
+      // 2. Verify SSE events
+      const vid1Events = sseClient.getEvents().filter(e => e.event === 'alert_change' && e.data && e.data.vehicle_id === vid1);
+      const vid2Events = sseClient.getEvents().filter(e => e.event === 'alert_change' && e.data && e.data.vehicle_id === vid2);
+
+      assert.strictEqual(vid1Events.length, 1, 'Exactly 1 event for vid1');
+      assert.strictEqual(vid2Events.length, 1, 'Exactly 1 event for vid2');
+      assert.strictEqual(vid1Events[0].data.rule, 'overheat');
+      assert.strictEqual(vid2Events[0].data.rule, 'geofence_breach');
+
+      // 3. Verify evaluateAlertsForVehicles de-duplication when passed duplicate vehicle IDs
+      const reEvaluated = evaluateAlertsForVehicles([vid1, vid1, vid2, vid2]);
+      // Active alerts already exist, so no new changes should be emitted
+      assert.strictEqual(reEvaluated.length, 0, 'No additional alerts created for existing active conditions');
+
+      const vid1EventsAfter = sseClient.getEvents().filter(e => e.event === 'alert_change' && e.data && e.data.vehicle_id === vid1);
+      assert.strictEqual(vid1EventsAfter.length, 1, 'No duplicate events emitted');
+
+      sseClient.close();
+    });
+  });
+
   describe('Edge Cases: Gap Detection on Old Event IDs & Query Param Resumption', () => {
     test('Old Last-Event-ID older than minimum retained history emits gap_detected comment', async () => {
+      // Flush any background coalesced vehicles before resetting table
+      flushCoalescedVehicles();
       // Clean old stream events and seed with high IDs (e.g. 500+)
       db.prepare('DELETE FROM stream_events').run();
       db.prepare(`

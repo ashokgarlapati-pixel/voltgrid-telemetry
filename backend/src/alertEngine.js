@@ -579,7 +579,10 @@ const evaluateVehicleAlertsTx = db.transaction((vehicleId, nowIso) => {
  */
 function evaluateVehicleAlerts(vehicleId, nowIso = new Date().toISOString()) {
   const changedAlerts = evaluateVehicleAlertsTx(vehicleId, nowIso);
+  const publishedAlertIds = new Set();
   for (const alert of changedAlerts) {
+    if (publishedAlertIds.has(alert.id)) continue;
+    publishedAlertIds.add(alert.id);
     if (alert.status === 'open') {
       trackAlertCreated();
     } else if (alert.status === 'resolved') {
@@ -598,8 +601,9 @@ function evaluateVehicleAlerts(vehicleId, nowIso = new Date().toISOString()) {
  * @returns {Array<object>}
  */
 function evaluateAlertsForVehicles(vehicleIds, nowIso = new Date().toISOString()) {
+  const distinctVehicleIds = vehicleIds instanceof Set ? vehicleIds : new Set(vehicleIds);
   const allChanged = [];
-  for (const vehicleId of vehicleIds) {
+  for (const vehicleId of distinctVehicleIds) {
     const changed = evaluateVehicleAlerts(vehicleId, nowIso);
     if (changed && changed.length > 0) {
       allChanged.push(...changed);
