@@ -10,7 +10,9 @@
     "test:unit": "node --test tests/alerts.unit.test.js",
     "test:concurrency": "node --test tests/concurrency*.test.js",
     "simulate": "node ../simulator/simulator.js",
-    "loadtest": "node ../scripts/loadtest.js"
+    "loadtest": "node ../scripts/loadtest.js",
+    "benchmark:5m": "node ../scripts/benchmark_5m.js",
+    "benchmark:summary": "node ../scripts/benchmark_5m.js"
   },
   "dependencies": {
     "express": "^4.21.2"
