@@ -113,7 +113,7 @@ All requests to `POST /v1/telemetry/batch` must include HMAC-SHA256 authenticati
 
 #### 3. Fleet Aggregation SLA (`GET /v1/fleet/summary`)
 * **High-Speed Summary**: Aggregates fleet counts by status (`online`, `offline`, `maintenance`), fleet average SOC (`avg_soc_pct`), observed sequence completeness (`data_completeness_pct`), and open/acknowledged alerts grouped by rule.
-* **Sub-150ms SLA Guarantee**: Queries strictly from the `vehicles` state table (2,000 rows) and `alerts` table (`WHERE status != 'resolved'`). Never executes table scans on `telemetry_history`. Benchmarked at $p95 < 2\text{ ms}$.
+* **Sub-150ms SLA Guarantee**: Queries strictly from the `vehicles` state table (1,000–2,000 rows) and `alerts` table (`WHERE status != 'resolved'`). Never executes table scans on `telemetry_history`. Internal database query executes in $< 2\text{ ms}$ (end-to-end HTTP $p95 < 10\text{ ms}$ against 5M records, well within the 150 ms SLA target).
 
 #### 4. Optimistic Concurrency Control (`POST /v1/alerts/:id/ack`)
 * **Atomic OCC Update**: `UPDATE alerts SET status = 'acknowledged', updated_at = datetime('now'), version = version + 1 WHERE id = @id AND version = @version AND status = 'open'`.
@@ -417,17 +417,18 @@ npm run benchmark:5m
 | **Telemetry History Records** | **5,000,000** | **5,000,000** | 5,000,000 | Populated |
 | **Fleet Vehicles** | **1,000** | **1,000** | Multi-vehicle | Populated |
 | **Database File Size** | **1,302.05 MB** | **1,302.05 MB** | ~1.3 GB | Verified |
-| **Throughput** | **1,768 req/s** | **1,646 req/s** | - | Completed |
+| **Concurrency** | **10 VUs** | **10 VUs** | Concurrent | Completed |
+| **Total Measured Requests** | **500** (+ 50 warm-up) | **500** (+ 50 warm-up) | 500 | Completed |
+| **Successful Requests** | **500 (100.0%)** | **500 (100.0%)** | 100% | Completed |
 | **Error Rate** | **0.00%** | **0.00%** | < 0.1% | **PASSED** |
+| **Throughput** | **1,768 req/s** | **1,646 req/s** | - | Completed |
+| **Min Latency** | **3.70 ms** | **4.26 ms** | - | Completed |
 | **Average Latency** | **5.61 ms** | **6.03 ms** | - | Completed |
 | **p50 Latency** | **5.56 ms** | **5.99 ms** | - | Completed |
 | **p90 Latency** | **6.81 ms** | **7.26 ms** | - | Completed |
 | **p95 Latency** | **7.23 ms** | **8.64 ms** | **< 150.0 ms** | **PASSED (Target Satisfied)** |
 | **p99 Latency** | **9.89 ms** | **10.77 ms** | - | Completed |
 | **Max Latency** | **10.37 ms** | **11.29 ms** | - | Completed |
-
-* **Query Plan Optimization**: Aggregates directly from `vehicles` (1,000 rows) and `alerts` (filtered via `idx_alerts_active_rule`). `telemetry_history` (5,000,000 rows) is never scanned, ensuring $O(V)$ scaling instead of $O(N)$.
-* **Idempotency**: Repeated execution checks existing row counts before inserting, preventing duplicate rows or artificial inflation.
 
 * **Query Plan Optimization**: Aggregates directly from `vehicles` (1,000 rows) and `alerts` (filtered via `idx_alerts_active_rule`). `telemetry_history` (5,000,000 rows) is never scanned, ensuring $O(V)$ scaling instead of $O(N)$.
 * **Idempotency**: Repeated execution checks existing row counts before inserting, preventing duplicate rows or artificial inflation.
