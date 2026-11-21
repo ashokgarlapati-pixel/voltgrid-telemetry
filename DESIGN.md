@@ -37,10 +37,75 @@ We use an **at-least-once delivery model with idempotent writes** to achieve eff
 * **Server Time (`updated_at`)**: We trust server time for offline detection (`offlineWorker.js`) and HMAC replay window checks (`security.js`). A disconnected vehicle cannot report its own death; silence must be measured by the server's clock.
 
 ### Separation of Timestamps & Tolerance Windows
-* **Transport Request Timestamp (`X-Timestamp`)**: Checked against server clock ($|T_{\text{server}} - T_{\text{req}}| \le 300\text{s}$, $\pm 5$ minutes). Rejects expired or replayed requests with `HTTP 401 Unauthorized`.
-* **Telemetry Reading Timestamp (`reading.ts`)**: Checked against server clock window $[T_{\text{server}} - 10\text{ minutes}, T_{\text{server}} + 30\text{ seconds}]$.
-  - **Lateness (Up to 10 minutes)**: Accepted (handles cellular queuing and tunnel delays). Older than 10 minutes: Rejected (`HTTP 207/400`, `"ts cannot be older than 10 minutes"`).
-  - **Drift (Up to 30 seconds fast)**: Accepted (handles vehicle RTC clock drift). More than 30 seconds fast: Rejected (`"ts cannot be more than 30 seconds in the future"`), preventing poison readings from locking `vehicles.last_ts` and permanently corrupting live state updates.
+
+It is critical to distinguish between two completely independent timestamp validations operating at different layers of the request lifecycle:
+
+1. **HTTP Transport Authentication Timestamp (`X-Timestamp`)**:
+   * **Validated By**: `backend/src/security.js` (`hmacAuth` middleware).
+   * **Tolerance Window**: $|T_{\text{server}} - T_{\text{req}}| \le 300{,}000\text{ ms}$ ($\pm 5$ minutes against server wall clock).
+   * **Purpose**: Bounds the freshness of HTTP batch submissions and defines the TTL for nonce de-duplication in `used_nonces`.
+   * **Rejection Behavior**: An expired, future-skewed (>5 min), or unparseable `X-Timestamp` halts request processing at the authentication boundary, returning **`HTTP 401 Unauthorized`** (`"Request timestamp is outside the allowed 5-minute window"`).
+
+2. **Telemetry Reading Event Timestamp (`reading.ts`)**:
+   * **Validated By**: `backend/src/ingestion.js` (`validateReading` in the ingestion pipeline).
+   * **Tolerance Window**: $[T_{\text{server}} - 10\text{ minutes}, T_{\text{server}} + 30\text{ seconds}]$.
+     - **Lateness (Up to 10 minutes)**: Accepted to accommodate cellular queuing and tunnel transit latency. Older than 10 minutes is rejected (`"ts cannot be older than 10 minutes"`).
+     - **Clock Drift (Up to 30 seconds fast)**: Accepted to handle vehicle RTC hardware oscillator variance. More than 30 seconds fast is rejected (`"ts cannot be more than 30 seconds in the future"`), preventing future-timestamp state poisoning from locking `vehicles.last_ts` and corrupting live vehicle updates.
+   * **Rejection Behavior**: Out-of-window telemetry timestamps are rejected at the reading level within the ingestion pipeline, returning **`HTTP 207 Multi-Status`** with `status: 'rejected'` (or `HTTP 400` if the entire batch structure is invalid). They are **never** reported as authentication failures (`HTTP 401`).
+
+### Clarifying the "One-Day Clock Error" Misconception
+
+An earlier draft suggested that a telemetry reading with a 1-day clock error returns `HTTP 401 Unauthorized`. That is technically incorrect:
+
+* **Authentication does not inspect payload timestamps**: The authentication middleware (`hmacAuth`) inspects only HTTP transport headers (`X-API-Key`, `X-Timestamp`, `X-Signature`). If `X-Timestamp` matches the server's current wall clock, the request authenticates successfully regardless of payload contents.
+* **Ingestion rejects stale or future readings independently**: If the batch payload contains a reading with a 1-day clock error, `validateReading` rejects that individual reading. The response is `HTTP 207 Multi-Status`, **not** `HTTP 401`.
+
+#### Concrete Example:
+A vehicle client transmits an HTTP request at current server time $T_{\text{server}} = \text{12:00:00}$:
+* **Headers**: `X-Timestamp: 12:00:00` (valid wall clock), signed with a valid HMAC.
+* **Payload**:
+  ```json
+  [
+    {
+      "vehicle_id": "VG-00042",
+      "seq": 105,
+      "ts": "2026-11-20T12:00:00.000Z",
+      "soc_pct": 78.5,
+      "battery_temp_c": 32.0,
+      "speed_kmh": 40.0,
+      "lat": 13.0827,
+      "lng": 80.2707,
+      "odometer_km": 150.0,
+      "charging": false,
+      "fault_codes": []
+    }
+  ]
+  ```
+  *(Note that `ts` is dated 1 day in the past due to an un-synchronized vehicle RTC clock).*
+
+* **Lifecycle & Result**:
+  1. **Transport Layer (`security.js`)**: $|T_{\text{server}} - \text{X-Timestamp}| = 0 \le 300\text{s}$. Authentication **passes** (`HTTP 200` at middleware).
+  2. **Ingestion Layer (`ingestion.js`)**: `reading.ts` is 24 hours old ($> 10\text{ minutes}$). `validateReading` rejects the reading with `"ts cannot be older than 10 minutes"`.
+  3. **HTTP Response**: The API responds with **`HTTP 207 Multi-Status`** (NOT `HTTP 401`):
+     ```json
+     {
+       "total": 1,
+       "accepted": 0,
+       "duplicates": 0,
+       "rejected": 1,
+       "summary": { "accepted": 0, "duplicates": 0, "rejected": 1 },
+       "results": [
+         {
+           "index": 0,
+           "status": "rejected",
+           "error": "ts cannot be older than 10 minutes",
+           "vehicle_id": "VG-00042",
+           "seq": 105
+         }
+       ]
+     }
+     ```
+  Thus, a valid HTTP authentication timestamp never renders an excessively old or future-dated telemetry reading valid, and telemetry timestamp rejection remains strictly decoupled from transport authentication.
 
 ---
 

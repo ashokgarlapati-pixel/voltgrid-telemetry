@@ -1090,7 +1090,7 @@ The comprehensive engineering answers to all 7 Part C evaluation questions are a
 3. **Time & Clock Drift**:
    * **Device Timestamp (`ts`)**: Trusted for vehicle live state (`last_ts` CASE statement), history ordering, downsampling, and alert rule evaluation.
    * **Server Timestamp (`received_at` / `updated_at`)**: Trusted for offline detection sweeps and HMAC 5-minute replay window validation.
-   * **25s Drift vs. 1 Day Off**: 25s drift accepted cleanly within 5-min window; 1 day drift rejected with `HTTP 401 Unauthorized` by `security.js`.
+   * **Timestamp Validation Separation**: HTTP request timestamp (`X-Timestamp`) enforced within $\pm 5$ min by `security.js` (rejects with `HTTP 401 Unauthorized`). Telemetry reading timestamp (`reading.ts`) enforced within $[T-10\text{m}, T+30\text{s}]$ by `ingestion.js` (rejects reading with `HTTP 207 Multi-Status`, `"ts cannot be older than 10 minutes"` / `"ts cannot be more than 30 seconds in the future"`, never HTTP 401).
 4. **Storage & Cost (~35M Rows / Day)**:
    * **Volume**: ~220 bytes/row $\times$ 35M $\approx$ 7.7 GB/day (~230 GB/month).
    * **Tiered Lifecycle**: 7 days raw (Hot, ~54 GB) $\rightarrow$ 90 days 1-minute rollups (Warm, ~15 GB) $\rightarrow$ 1 year 1-hour rollups (Cold, raw dumped to S3 Glacier as Parquet).
