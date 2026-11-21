@@ -484,17 +484,21 @@ describe('Part A5: Live Stream (SSE) Integration & Performance Tests', () => {
       await new Promise(r => setTimeout(r, 80));
 
       const eventsAfterFlush = client.getEvents();
-      const v1Updates = eventsAfterFlush.filter(e => e.event === 'vehicle_update' && e.data?.vehicle_id === 'VG-COAL-1');
-      const v2Updates = eventsAfterFlush.filter(e => e.event === 'vehicle_update' && e.data?.vehicle_id === 'VG-COAL-2');
+      const batchEvent = eventsAfterFlush.find(e => e.event === 'vehicle_batch');
+      assert.ok(batchEvent, 'Must emit consolidated vehicle_batch event instead of separate per-vehicle events');
+      assert.strictEqual(batchEvent.data.count, 2, 'Batch must contain exactly 2 coalesced vehicles');
 
-      // Must have collapsed 5 updates for VG-COAL-1 into exactly ONE event
-      assert.strictEqual(v1Updates.length, 1, '5 rapid updates for VG-COAL-1 must collapse into exactly 1 event');
-      assert.strictEqual(v1Updates[0].data.state.battery_temp_c, 41.5, 'Must retain the latest battery temperature (41.5°C)');
-      assert.strictEqual(v1Updates[0].data.state.soc_pct, 85, 'Must retain the latest SOC (85%)');
+      const v1 = batchEvent.data.vehicles.find(v => v.vehicle_id === 'VG-COAL-1');
+      const v2 = batchEvent.data.vehicles.find(v => v.vehicle_id === 'VG-COAL-2');
 
-      // Must have collapsed 3 updates for VG-COAL-2 into exactly ONE event
-      assert.strictEqual(v2Updates.length, 1, '3 rapid updates for VG-COAL-2 must collapse into exactly 1 event');
-      assert.strictEqual(v2Updates[0].data.state.speed_kmh, 48.0, 'Must retain the latest speed (48.0 km/h)');
+      // Must have collapsed 5 updates for VG-COAL-1 into latest state
+      assert.ok(v1, 'VG-COAL-1 must be present in vehicle_batch');
+      assert.strictEqual(v1.state.battery_temp_c, 41.5, 'Must retain the latest battery temperature (41.5°C)');
+      assert.strictEqual(v1.state.soc_pct, 85, 'Must retain the latest SOC (85%)');
+
+      // Must have collapsed 3 updates for VG-COAL-2 into latest state
+      assert.ok(v2, 'VG-COAL-2 must be present in vehicle_batch');
+      assert.strictEqual(v2.state.speed_kmh, 48.0, 'Must retain the latest speed (48.0 km/h)');
 
       client.close();
     });
@@ -551,18 +555,20 @@ describe('Part A5: Live Stream (SSE) Integration & Performance Tests', () => {
 
       await new Promise(r => setTimeout(r, 100));
 
-      // 400 readings across 20 vehicles must coalesce into exactly 20 vehicle_update events!
-      const c1Events = client1.getEvents().filter(e => e.event === 'vehicle_update');
-      const c2Events = client2.getEvents().filter(e => e.event === 'vehicle_update');
-      const c3Events = client3.getEvents().filter(e => e.event === 'vehicle_update');
+      // 400 readings across 20 vehicles must coalesce into exactly ONE consolidated vehicle_batch event containing 20 vehicles!
+      const c1Batches = client1.getEvents().filter(e => e.event === 'vehicle_batch');
+      const c2Batches = client2.getEvents().filter(e => e.event === 'vehicle_batch');
+      const c3Batches = client3.getEvents().filter(e => e.event === 'vehicle_batch');
 
       console.log(`[Stream Benchmark] Ingested ${TOTAL_READINGS} readings in ${ingestDurationMs.toFixed(2)}ms (${(TOTAL_READINGS / (ingestDurationMs / 1000)).toFixed(0)} readings/sec)`);
-      console.log(`[Stream Benchmark] Coalesced 400 readings across 20 vehicles into 20 events in ${flushDurationMs.toFixed(2)}ms`);
-      console.log(`[Stream Benchmark] Delivered events: Client1=${c1Events.length}, Client2=${c2Events.length}, Client3=${c3Events.length}`);
+      console.log(`[Stream Benchmark] Coalesced 400 readings across 20 vehicles into 1 consolidated vehicle_batch event in ${flushDurationMs.toFixed(2)}ms`);
+      console.log(`[Stream Benchmark] Delivered batch events: Client1=${c1Batches.length}, Client2=${c2Batches.length}, Client3=${c3Batches.length}`);
 
-      assert.ok(c1Events.length >= 20, 'Client 1 must receive all coalesced vehicle events');
-      assert.ok(c2Events.length >= 20, 'Client 2 must receive all coalesced vehicle events');
-      assert.ok(c3Events.length >= 20, 'Client 3 must receive all coalesced vehicle events');
+      assert.strictEqual(c1Batches.length, 1, 'Client 1 must receive exactly 1 consolidated vehicle_batch event');
+      assert.strictEqual(c2Batches.length, 1, 'Client 2 must receive exactly 1 consolidated vehicle_batch event');
+      assert.strictEqual(c3Batches.length, 1, 'Client 3 must receive exactly 1 consolidated vehicle_batch event');
+      assert.strictEqual(c1Batches[0].data.count, 20, 'vehicle_batch event must contain all 20 vehicles');
+      assert.strictEqual(c1Batches[0].data.vehicles.length, 20);
 
       client1.close();
       client2.close();
@@ -1024,6 +1030,69 @@ describe('Part A5: Live Stream (SSE) Integration & Performance Tests', () => {
       assert.ok(replayed, `Event ${res2.id} must be replayed when resuming via ?lastEventId`);
       assert.strictEqual(replayed.data.vehicle_id, 'VG-QP-2');
 
+      client.close();
+    });
+
+    test('Gap detection provides explicit recovery strategy instruction', async () => {
+      flushCoalescedVehicles();
+      const minRow = db.prepare('SELECT MIN(id) AS min_id FROM stream_events').get();
+      const client = createSseClient(`${baseUrl}/v1/stream?api_key=${API_KEY}`, {
+        headers: { 'Last-Event-ID': '1' }
+      });
+      await client.ready;
+      await new Promise(r => setTimeout(r, 100));
+
+      const rawChunks = client.getRawChunks().join('');
+      assert.ok(rawChunks.includes('gap_recovery_strategy'), 'Server must provide recovery strategy comment');
+      assert.ok(rawChunks.includes('GET /v1/fleet/summary'), 'Recovery strategy must guide client to fetch fleet summary');
+      client.close();
+    });
+  });
+
+  describe('Stream Authentication & Bounded Replay Safeguards', () => {
+    test('Invalid API key returns 401 Unauthorized', async () => {
+      const res = await fetch(`${baseUrl}/v1/stream?api_key=invalid-key`);
+      assert.strictEqual(res.status, 401);
+      const body = await res.json();
+      assert.strictEqual(body.error, 'Unauthorized: invalid API key');
+    });
+
+    test('Valid API key via header or query parameter succeeds with 200 OK', async () => {
+      const resHeader = await fetch(`${baseUrl}/v1/stream`, {
+        headers: { 'X-API-Key': API_KEY }
+      });
+      assert.strictEqual(resHeader.status, 200);
+      assert.strictEqual(resHeader.headers.get('content-type'), 'text/event-stream');
+      resHeader.body?.cancel();
+
+      const resQuery = await fetch(`${baseUrl}/v1/stream?api_key=${API_KEY}`);
+      assert.strictEqual(resQuery.status, 200);
+      resQuery.body?.cancel();
+    });
+
+    test('Cross-instance event insertion into stream_events broadcasts to active subscribers', async () => {
+      const client = createSseClient(`${baseUrl}/v1/stream?api_key=${API_KEY}`);
+      await client.ready;
+      await new Promise(r => setTimeout(r, 60));
+
+      // Simulate a concurrent API instance inserting an event into the shared SQLite database
+      const insertStmt = db.prepare(`
+        INSERT INTO stream_events (event_type, data, created_at)
+        VALUES ('vehicle_update', ?, datetime('now'))
+      `);
+      const info = insertStmt.run(JSON.stringify({
+        event_type: 'vehicle_update',
+        vehicle_id: 'VG-CROSS-INST-99',
+        state: { speed_kmh: 88 }
+      }));
+      const extId = Number(info.lastInsertRowid);
+
+      // Wait for cross-instance poll interval (500ms)
+      await new Promise(r => setTimeout(r, 650));
+
+      const received = client.getEvents().find(e => e.id === extId);
+      assert.ok(received, 'Client must receive event inserted by external instance via shared outbox');
+      assert.strictEqual(received.data.vehicle_id, 'VG-CROSS-INST-99');
       client.close();
     });
   });

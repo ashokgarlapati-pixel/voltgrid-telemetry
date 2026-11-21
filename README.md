@@ -321,7 +321,7 @@ To scale horizontally across multiple physical or virtual machines, replace the 
 
 The live streaming endpoint (`GET /v1/stream`) provides real-time telemetry updates and alert events to operator dashboards and dispatchers over Server-Sent Events (SSE).
 
-### 1. HTTP Endpoint & Transport Headers
+### 1. HTTP Endpoint, Transport Headers & Authentication
 * **Endpoint**: `GET /v1/stream`
 * **Transport Headers**:
   ```http
@@ -330,37 +330,58 @@ The live streaming endpoint (`GET /v1/stream`) provides real-time telemetry upda
   Connection: keep-alive
   X-Accel-Buffering: no
   ```
+* **Authentication**: Supports authentication via `X-API-Key` header, `Authorization: Bearer <key>` header, or `?api_key=` / `?apiKey=` query parameter (essential for browser `EventSource` clients which cannot send custom HTTP headers). Rejects invalid keys with `401 Unauthorized`.
 * **Connection Lifecycle**: Emits `: connected\n\n` on initial connect. Periodically emits `: heartbeat\n\n` comments every 15 seconds to keep intermediary proxy and NAT connections active.
 
 ### 2. Event Structure & Wire Contract
 Events adhere to standard SSE wire framing (`id: <id>\nevent: <type>\ndata: <json>\n\n`):
 
-* **Vehicle Update (`vehicle_update`)**:
+* **Consolidated Vehicle Batch (`vehicle_batch`)**:
+  Emitted once per flush interval containing the coalesced states of all active vehicles, preventing subscriber event flooding:
   ```json
   {
     "event_id": 412,
+    "event_type": "vehicle_batch",
+    "count": 2,
+    "vehicles": [
+      {
+        "vehicle_id": "VG-00104",
+        "state": {
+          "soc_pct": 74.5,
+          "battery_temp_c": 38.2,
+          "speed_kmh": 32.0,
+          "lat": 13.0827,
+          "lng": 80.2707,
+          "odometer_km": 1420.5,
+          "charging": false,
+          "status": "online",
+          "last_seq": 8840,
+          "last_ts": "2026-11-20T12:00:00.000Z"
+        },
+        "ts": "2026-11-20T12:00:00.000Z"
+      }
+    ],
+    "ts": "2026-11-20T12:00:01.000Z"
+  }
+  ```
+
+* **Single Vehicle Update (`vehicle_update`)**:
+  Supported for targeted or ad-hoc updates:
+  ```json
+  {
+    "event_id": 413,
     "event_type": "vehicle_update",
     "vehicle_id": "VG-00104",
-    "state": {
-      "soc_pct": 74.5,
-      "battery_temp_c": 38.2,
-      "speed_kmh": 32.0,
-      "lat": 13.0827,
-      "lng": 80.2707,
-      "odometer_km": 1420.5,
-      "charging": false,
-      "status": "online",
-      "last_seq": 8840,
-      "last_ts": "2026-11-20T12:00:00.000Z"
-    },
+    "state": { ... },
     "ts": "2026-11-20T12:00:00.000Z"
   }
   ```
 
 * **Alert Lifecycle Change (`alert_change`)**:
+  Dispatched **immediately** without coalescing delays:
   ```json
   {
-    "event_id": 413,
+    "event_id": 414,
     "event_type": "alert_change",
     "alert_id": 28,
     "vehicle_id": "VG-00104",
@@ -372,20 +393,32 @@ Events adhere to standard SSE wire framing (`id: <id>\nevent: <type>\ndata: <jso
   }
   ```
 
-### 3. Persistent Event Log & Reconnection (`Last-Event-ID`)
+### 3. Persistent Event Log, Bounded Replay & Gap Recovery (`Last-Event-ID`)
 * **SQLite Event Outbox**: Events are persisted into `stream_events (id INTEGER PRIMARY KEY AUTOINCREMENT, event_type, data, created_at)` in WAL mode. Monotonically increasing event IDs survive process restarts and power loss.
-* **Resumption**: Accepts the `Last-Event-ID` request header (or `?lastEventId=` query parameter). Queries `SELECT * FROM stream_events WHERE id > @lastId ORDER BY id ASC` to replay missed events.
-* **Retention Pruning**: Retains the latest 10,000 historical events. If a client connects with an ID older than the retention window, a `: gap_detected: ...` notification comment is sent and all available history is replayed.
+* **Resumption**: Accepts the `Last-Event-ID` request header (or `?lastEventId=` query parameter). Queries `SELECT * FROM stream_events WHERE id > @lastId ORDER BY id ASC LIMIT 1000` to replay missed events.
+* **Bounded Replay Safeguard**: Replay queries are strictly bounded to `STREAM_MAX_REPLAY_LIMIT = 1000` to eliminate memory exhaustion and denial-of-service risks. If more events exist, the server appends `: replay_truncated: ...` advising the client to reconnect with its latest received ID.
+* **Documented Gap Recovery Strategy**:
+  If a client connects with an ID older than the retention window (`parsedLastId < min_id`), the server detects the gap and emits:
+  ```text
+  : gap_detected: requested Last-Event-ID (50) is older than retained history (500)
+  : gap_recovery_strategy: fetch GET /v1/fleet/summary and GET /v1/vehicles to re-synchronize baseline state, then reconnect to /v1/stream with latest Last-Event-ID
+  ```
+  **Client Recovery Procedure**:
+  1. **Re-synchronize State**: Call `GET /v1/fleet/summary` and `GET /v1/vehicles` to rebuild current fleet snapshot and vehicle states.
+  2. **Fetch Active Alerts**: Call `GET /v1/alerts?status=open` to synchronize unresolved alerts.
+  3. **Resume Live Stream**: Re-connect to `GET /v1/stream` using the highest received `event_id` to continue receiving real-time updates from the synchronized baseline.
 
-### 4. Replay-to-Live Handoff
-* Prevents the classic race condition where live events arriving during historical database replay are missed or delivered out-of-order.
-* Connecting clients with `Last-Event-ID` enter a temporary `replaying` state where live events are placed in an internal per-client `replayQueue`.
-* Once database replay completes, queued live events with `id > lastDeliveredId` are flushed in strict monotonic order before live broadcasting resumes, guaranteeing **zero missed events and zero duplicates**.
+### 4. Cross-Instance Event Propagation
+In multi-instance deployments (`api` and `api2` sharing `/data/voltgrid.db`):
+* All instances persist events into the shared `stream_events` table.
+* Each instance maintains a background poller (`pollCrossInstanceEvents`, default every 500 ms) querying for new events in the shared database whose `id > client.lastDeliveredId`.
+* Subscribers connected to `api2` automatically receive updates committed by `api` without having to disconnect or reconnect.
 
 ### 5. Vehicle Update Coalescing
-* Ingesting ~400 readings/sec would overwhelm client event loops if dispatched individually.
+* Ingesting ~400 readings/sec across 2,000 vehicles would overwhelm subscriber event loops if dispatched as individual events.
 * Pending vehicle state updates are collapsed in memory by `vehicle_id` (`pendingVehicles = new Map()`), retaining only the freshest state per vehicle.
-* Flushed at a configurable 1-second interval (`STREAM_COALESCE_INTERVAL_MS = 1000`). Memory is bounded strictly to $O(\text{fleet\_size})$.
+* At each 1-second interval (`STREAM_COALESCE_INTERVAL_MS = 1000`), all pending vehicles are emitted as **ONE consolidated `vehicle_batch` event**.
+* Subscriber event rate is reduced from ~400 events/sec down to **1 consolidated frame per second**, eliminating client event-loop starvation.
 * **Critical Rule**: Alert lifecycle events (`open`, `acknowledged`, `resolved`) **never coalesce**—they are dispatched immediately to all connected clients.
 
 ### 6. Client Back-Pressure & Slow-Client Protection

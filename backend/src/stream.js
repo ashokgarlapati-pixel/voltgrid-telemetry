@@ -16,9 +16,20 @@ const MAX_CLIENT_BUFFER = 100; // Maximum pending SSE frames per slow client bef
 const FLUSH_INTERVAL_MS = parseInt(process.env.STREAM_COALESCE_INTERVAL_MS, 10) || 1000;
 const HEARTBEAT_INTERVAL_MS = parseInt(process.env.STREAM_HEARTBEAT_INTERVAL_MS, 10) || 15000;
 const EVENT_RETENTION_LIMIT = 10000; // Number of historical events retained in stream_events
+const CROSS_INSTANCE_POLL_INTERVAL_MS = parseInt(process.env.STREAM_CROSS_INSTANCE_POLL_INTERVAL_MS, 10) || 500;
+const MAX_REPLAY_LIMIT = parseInt(process.env.STREAM_MAX_REPLAY_LIMIT, 10) || 1000;
 
 const connectedClients = new Set();
 const pendingVehicles = new Map();
+
+// Track highest event ID broadcast by this process to detect external inserts from other API instances
+let lastBroadcastId = 0;
+try {
+  const maxRow = db.prepare('SELECT MAX(id) AS max_id FROM stream_events').get();
+  if (maxRow && maxRow.max_id) {
+    lastBroadcastId = Number(maxRow.max_id);
+  }
+} catch (_) {}
 
 /**
  * Formats an event object as a standard SSE frame.
@@ -49,6 +60,7 @@ function recordAndBroadcastEvent(type, data) {
   
   const info = insertStmt.run(type, JSON.stringify(rawData));
   const eventId = Number(info.lastInsertRowid);
+  lastBroadcastId = Math.max(lastBroadcastId, eventId);
 
   // Set the canonical event_id in the payload
   rawData.event_id = eventId;
@@ -150,6 +162,7 @@ function broadcast(event) {
       continue;
     }
     writeDirectToClient(client, payload);
+    client.lastDeliveredId = Math.max(client.lastDeliveredId, event.id);
   }
 }
 
@@ -172,7 +185,9 @@ function publishVehicleUpdate(vehicle) {
 
 /**
  * Flushes all coalesced vehicle updates at the configured interval.
- * Dispatches an individual 'vehicle_update' event for each distinct vehicle updated.
+ * Dispatches ONE consolidated 'vehicle_batch' event containing the latest states
+ * for all vehicles collected during the interval, reducing subscriber event load from
+ * ~400 events/sec down to 1 consolidated frame per flush.
  */
 function flushCoalescedVehicles() {
   if (pendingVehicles.size === 0) return;
@@ -181,27 +196,31 @@ function flushCoalescedVehicles() {
     const updates = Array.from(pendingVehicles.values());
     pendingVehicles.clear();
 
-    for (const v of updates) {
-      const eventData = {
-        event_type: 'vehicle_update',
-        vehicle_id: v.vehicle_id,
-        state: {
-          soc_pct: v.soc_pct,
-          battery_temp_c: v.battery_temp_c,
-          speed_kmh: v.speed_kmh,
-          lat: v.lat,
-          lng: v.lng,
-          odometer_km: v.odometer_km,
-          charging: Boolean(v.charging),
-          status: v.status || 'online',
-          last_seq: v.last_seq,
-          last_ts: v.last_ts
-        },
-        ts: v.last_ts || new Date().toISOString()
-      };
+    const vehiclesList = updates.map(v => ({
+      vehicle_id: v.vehicle_id,
+      state: {
+        soc_pct: v.soc_pct,
+        battery_temp_c: v.battery_temp_c,
+        speed_kmh: v.speed_kmh,
+        lat: v.lat,
+        lng: v.lng,
+        odometer_km: v.odometer_km,
+        charging: Boolean(v.charging),
+        status: v.status || 'online',
+        last_seq: v.last_seq,
+        last_ts: v.last_ts
+      },
+      ts: v.last_ts || new Date().toISOString()
+    }));
 
-      recordAndBroadcastEvent('vehicle_update', eventData);
-    }
+    const eventData = {
+      event_type: 'vehicle_batch',
+      count: vehiclesList.length,
+      vehicles: vehiclesList,
+      ts: new Date().toISOString()
+    };
+
+    recordAndBroadcastEvent('vehicle_batch', eventData);
   } catch (err) {
     if (err && (err.message?.includes('database is not open') || err.code === 'ERR_SQLITE_NOT_OPEN')) {
       return;
@@ -213,6 +232,66 @@ function flushCoalescedVehicles() {
 // 1-second interval timer for vehicle update coalescing
 let flushTimer = setInterval(flushCoalescedVehicles, FLUSH_INTERVAL_MS);
 flushTimer.unref();
+
+/**
+ * Periodically polls the shared SQLite stream_events table for new events inserted by
+ * other API instances, broadcasting them to local subscribers so multi-instance subscribers
+ * receive cross-instance events without waiting for a reconnect.
+ */
+function pollCrossInstanceEvents() {
+  if (connectedClients.size === 0) return;
+
+  try {
+    let minDelivered = Infinity;
+    for (const client of connectedClients) {
+      if (!client.replaying && client.lastDeliveredId < minDelivered) {
+        minDelivered = client.lastDeliveredId;
+      }
+    }
+    if (minDelivered === Infinity) return;
+
+    const newEvents = db.prepare(`
+      SELECT id, event_type, data
+      FROM stream_events
+      WHERE id > ?
+      ORDER BY id ASC
+      LIMIT 100
+    `).all(minDelivered);
+
+    for (const row of newEvents) {
+      let payloadData;
+      try {
+        payloadData = JSON.parse(row.data);
+      } catch (_) {
+        payloadData = row.data;
+      }
+      if (typeof payloadData === 'object' && payloadData !== null) {
+        payloadData.event_id = row.id;
+      }
+
+      const msg = formatSseMessage({
+        id: row.id,
+        type: row.event_type,
+        data: payloadData
+      });
+
+      for (const client of connectedClients) {
+        if (!client.replaying && row.id > client.lastDeliveredId) {
+          writeDirectToClient(client, msg);
+          client.lastDeliveredId = row.id;
+        }
+      }
+    }
+  } catch (err) {
+    if (err && (err.message?.includes('database is not open') || err.code === 'ERR_SQLITE_NOT_OPEN')) {
+      return;
+    }
+    console.error('[Stream Cross-Instance Poll Error]', err);
+  }
+}
+
+let crossInstanceTimer = setInterval(pollCrossInstanceEvents, CROSS_INSTANCE_POLL_INTERVAL_MS);
+crossInstanceTimer.unref();
 
 /**
  * Publishes an alert change (open, acknowledged, or resolved).
@@ -285,9 +364,25 @@ heartbeatTimer.unref();
 
 /**
  * Express route handler for GET /v1/stream (Server-Sent Events)
- * Supports Last-Event-ID resumption, safe replay-to-live handoff, and back-pressure.
+ * Supports Last-Event-ID resumption, safe replay-to-live handoff, back-pressure,
+ * authentication via API key, bounded replay limits, and documented gap recovery.
  */
 function sseStreamHandler(req, res) {
+  // Stream Authentication: supports X-API-Key header, Authorization Bearer, or ?api_key= / ?apiKey= query param
+  const apiKey = req.headers['x-api-key'] || 
+                 (req.headers['authorization']?.startsWith('Bearer ') ? req.headers['authorization'].slice(7) : null) ||
+                 req.query.api_key || 
+                 req.query.apiKey;
+
+  if (apiKey) {
+    const keyRow = db.prepare('SELECT api_key FROM api_keys WHERE api_key = ?').get(apiKey);
+    if (!keyRow) {
+      return res.status(401).json({ error: 'Unauthorized: invalid API key' });
+    }
+  } else if (process.env.STREAM_AUTH_REQUIRED === 'true' || (process.env.NODE_ENV === 'production' && !process.env.ALLOW_ANONYMOUS_STREAM)) {
+    return res.status(401).json({ error: 'Unauthorized: missing API key (provide via X-API-Key header or ?api_key= query parameter)' });
+  }
+
   // Set required SSE HTTP response headers
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -335,15 +430,17 @@ function sseStreamHandler(req, res) {
       const minRow = db.prepare('SELECT MIN(id) AS min_id FROM stream_events').get();
       if (minRow && minRow.min_id && parsedLastId < minRow.min_id) {
         res.write(`: gap_detected: requested Last-Event-ID (${parsedLastId}) is older than retained history (${minRow.min_id})\n\n`);
+        res.write(`: gap_recovery_strategy: fetch GET /v1/fleet/summary and GET /v1/vehicles to re-synchronize baseline state, then reconnect to /v1/stream with latest Last-Event-ID\n\n`);
       }
 
-      // Query all persistent events created after Last-Event-ID
+      // Query persistent events created after Last-Event-ID with bounded LIMIT (Cost Point 3)
       const historicalRows = db.prepare(`
         SELECT id, event_type, data
         FROM stream_events
         WHERE id > ?
         ORDER BY id ASC
-      `).all(parsedLastId);
+        LIMIT ?
+      `).all(parsedLastId, MAX_REPLAY_LIMIT);
 
       for (const row of historicalRows) {
         let payloadData;
@@ -364,6 +461,10 @@ function sseStreamHandler(req, res) {
 
         writeDirectToClient(client, msg);
         client.lastDeliveredId = row.id;
+      }
+
+      if (historicalRows.length >= MAX_REPLAY_LIMIT) {
+        res.write(`: replay_truncated: replayed maximum allowed ${MAX_REPLAY_LIMIT} events. Reconnect with Last-Event-ID ${client.lastDeliveredId} to fetch next batch\n\n`);
       }
 
       // Safe Replay-to-Live Handoff:
@@ -412,6 +513,7 @@ function stopStreamWorker() {
   clearInterval(flushTimer);
   clearInterval(heartbeatTimer);
   clearInterval(pruneTimer);
+  clearInterval(crossInstanceTimer);
   for (const client of connectedClients) {
     try {
       client.res.end();
