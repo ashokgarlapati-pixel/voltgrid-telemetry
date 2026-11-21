@@ -8,20 +8,20 @@ This document provides empirical performance measurements for the VoltGrid Fleet
 
 ## 1. Historical Mixed-Workload Load Test Summary (Multi-Endpoint Contention)
 
-* **Generated**: 2026-11-21T22:29:45.904Z
+* **Generated**: 2026-11-21T23:08:42.880Z
 * **Workload Mix**: 60% Batch Ingestion (100 readings/batch, HMAC signed), 25% Fleet Summary, 15% History Downsampling (200 points).
 * **Duration**: 4.0 seconds
 * **Concurrency**: 5 workers
-* **Target Endpoint**: `http://127.0.0.1:60574`
+* **Target Endpoint**: `http://127.0.0.1:56422`
 
 | Metric | Measured Value | Requirement / SLA | Status |
 | :--- | :---: | :---: | :---: |
-| **Total Requests** | **2,440** | N/A | Completed |
-| **Throughput (RPS)** | **609 req/s** | Sustained ~400 req/s | ✅ PASSED |
+| **Total Requests** | **2,565** | N/A | Completed |
+| **Throughput (RPS)** | **641 req/s** | Sustained ~400 req/s | ✅ PASSED |
 | **Overall p50 Latency** | **7 ms** | Sub-50ms | ✅ PASSED |
-| **Overall p95 Latency** | **16 ms** | < 150 ms | ✅ PASSED |
-| **Overall p99 Latency** | **35 ms** | < 300 ms | ✅ PASSED |
-| **Error Rate** | **27.30%** | < 0.1% | ❌ FAILED |
+| **Overall p95 Latency** | **12 ms** | < 150 ms | ✅ PASSED |
+| **Overall p99 Latency** | **18 ms** | < 300 ms | ✅ PASSED |
+| **Error Rate** | **0.00%** | < 0.1% | ✅ PASSED |
 
 ---
 
@@ -29,11 +29,11 @@ This document provides empirical performance measurements for the VoltGrid Fleet
 
 | Endpoint / Operation | Share | Requests | Throughput | p50 (ms) | p95 (ms) | p99 (ms) | Errors | SLA Target | Status |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **POST /v1/telemetry/batch (100 readings)** | 60% | 1,462 | 365 req/s | 7 ms | 16 ms | 38 ms | 666 | N/A | Completed |
-| **GET /v1/fleet/summary** | 25% | 619 | 155 req/s | 7 ms | **18 ms** | 26 ms | 0 | < 150 ms | ✅ PASSED |
-| **GET /v1/vehicles/:id/history (200 pts)** | 15% | 359 | 90 req/s | 6 ms | 15 ms | 41 ms | 0 | < 150 ms | ✅ PASSED |
+| **POST /v1/telemetry/batch (100 readings)** | 60% | 1,527 | 381 req/s | 7 ms | 13 ms | 19 ms | 0 | N/A | Completed |
+| **GET /v1/fleet/summary** | 25% | 639 | 160 req/s | 6 ms | **12 ms** | 17 ms | 0 | < 150 ms | ✅ PASSED |
+| **GET /v1/vehicles/:id/history (200 pts)** | 15% | 399 | 100 req/s | 6 ms | 11 ms | 19 ms | 0 | < 150 ms | ✅ PASSED |
 
-> ⚠️ **SLA Non-Compliance in Historical Mixed Load Test**: In this multi-endpoint test, `GET /v1/fleet/summary` achieved a p95 latency of **18 ms**, which PASSED the sub-150 ms SLA target.
+> ⚠️ **SLA Non-Compliance in Historical Mixed Load Test**: In this multi-endpoint test, `GET /v1/fleet/summary` achieved a p95 latency of **12 ms**, which PASSED the sub-150 ms SLA target.
 >
 > **Root Cause Analysis (Write Serialization Contention)**: In this test, 60% of requests were concurrent `POST /v1/telemetry/batch` ingestion batches (100 readings each) running inside serialized SQLite write transactions (`BEGIN IMMEDIATE`). Because SQLite WAL mode strictly serializes write transactions, read queries queued behind active disk commits. This demonstrated that mixed-workload tests under heavy batch write pressure produce false-positive latency spikes for read endpoints, highlighting the necessity of the dedicated 5M-reading benchmark (Section 4).
 

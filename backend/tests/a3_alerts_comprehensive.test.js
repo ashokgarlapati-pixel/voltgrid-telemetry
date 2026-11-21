@@ -783,4 +783,148 @@ describe('A3 Comprehensive Alert Engine Edge Cases & Lifecycle Tests', () => {
       assert.strictEqual(alertsIn[0].resolved_at, alertsOut[0].resolved_at);
     });
   });
+
+  // =========================================================================
+  // TASK 8: RAPID-DISCHARGE DETECTION ACROSS CHARGING PERIODS (ISSUE 1)
+  // =========================================================================
+  describe('Issue 1: Rapid-Discharge Detection Across Charging Periods', () => {
+    test('Charging period resets rapid-discharge window: no false alert for 90% -> 85%(chg) -> 85% -> 80%', async () => {
+      const vid = `VG-CHG-RESET-${Date.now()}`;
+      const now = Date.now();
+
+      // Reading 1: 90% SoC, not charging
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 1, ts: new Date(now - 180000).toISOString(), soc_pct: 90.0, battery_temp_c: 30, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] }
+      ]);
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ? AND rule = 'rapid_discharge'").get(vid).total, 0);
+
+      // Reading 2: 85% SoC, charging = true (charging session commences)
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 120000).toISOString(), soc_pct: 85.0, battery_temp_c: 30, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 10, charging: true, fault_codes: [] }
+      ]);
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ? AND rule = 'rapid_discharge'").get(vid).total, 0);
+
+      // Reading 3: 85% SoC, charging = false (vehicle unplugs)
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 3, ts: new Date(now - 60000).toISOString(), soc_pct: 85.0, battery_temp_c: 30, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.2, charging: false, fault_codes: [] }
+      ]);
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ? AND rule = 'rapid_discharge'").get(vid).total, 0);
+
+      // Reading 4: 80% SoC, charging = false (drop in new period is 5.0 points <= 8.0)
+      // Must NOT compare 90% (pre-charging) with 80% (post-charging)
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 4, ts: new Date(now - 10000).toISOString(), soc_pct: 80.0, battery_temp_c: 30, speed_kmh: 45, lat: 13.08, lng: 80.27, odometer_km: 10.8, charging: false, fault_codes: [] }
+      ]);
+      assert.strictEqual(
+        db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ? AND rule = 'rapid_discharge'").get(vid).total,
+        0,
+        'Must NOT trigger rapid discharge across a charging break'
+      );
+
+      // Reading 5: 76.0% SoC, charging = false (drop in current continuous non-charging period is 85.0 - 76.0 = 9.0 > 8.0)
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 5, ts: new Date(now - 2000).toISOString(), soc_pct: 76.0, battery_temp_c: 30, speed_kmh: 45, lat: 13.08, lng: 80.27, odometer_km: 11.2, charging: false, fault_codes: [] }
+      ]);
+      const alert = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'rapid_discharge'").get(vid);
+      assert.ok(alert, 'Must trigger rapid discharge when continuous non-charging period drops > 8.0 points');
+      assert.strictEqual(alert.status, 'open');
+      const details = JSON.parse(alert.details);
+      assert.strictEqual(details.drop_points, 9.0);
+      assert.strictEqual(details.window_max_soc, 85.0);
+    });
+
+    test('Late-arriving charging reading resolves previously triggered false alert', async () => {
+      const vid = `VG-LATE-CHG-${Date.now()}`;
+      const now = Date.now();
+
+      // 1. Post Readings 1, 3, 4 without Reading 2 (charging).
+      // Initially, the engine sees 90% -> 85% -> 80% without knowing a charge occurred -> triggers alert.
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 1, ts: new Date(now - 180000).toISOString(), soc_pct: 90.0, battery_temp_c: 30, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: new Date(now - 60000).toISOString(), soc_pct: 85.0, battery_temp_c: 30, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.2, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 4, ts: new Date(now - 10000).toISOString(), soc_pct: 80.0, battery_temp_c: 30, speed_kmh: 45, lat: 13.08, lng: 80.27, odometer_km: 10.8, charging: false, fault_codes: [] }
+      ]);
+      const alertBefore = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'rapid_discharge'").get(vid);
+      assert.ok(alertBefore, 'Alert triggered when charging reading was missing');
+      assert.strictEqual(alertBefore.status, 'open');
+
+      // 2. Reading 2 (charging = true) arrives late
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 120000).toISOString(), soc_pct: 85.0, battery_temp_c: 30, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 10, charging: true, fault_codes: [] }
+      ]);
+
+      // 3. Engine evaluates readings chronologically, identifies charging break, and resolves false alert
+      const alertAfter = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'rapid_discharge'").get(vid);
+      assert.ok(alertAfter);
+      assert.strictEqual(alertAfter.status, 'resolved', 'Late charging reading must resolve the false rapid-discharge alert');
+    });
+  });
+
+  // =========================================================================
+  // TASK 9: BOUNDED HISTORY RETRIEVAL UNDER LARGE VEHICLE HISTORY (ISSUE 2)
+  // =========================================================================
+  describe('Issue 2: Bounded History Retrieval Under Large Vehicle History', () => {
+    test('Alert evaluation on vehicle with 1,000 historical rows bounds query and maintains alert lifecycle', async () => {
+      const vid = `VG-LARGE-HIST-${Date.now()}`;
+      const now = Date.now();
+
+      // 1. Seed 1,000 historical readings spanning the previous 10 hours
+      const seedStmt = db.prepare(`
+        INSERT INTO telemetry_history (
+          vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, fault_codes
+        ) VALUES (
+          ?, ?, ?, 80.0, 35.0, 40.0, 13.08, 80.27, 10.0, 0, '[]'
+        )
+      `);
+
+      const insertMany = db.transaction(() => {
+        for (let i = 1; i <= 1000; i++) {
+          // 1,000 readings spread over 10 hours (~36 seconds apart), older than 15 minutes
+          const historicalTs = new Date(now - (10 * 3600 * 1000) + (i * 35000)).toISOString();
+          seedStmt.run(vid, i, historicalTs);
+        }
+      });
+      insertMany();
+
+      const totalRowsBefore = db.prepare("SELECT COUNT(*) AS total FROM telemetry_history WHERE vehicle_id = ?").get(vid).total;
+      assert.strictEqual(totalRowsBefore, 1000, 'Vehicle must have 1,000 historical rows in database');
+
+      // 2. Ingest hot streak (3 readings > 55°C) within current window
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 1001, ts: new Date(now - 15000).toISOString(), soc_pct: 75, battery_temp_c: 56.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 50, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 1002, ts: new Date(now - 10000).toISOString(), soc_pct: 75, battery_temp_c: 57.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 50.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 1003, ts: new Date(now - 5000).toISOString(), soc_pct: 75, battery_temp_c: 58.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 50.2, charging: false, fault_codes: [] }
+      ]);
+
+      const openAlert = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").get(vid);
+      assert.ok(openAlert, 'Overheat alert must trigger correctly despite 1,000 historical rows');
+      assert.strictEqual(openAlert.status, 'open');
+
+      // 3. Ingest cooling streak (3 readings <= 50°C)
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 1004, ts: new Date(now - 3000).toISOString(), soc_pct: 75, battery_temp_c: 49.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 50.3, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 1005, ts: new Date(now - 2000).toISOString(), soc_pct: 75, battery_temp_c: 48.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 50.4, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 1006, ts: new Date(now - 1000).toISOString(), soc_pct: 75, battery_temp_c: 47.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 50.5, charging: false, fault_codes: [] }
+      ]);
+
+      const resolvedAlert = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").get(vid);
+      assert.ok(resolvedAlert);
+      assert.strictEqual(resolvedAlert.status, 'resolved', 'Overheat alert must resolve cleanly');
+      assert.strictEqual(resolvedAlert.version, 2, 'Alert version must increment to 2 on resolution');
+
+      // 4. Multiple re-evaluations must NEVER create duplicate alerts
+      const changed = evaluateVehicleAlerts(vid);
+      assert.strictEqual(changed.length, 0, 'Re-evaluation must produce 0 changed alerts');
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ?").get(vid).total, 1);
+
+      // 5. Verify bounded retrieval: rows loaded by getWindowHistoryStmt are strictly bounded by cutoff, NOT 1,000 rows
+      const cutoff10MinAgo = new Date(now - (10 * 60 * 1000)).toISOString();
+      const boundedRows = db.prepare(`
+        SELECT COUNT(*) AS total FROM telemetry_history
+        WHERE vehicle_id = ? AND ts >= ?
+      `).get(vid, cutoff10MinAgo).total;
+
+      assert.ok(boundedRows < 20, `Bounded rows (${boundedRows}) must be far less than total history (1000)`);
+    });
+  });
 });

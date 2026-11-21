@@ -192,26 +192,45 @@ function evaluateRapidDischarge(readings, activeAlert = null) {
   const latestTimeMs = Date.parse(latest.ts);
   const fiveMinWindowStart = latestTimeMs - (5 * 60 * 1000);
 
-  // Filter non-charging readings within preceding 5-minute event window
-  const windowReadings = sorted.filter(r =>
-    !r.charging &&
-    Date.parse(r.ts) >= fiveMinWindowStart &&
-    Date.parse(r.ts) <= latestTimeMs
-  );
+  // Scan backwards to find the latest continuous non-charging period within the 5-minute window.
+  // When a charging reading occurs, break the previous non-charging comparison period so that
+  // readings across charging transitions are never compared.
+  const currentNonChargingPeriod = [];
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    const r = sorted[i];
+    const rTimeMs = Date.parse(r.ts);
 
-  // If insufficient readings in window:
-  // - If alert is currently active, or history has older readings: the 5-minute window has elapsed/expired,
-  //   meaning rapid drop is no longer active in the current window -> resolve.
+    if (rTimeMs < fiveMinWindowStart) {
+      break;
+    }
+
+    if (rTimeMs > latestTimeMs) {
+      continue;
+    }
+
+    if (Boolean(r.charging)) {
+      break; // Charging reading breaks the continuous non-charging comparison period
+    }
+
+    currentNonChargingPeriod.push(r);
+  }
+
+  // Restore chronological order (oldest to newest within current non-charging period)
+  currentNonChargingPeriod.reverse();
+
+  // If insufficient readings in current non-charging period:
+  // - If alert is currently active, or history has older readings: the 5-minute window has elapsed/expired
+  //   or a charging break reset the window -> resolve active alert.
   // - If brand new vehicle with single reading and no active alert: do nothing.
-  if (windowReadings.length < 2) {
+  if (currentNonChargingPeriod.length < 2) {
     if (activeAlert || sorted.length >= 2) {
       return {
         triggered: false,
         resolved: true,
         resolvedAt: latest.ts,
         details: {
-          reason: '5_min_window_expired',
-          message: 'Rapid discharge condition no longer active (window expired or sparse readings)',
+          reason: 'insufficient_period_readings',
+          message: 'Rapid discharge condition no longer active (window expired or charging transition)',
           current_soc: latest.soc_pct
         }
       };
@@ -219,9 +238,9 @@ function evaluateRapidDischarge(readings, activeAlert = null) {
     return { triggered: false, resolved: false };
   }
 
-  // Find maximum SOC within preceding 5 minutes
+  // Find maximum SOC strictly within the current continuous non-charging period
   let maxSocInWindow = -Infinity;
-  for (const r of windowReadings) {
+  for (const r of currentNonChargingPeriod) {
     if (r.soc_pct > maxSocInWindow) {
       maxSocInWindow = r.soc_pct;
     }
@@ -381,6 +400,13 @@ const getWindowHistoryStmt = db.prepare(`
   ORDER BY ts ASC, seq ASC
 `);
 
+const getLatestReadingTsStmt = db.prepare(`
+  SELECT ts FROM telemetry_history
+  WHERE vehicle_id = ?
+  ORDER BY ts DESC, seq DESC
+  LIMIT 1
+`);
+
 const getAlertByIdStmt = db.prepare('SELECT * FROM alerts WHERE id = ?');
 const getActiveAlertsForVehicleStmt = db.prepare("SELECT opened_at FROM alerts WHERE vehicle_id = ? AND status != 'resolved'");
 
@@ -453,8 +479,17 @@ const resolveAlertStmt = db.prepare(`
  * alert is open. Returns list of changed alert objects for post-commit publishing.
  */
 function evaluateVehicleAlertsInternal(vehicleId, nowIso) {
-  const nowMs = Date.parse(nowIso);
-  const tenMinAgoIso = new Date(nowMs - (10 * 60 * 1000)).toISOString();
+  const latestRow = getLatestReadingTsStmt.get(vehicleId);
+  if (!latestRow) return [];
+
+  const latestTsMs = Date.parse(latestRow.ts);
+  const nowMs = nowIso ? Date.parse(nowIso) : Date.now();
+  // Anchor the window to the latest reading or nowIso (supports historical datasets / tests)
+  const anchorMs = (!isNaN(nowMs) && Math.abs(nowMs - latestTsMs) <= (15 * 60 * 1000))
+    ? Math.max(nowMs, latestTsMs)
+    : latestTsMs;
+
+  const tenMinAgoIso = new Date(anchorMs - (10 * 60 * 1000)).toISOString();
   let cutoffIso = tenMinAgoIso;
 
   // If there are any active unresolved alerts, extend cutoff back to opened_at

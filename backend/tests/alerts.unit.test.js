@@ -163,6 +163,71 @@ describe('Part A3 Alert Engine Unit Tests', () => {
       assert.strictEqual(outcome.triggered, false);
       assert.strictEqual(outcome.resolved, true, 'Window expiration must resolve active alert');
     });
+
+    test('Discharge within one continuous non-charging period (>8% drop triggers)', () => {
+      const readings = [
+        { seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 85.0, charging: false },
+        { seq: 2, ts: '2026-11-20T10:02:00Z', soc_pct: 76.5, charging: false },
+        { seq: 3, ts: '2026-11-20T10:04:00Z', soc_pct: 76.0, charging: false } // Drop: 9.0 points (> 8.0)
+      ];
+      const outcome = evaluateRapidDischarge(readings);
+      assert.strictEqual(outcome.triggered, true, 'Discharge > 8% in continuous non-charging period must trigger');
+      assert.strictEqual(outcome.resolved, false);
+      assert.strictEqual(outcome.details.drop_points, 9.0);
+    });
+
+    test('Charging occurring between two non-charging periods: no false rapid-discharge alert', () => {
+      // Example: 90% non-charging -> 85% charging -> 85% non-charging -> 80% non-charging
+      const readings = [
+        { seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 90.0, charging: false },
+        { seq: 2, ts: '2026-11-20T10:01:00Z', soc_pct: 85.0, charging: true },  // Charging break!
+        { seq: 3, ts: '2026-11-20T10:02:00Z', soc_pct: 85.0, charging: false },
+        { seq: 4, ts: '2026-11-20T10:03:00Z', soc_pct: 80.0, charging: false }  // Drop in new period is only 5.0 (85 - 80)
+      ];
+      const outcome = evaluateRapidDischarge(readings);
+      assert.strictEqual(outcome.triggered, false, 'Must NOT compare 90% with 80% across charging break');
+      assert.strictEqual(outcome.resolved, true, 'Must evaluate to resolved (drop is 5.0 <= 8.0)');
+      assert.strictEqual(outcome.details.drop_points, 5.0);
+    });
+
+    test('Charging reading followed by a new non-charging period: drop only evaluated in new period', () => {
+      // In the new period, drop exceeds 8% (85% -> 75% = 10% drop)
+      const readings = [
+        { seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 95.0, charging: false },
+        { seq: 2, ts: '2026-11-20T10:01:00Z', soc_pct: 90.0, charging: true },  // Charging break!
+        { seq: 3, ts: '2026-11-20T10:02:00Z', soc_pct: 85.0, charging: false }, // New period start
+        { seq: 4, ts: '2026-11-20T10:04:00Z', soc_pct: 75.0, charging: false }  // Drop in new period is 10.0 (> 8.0)
+      ];
+      const outcome = evaluateRapidDischarge(readings);
+      assert.strictEqual(outcome.triggered, true, 'Drop > 8% within new continuous period must trigger alert');
+      assert.strictEqual(outcome.details.window_max_soc, 85.0, 'Window max must be from new period (85.0), not pre-charging (95.0)');
+      assert.strictEqual(outcome.details.drop_points, 10.0);
+    });
+
+    test('Out-of-order arrival of readings across charging transitions', () => {
+      // Shuffled readings: Reading 2 (charging) arrives out of order
+      const shuffled = [
+        { seq: 4, ts: '2026-11-20T10:03:00Z', soc_pct: 80.0, charging: false },
+        { seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 90.0, charging: false },
+        { seq: 3, ts: '2026-11-20T10:02:00Z', soc_pct: 85.0, charging: false },
+        { seq: 2, ts: '2026-11-20T10:01:00Z', soc_pct: 85.0, charging: true }   // Intermediate charging reading
+      ];
+      const outcome = evaluateRapidDischarge(shuffled);
+      assert.strictEqual(outcome.triggered, false, 'Chronological sort must identify intermediate charging reading');
+      assert.strictEqual(outcome.details.drop_points, 5.0, 'Drop must be calculated strictly from post-charging period');
+    });
+
+    test('Duplicate readings in continuous non-charging period do not trigger false alerts', () => {
+      const readings = [
+        { seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 80.0, charging: false },
+        { seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 80.0, charging: false }, // Duplicate
+        { seq: 2, ts: '2026-11-20T10:02:00Z', soc_pct: 78.0, charging: false },
+        { seq: 2, ts: '2026-11-20T10:02:00Z', soc_pct: 78.0, charging: false }  // Duplicate (drop is 2.0 <= 8.0)
+      ];
+      const outcome = evaluateRapidDischarge(readings);
+      assert.strictEqual(outcome.triggered, false, 'Duplicates must not trigger rapid discharge');
+      assert.strictEqual(outcome.details.drop_points, 2.0);
+    });
   });
 
   describe('Rule 3: Geofence Breach (Operating Polygon)', () => {
