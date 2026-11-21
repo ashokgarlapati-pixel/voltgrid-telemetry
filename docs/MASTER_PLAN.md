@@ -1096,7 +1096,7 @@ Using `loadtest/loadtest.js`, we ran a mixed concurrent load test against the AP
 
 ### Q3: "Which part of this system requires the most care under extreme scale?"
 > **Answer**:
-> *"Single-node SQLite write serialization. While SQLite WAL mode with `PRAGMA synchronous = NORMAL` and `BEGIN IMMEDIATE` transactions comfortably handles 400+ writes/second on SSD storage, SQLite has a single-writer architecture. If the fleet scales to 200,000 vehicles (40,000 req/s), write lock contention on a single `.db` file will eventually saturate disk I/O. To scale 100x, we would shard vehicles into regional database clusters (or migrate raw telemetry ingestion to ClickHouse/TimescaleDB or Kafka) while retaining SQLite/Postgres for vehicle metadata and alert management."*
+> *"Single-node SQLite write serialization. While SQLite WAL mode with `PRAGMA synchronous = NORMAL` and `BEGIN IMMEDIATE` transactions comfortably handles write bursts for the baseline 2,000-vehicle fleet (~400 readings/s in batches), SQLite has a single-writer architecture. If the fleet scales to 200,000 vehicles (a theoretical 100x projection of ~40,000 readings/s; e.g. 400 batches/s at 100 readings/batch, 80 batches/s at 500 readings/batch, or 40,000 req/s unbatched), write lock contention on a single `.db` file will eventually saturate disk I/O. To scale 100x, we would shard vehicles into regional database clusters (or migrate raw telemetry ingestion to ClickHouse/TimescaleDB or Kafka) while retaining SQLite/Postgres for vehicle metadata and alert management."*
 
 <br/><br/>
 
@@ -1110,7 +1110,8 @@ Using `loadtest/loadtest.js`, we ran a mixed concurrent load test against the AP
 
 The comprehensive engineering answers to all 7 Part C evaluation questions are authored in **[DESIGN.md](file:///c:/Users/garla/OneDrive/Desktop/Fleet%20telementary/voltgrid-telemetry/DESIGN.md)**:
 
-1. **Scale (100x Growth → 200,000 Vehicles / ~40,000 Readings/sec)**:
+1. **Scale (100x Growth → 200,000 Vehicles / Theoretical ~40,000 Readings/sec)**:
+   * **Throughput & Batch Formula**: $\text{Batches/sec} = \text{Readings/sec} / \text{Average readings per batch}$. The ~400 batches/sec figure applies strictly when average batch size is 100 readings (from historical load test). At maximum permitted batch size (500), write load is 80 batches/s; at 50 readings/batch, 800 batches/s; and unbatched, 40,000 req/s. 40,000 readings/sec is a theoretical projection, not a measured benchmark.
    * **First Bottleneck**: SQLite's single-writer lock on `BEGIN IMMEDIATE` transactions in `ingestion.js`.
    * **Next 3 Bottlenecks**: Single-threaded Node.js event-loop CPU saturation (HMAC + JSON parsing) $\rightarrow$ NVMe disk I/O & B-tree write amplification on `telemetry_history` (3.45B rows/day) $\rightarrow$ In-memory SSE fan-out & `offlineWorker` 10s table scans.
    * **Mitigations**: Stateless API cluster behind API Gateway $\rightarrow$ Kafka buffer + ClickHouse/TimescaleDB time-partitioned storage $\rightarrow$ Redis Sorted Sets for heartbeats and Redis Pub/Sub for SSE streaming.

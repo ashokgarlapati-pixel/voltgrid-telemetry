@@ -1,9 +1,9 @@
 # VoltGrid Fleet Telemetry Service — System Design & Architecture
 
-## 1. Scale: Scaling to 200,000 Vehicles (~40,000 readings/sec)
+## 1. Scale: Scaling to 200,000 Vehicles (Theoretical ~40,000 readings/sec)
 
 ### The First Failure Point
-The single-writer bottleneck in SQLite's WAL mode breaks first. While WAL allows concurrent readers, write transactions (`BEGIN IMMEDIATE`) are strictly serialized. At our current 2,000-vehicle fleet (~400 readings/sec in batches), lock hold times average 5–15 ms (well within `busy_timeout = 5000ms`). At 40,000 readings/sec (~400 batches/sec), writes queue up faster than SQLite can commit them to disk, triggering `SQLITE_BUSY: database is locked`. Furthermore, SQLite WAL mode requires same-host shared-memory coordination via its memory-mapped WAL index (`.shm`), making it unsuitable for multi-machine scale-out over network filesystems (NFS/EFS).
+The single-writer bottleneck in SQLite's WAL mode breaks first. While WAL allows concurrent readers, write transactions (`BEGIN IMMEDIATE`) are strictly serialized. At our 2,000-vehicle baseline fleet (~400 readings/s theoretical volume), lock hold times average 5–15 ms (well within `busy_timeout = 5000ms`). Scaling to 200,000 vehicles is a theoretical 100x projection (40,000 readings/s, not a measured benchmark). Write request rates follow $\text{Batches/s} = \text{Readings/s} / \text{Avg Batch Size}$. The figure of ~400 batches/s holds *only* if the average batch is 100 readings (as in our mixed load test). At the maximum permitted batch size of 500 (`server.js`), write load is 80 batches/s; at 50 readings/batch (`scripts/loadtest.js`), it is 800 batches/s; and unbatched it is 40,000 req/s. Under any batch size, serialized SQLite WAL writes queue up faster than disk commits, triggering `SQLITE_BUSY`. Furthermore, SQLite WAL mode requires same-host shared-memory coordination via its memory-mapped WAL index (`.shm`), making it unsuitable for multi-machine scale-out over network filesystems (NFS/EFS).
 
 ### Subsequent Bottlenecks & Fixes
 1. **Node.js Event Loop Saturation**: Parsing ~20 MB/s of JSON and computing 400 HMAC-SHA256 hashes/s saturates a single CPU core.

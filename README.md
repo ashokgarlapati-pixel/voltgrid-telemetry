@@ -145,6 +145,25 @@ Every reading in `POST /v1/telemetry/batch` is individually validated using `Num
   $$\text{Completeness} = \frac{\text{received\_count}}{\text{max\_seq} - \text{min\_seq} + 1}$$
 * **Limitation Note**: Sequence gap tracking establishes completeness strictly within the observed interval $[\text{min\_seq}, \text{max\_seq}]$. Sequences dropped prior to the first observed reading cannot be determined without an external provisioning baseline. Single-vehicle gaps are queryable via `GET /v1/completeness?vehicle_id=VG-xxx`.
 
+### Ingestion Throughput & Batch-Size Economics
+Telemetry ingestion throughput depends fundamentally on batch size according to:
+$$\text{Batches/sec} = \frac{\text{Readings/sec}}{\text{Average readings per batch}}$$
+
+* **Maximum Permitted Batch Size (500 readings)**: Enforced strictly in `server.js` (`readings.length > 500` returns `HTTP 400 Bad Request`).
+* **Configured Simulator Batch Size (up to 500 readings)**: `simulator/simulator.js` defaults to `BATCH_SIZE = 500`. For the 2,000-vehicle baseline fleet emitting 400 readings/sec (5-second vehicle report intervals), readings are aggregated into **~1 batch/sec of ~400 readings**.
+* **Measured Average Batch Size in Benchmarks**:
+  * *Historical Mixed Load Test (`loadtest/loadtest.js`)*: Evaluated using fixed batches of **100 readings/batch** (415 batch requests over 30.7s = ~13.5 batches/s, ~1,350 readings/s).
+  * *Native Load Test (`scripts/loadtest.js`)*: Defaults to `BATCH_SIZE = 50` readings/batch.
+  * *In-Memory Streaming Benchmark (`tests/stream.int.test.js`)*: Ingests 400-reading bursts in 65–100 ms (~4,000–6,000 readings/sec).
+* **Theoretical Scale-Up Calculation vs. Benchmark Reality**:
+  * The **40,000 readings/sec** throughput figure is a **theoretical 100x projection** (200,000 vehicles @ 5s reporting interval), **not an empirical measurement**.
+  * At 40,000 readings/sec, write load varies by batch size:
+    * At **100 readings/batch** (historical load test average): $40{,}000 / 100 = \mathbf{400\text{ batches/sec}}$.
+    * At **500 readings/batch** (maximum permitted size): $40{,}000 / 500 = \mathbf{80\text{ batches/sec}}$.
+    * At **50 readings/batch** (`scripts/loadtest.js` default): $40{,}000 / 50 = \mathbf{800\text{ batches/sec}}$.
+    * **Unbatched** (1 reading per HTTP request): $40{,}000 / 1 = \mathbf{40{,}000\text{ req/sec}}$.
+  * Regardless of batching, single-writer SQLite WAL transactions bottleneck on disk commits under 40,000 readings/sec, requiring the production migration path outlined in Section 5.
+
 ---
 
 ## 4. Alert Engine & Lifecycle Specification (Part A3)
