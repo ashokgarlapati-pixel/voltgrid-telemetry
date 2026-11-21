@@ -416,7 +416,7 @@ npm run benchmark:5m
 | :--- | :---: | :---: | :---: | :---: |
 | **Telemetry History Records** | **5,000,000** | **5,000,000** | 5,000,000 | Populated |
 | **Fleet Vehicles** | **1,000** | **1,000** | Multi-vehicle | Populated |
-| **Database File Size** | **1,302.05 MB** | **1,302.05 MB** | ~1.3 GB | Verified |
+| **Database File Size** | **1,302.05 MiB (1,365.30 MB)** | **1,302.05 MiB (1,365.30 MB)** | ~1.3–1.4 GB | Verified |
 | **Concurrency** | **10 VUs** | **10 VUs** | Concurrent | Completed |
 | **Total Measured Requests** | **500** (+ 50 warm-up) | **500** (+ 50 warm-up) | 500 | Completed |
 | **Successful Requests** | **500 (100.0%)** | **500 (100.0%)** | 100% | Completed |

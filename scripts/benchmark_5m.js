@@ -247,7 +247,7 @@ async function ensureDataset() {
   console.log(`\n\nDataset generation complete: Exactly ${finalHistoryCount.toLocaleString()} records across ${finalVehiclesCount.toLocaleString()} vehicles in ${genDuration.toFixed(2)}s (${Math.round(totalInserted / genDuration).toLocaleString()} rows/s)`);
 
   const fileStat = fs.statSync(BENCH_DB_PATH);
-  console.log(`Database File Size on Disk: ${(fileStat.size / (1024 * 1024)).toFixed(2)} MB\n`);
+  console.log(`Database File Size on Disk: ${(fileStat.size / (1024 * 1024)).toFixed(2)} MiB (${(fileStat.size / 1e6).toFixed(2)} MB / ${fileStat.size.toLocaleString()} bytes)\n`);
 }
 
 /**
@@ -390,7 +390,7 @@ async function runBenchmark() {
   console.log('='.repeat(75));
   console.log(`Telemetry Rows in History : ${TARGET_READINGS.toLocaleString()}`);
   console.log(`Vehicles in State Table   : ${VEHICLE_COUNT.toLocaleString()}`);
-  console.log(`Database Size on Disk     : ${(dbStat.size / (1024 * 1024)).toFixed(2)} MB`);
+  console.log(`Database Size on Disk     : ${(dbStat.size / (1024 * 1024)).toFixed(2)} MiB (${(dbStat.size / 1e6).toFixed(2)} MB / ${dbStat.size.toLocaleString()} bytes)`);
   console.log(`Hardware Environment     : ${cpus[0]?.model || 'Generic CPU'} (${cpus.length} cores, ${(os.totalmem() / (1024**3)).toFixed(1)} GB RAM)`);
   console.log(`OS & Node.js Version      : ${os.type()} ${os.release()} | Node ${process.version}`);
   console.log(`SQLite Engine Driver      : ${db.engineName || 'better-sqlite3'}`);

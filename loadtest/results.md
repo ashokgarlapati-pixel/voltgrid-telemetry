@@ -110,7 +110,7 @@ A reproducible performance benchmark (`scripts/benchmark_5m.js`) tests `GET /v1/
 * **RAM**: 15.7 GB
 * **Operating System**: Windows_NT 10.0.26200 x64
 * **Node.js**: v24.14.1
-* **Database Size**: 1,302.05 MB (5,000,000 rows in `telemetry_history`)
+* **Database Size**: 1,302.05 MiB / 1,365.30 MB (1,365,295,104 bytes for 5,000,000 rows in `telemetry_history`, plus vehicles, alerts, and indexes)
 * **SQLite Configuration**: Engine driver `node:sqlite` (fallback) / `better-sqlite3`, WAL mode, `synchronous = NORMAL`, `busy_timeout = 5000ms`, `cache_size = -64000`
 
 ### Empirical Measurement Results
@@ -119,7 +119,7 @@ A reproducible performance benchmark (`scripts/benchmark_5m.js`) tests `GET /v1/
 | :--- | :---: | :---: | :---: | :---: |
 | **Telemetry History Records** | **5,000,000** | **5,000,000** | 5,000,000 | Populated |
 | **Fleet Vehicles** | **1,000** | **1,000** | Multi-vehicle | Populated |
-| **Database File Size** | **1,302.05 MB** | **1,302.05 MB** | ~1.3 GB | Verified |
+| **Database File Size** | **1,302.05 MiB (1,365.30 MB)** | **1,302.05 MiB (1,365.30 MB)** | ~1.3–1.4 GB | Verified |
 | **Concurrency** | **10 VUs** | **10 VUs** | Concurrent | Completed |
 | **Total Measured Requests** | **500** (+ 50 warm-up) | **500** (+ 50 warm-up) | 500 | Completed |
 | **Successful Requests** | **500 (100.0%)** | **500 (100.0%)** | 100% | Completed |

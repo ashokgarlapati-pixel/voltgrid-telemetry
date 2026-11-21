@@ -1092,8 +1092,8 @@ The comprehensive engineering answers to all 7 Part C evaluation questions are a
    * **Server Timestamp (`received_at` / `updated_at`)**: Trusted for offline detection sweeps and HMAC 5-minute replay window validation.
    * **Timestamp Validation Separation**: HTTP request timestamp (`X-Timestamp`) enforced within $\pm 5$ min by `security.js` (rejects with `HTTP 401 Unauthorized`). Telemetry reading timestamp (`reading.ts`) enforced within $[T-10\text{m}, T+30\text{s}]$ by `ingestion.js` (rejects reading with `HTTP 207 Multi-Status`, `"ts cannot be older than 10 minutes"` / `"ts cannot be more than 30 seconds in the future"`, never HTTP 401).
 4. **Storage & Cost (~35M Rows / Day)**:
-   * **Volume**: ~220 bytes/row $\times$ 35M $\approx$ 7.7 GB/day (~230 GB/month).
-   * **Tiered Lifecycle (Design Proposal)**: 7 days raw (Hot, ~54 GB) $\rightarrow$ 90 days 1-minute rollups (Warm, ~15 GB under $\ge 2.5:1$ compression or 1,000-vehicle baseline; uncompressed ~38–41 GB) $\rightarrow$ 1 year 1-hour rollups (Cold, raw dumped to S3 Glacier as Parquet). Note: Warm/cold tiers are architectural design proposals; the current prototype stores raw readings in SQLite.
+   * **Volume**: ~220 B/row theoretical $\times$ 35M $\approx$ 7.7 GB/day (53.9 GB/7 days); benchmark-derived empirical footprint ~273 B/reading $\times$ 35M $\approx$ 9.56 GB/day (66.9 GB/7 days).
+   * **Tiered Lifecycle (Design Proposal)**: 7 days raw (Hot, 53–54 GB theoretical raw; 66–67 GB empirical database allocation) $\rightarrow$ 90 days 1-minute rollups (Warm, ~15 GB under $\ge 2.5:1$ compression or 1,000-vehicle baseline; uncompressed ~38.2–41.5 GB) $\rightarrow$ 1 year 1-hour rollups (Cold, raw dumped to S3 Glacier as Parquet). Note: Warm/cold tiers are architectural design proposals; the current prototype stores raw readings in SQLite.
    * **What Operator Loses**: Sub-minute transient spikes (<60s), exact `seq` packet drop gaps, and exact 3-reading alert streaks.
 5. **Threat Model**:
    * **Replay Attacks**: Defended via `used_nonces` table in `security.js` (HTTP 401 on duplicate signature within 5 mins).

@@ -133,28 +133,31 @@ Re-evaluating the rule over this chronological slice reconstructs the exact stat
 ## 5. Storage Economics (~35M Rows/Day)
 
 ### Implementation Reality vs. Production Architecture
-The current VoltGrid prototype stores all ingested telemetry as raw records in SQLite `telemetry_history`. It does **not** implement automated background rollups, warm-tier aggregation tables, or cold-tier Parquet archival (only `stream_events` implements retention pruning, capped at 10,000 events). The tiered model below outlines the proposed production lifecycle.
+The prototype stores all telemetry as raw records in SQLite `telemetry_history`. It does **not** implement automated background rollups, warm-tier aggregation tables, or cold-tier Parquet archival (only `stream_events` implements retention pruning, capped at 10,000 events). The tiered model below outlines the proposed production lifecycle.
 
-### Raw Telemetry Volume (Current Implementation)
-* **Ingestion Workload**: 2,000 vehicles generating 1 reading every 5 seconds = 400 readings/sec.
-* **Daily Ingestion Volume**: $400\text{ readings/s} \times 86{,}400\text{ s/day} = 34{,}560{,}000\text{ readings/day}$ (~34.56M, rounded to ~35M rows/day).
-* **Storage Footprint Breakdown per Row**:
-  * *Raw Data Payload*: ~120 bytes (`vehicle_id`, `seq`, `ts`, `soc_pct`, `battery_temp_c`, `speed_kmh`, `lat`, `lng`, `odometer_km`, `charging`, `fault_codes`, `received_at`).
-  * *Index Overhead*: ~100 bytes across `PRIMARY KEY (vehicle_id, seq)` (~40 B) and `idx_history_vehicle_ts (vehicle_id, ts)` (~60 B).
-  * *Total Uncompressed Database Footprint*: ~220 bytes/row.
-  * *B-Tree & Page Fill Factor*: SQLite B-tree pages operate at 75–85% fill factor, resulting in an empirical on-disk footprint of ~260–275 bytes/row (verified by our 5M-reading benchmark: 5,000,000 rows occupy 1,302.05 MB $\approx 273$ bytes/row).
-  * *WAL & Ephemeral Space*: SQLite WAL mode introduces transient `-wal` file overhead (typically 4–32 MB with regular checkpoints, expanding under uncheckpointed write bursts).
-* **Daily & 7-Day Raw Storage**:
-  * *Daily Raw Storage*: $34.56\text{M rows} \times 220\text{ B} \approx 7.60\text{ GB/day}$ ($35\text{M} \times 220\text{ B} \approx 7.7\text{ GB/day}$).
-  * *7-Day Raw Storage (Hot Tier)*: $7 \times 7.60\text{ GB} \approx 53.2\text{ GB}$ (or $7 \times 7.7\text{ GB} \approx 53.9\text{ GB} \approx 54\text{ GB}$).
+### Ingestion Volume & Row Footprint
+* **Workload**: 2,000 vehicles transmitting every 5s = 400 readings/s ($34{,}560{,}000\text{ readings/day} \approx 34.56\text{M}$, rounded to ~35M).
+* **Theoretical Row Footprint (~220 B/row)**: ~120 B raw row payload (`vehicle_id`, `seq`, `ts`, 7 metric floats, bool, status, timestamps) + ~100 B index overhead (`PRIMARY KEY (vehicle_id, seq)` ~40 B + `idx_history_vehicle_ts` ~60 B).
+* **Empirical Measurement (~273 B/reading)**: The dedicated 5M-reading benchmark database file is exactly $1{,}365{,}295{,}104\text{ bytes}$ ($1{,}302.05\text{ MiB}$ binary, or $1{,}365.30\text{ MB}$ decimal). Dividing total database size by 5,000,000 readings yields $273.06\text{ bytes/reading}$. Note that this includes the entire database (schema, `telemetry_history`, `vehicles`, `alerts`, and all associated B-tree pages/indexes); it is an empirical system footprint, not an isolated row-payload measurement.
+* **Storage Factors & Overhead**:
+  * *B-Tree Utilization*: Storage overhead depends on schema, index count, page size (4,096 B), and insertion patterns (append-only vs random updates). The 273.06 B/reading measurement reflects empirical overhead for this workload, not a universal fill-factor guarantee.
+  * *WAL Overhead*: The SQLite `-wal` file size is workload- and checkpoint-dependent (governed by checkpoint policy, write velocity, and active readers), acting as additional temporary disk usage.
+
+### Daily & 7-Day Hot-Tier Storage Comparison
+* **Theoretical Storage (at 220 B/row)**:
+  * *Daily*: $34.56\text{M} \times 220\text{ B} \approx 7.60\text{ GB/day}$ ($7.08\text{ GiB}$; rounded 35M: $7.70\text{ GB/day}$).
+  * *7-Day*: $7 \times 7.60\text{ GB} \approx 53.22\text{ GB}$ ($49.57\text{ GiB}$; rounded 35M: $53.90\text{ GB} \approx 54\text{ GB}$).
+* **Empirical Storage (at 273.06 B/reading, benchmark-derived)**:
+  * *Daily*: $34.56\text{M} \times 273.06\text{ B} \approx 9.44\text{ GB/day}$ ($8.79\text{ GiB}$; rounded 35M: $9.56\text{ GB/day}$).
+  * *7-Day*: $7 \times 9.44\text{ GB} \approx 66.06\text{ GB}$ ($61.52\text{ GiB}$; rounded 35M: $66.90\text{ GB} \approx 67\text{ GB}$).
 
 ### Tiered Retention Strategy (Architectural Proposal)
-1. **Hot Tier (0–7 Days)**: Full raw 5-second readings in SQLite/NVMe for live operations and triage (~54 GB raw data + index footprint).
-2. **Warm Tier (8–90 Days — Illustrative Estimate)**: Proposed nightly rollups downsampling into 1-minute `min/max/avg` buckets (SOC, temperature, speed):
-   * *Rollup Volume*: $2{,}000\text{ vehicles} \times 1{,}440\text{ min/day} = 2{,}880{,}000\text{ rollup rows/day}$. Over 83 days (days 8–90), this yields $239{,}040{,}000\text{ rows}$ (or $259.2\text{M rows}$ for 90 days).
-   * *Uncompressed Reality*: An uncompressed SQLite rollup table (~160 B/row with indexes) requires **~38–41 GB**, not 15 GB.
-   * *Derivation of the ~15 GB Figure*: The original ~15 GB estimate is an **unverified design target** that assumes either:
-     - **Columnar/compressed storage** (e.g. Parquet or zstd compression achieving $\ge 2.5:1$ ratio, yielding ~60 B/row: $239\text{M} \times 60\text{ B} \approx 14.3\text{ GB} \approx 15\text{ GB}$), or
+1. **Hot Tier (0–7 Days)**: Full raw 5s readings in SQLite/NVMe for live triage (53–54 GB theoretical raw; 66–67 GB empirical database allocation).
+2. **Warm Tier (8–90 Days — Illustrative Design Target)**: Proposed nightly rollups downsampling into 1-minute `min/max/avg` buckets:
+   * *Rollup Volume*: $2{,}000\text{ vehicles} \times 1{,}440\text{ min/day} = 2{,}880{,}000\text{ rows/day}$. Over 83 days (days 8–90), this yields $239{,}040{,}000\text{ rows}$ ($259.2\text{M rows}$ for 90 days).
+   * *Uncompressed Reality*: An uncompressed SQLite rollup table (~160 B/row with indexes) requires **~38.2–41.5 GB**, not 15 GB.
+   * *Derivation of the ~15 GB Figure*: The original ~15 GB estimate is an **unverified design target** assuming either:
+     - **Columnar/compressed storage** (e.g. Parquet or zstd with $\ge 2.5:1$ compression ratio, yielding ~60 B/row: $239\text{M} \times 60\text{ B} \approx 14.3\text{ GB} \approx 15\text{ GB}$), or
      - A smaller baseline fleet of **1,000 vehicles** ($1{,}000 \times 1{,}440 \times 90 \times 116\text{ B} \approx 15.0\text{ GB}$).
 3. **Cold Tier (91–365 Days)**: Hourly rollups exported to compressed Parquet files on S3 Glacier ($0.0036/GB/month). Drop raw partitions.
 *Trade-off*: Downsampling loses sub-minute transient thermal spikes and fine-grained sequence gap detection.
