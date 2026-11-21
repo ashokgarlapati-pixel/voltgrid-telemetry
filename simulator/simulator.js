@@ -19,7 +19,7 @@ const NUM_VEHICLES = parseInt(process.env.NUM_VEHICLES || '2000', 10);
 const REPORT_INTERVAL_MS = parseInt(process.env.REPORT_INTERVAL_MS || '5000', 10);
 const DUPLICATE_RATE = parseFloat(process.env.DUPLICATE_RATE || '0.05');
 const LATE_RATE = parseFloat(process.env.LATE_RATE || '0.10');
-const MAX_LATE_MS = parseInt(process.env.MAX_LATE_MS || '60000', 10);
+const MAX_LATE_MS = parseInt(process.env.MAX_LATE_MS || '600000', 10);
 const MAX_DRIFT_MS = parseInt(process.env.MAX_DRIFT_MS || '30000', 10);
 const MALFORMED_RATE = parseFloat(process.env.MALFORMED_RATE || '0.02');
 const BATCH_SIZE = Math.min(500, parseInt(process.env.BATCH_SIZE || '500', 10));
@@ -210,7 +210,9 @@ async function tick() {
 
     // Check if this reading should be delayed (late arrival)
     if (Math.random() < LATE_RATE) {
-      const delayMs = Math.floor(Math.random() * MAX_LATE_MS);
+      // Ensure reading age at release does not exceed MAX_LATE_MS (10 minutes) even with negative clock drift
+      const maxAllowedDelay = Math.max(1000, MAX_LATE_MS - Math.max(0, -v.clock_drift_ms));
+      const delayMs = Math.floor(Math.random() * maxAllowedDelay);
       delayedQueue.push({
         reading,
         releaseAt: Date.now() + delayMs
@@ -268,12 +270,11 @@ async function tick() {
   }
 }
 
-// Start simulator loop every 1 second
-const timer = setInterval(tick, 1000);
+let timer = null;
 
 // Log summary on shutdown
 function handleExit() {
-  clearInterval(timer);
+  if (timer) clearInterval(timer);
   console.log('\n' + '='.repeat(70));
   console.log('VoltGrid Simulator Stopped. Cumulative Statistics:');
   console.log(`  Total Readings Sent : ${totalSentCount}`);
@@ -285,8 +286,20 @@ function handleExit() {
   process.exit(0);
 }
 
-process.on('SIGINT', handleExit);
-process.on('SIGTERM', handleExit);
+// Start simulator loop if run directly
+if (require.main === module) {
+  timer = setInterval(tick, 1000);
+  process.on('SIGINT', handleExit);
+  process.on('SIGTERM', handleExit);
+  tick();
+}
 
-// Immediate first tick
-tick();
+module.exports = {
+  MAX_LATE_MS,
+  MAX_DRIFT_MS,
+  generateNextReading,
+  corruptPayload,
+  vehicles,
+  delayedQueue,
+  tick
+};

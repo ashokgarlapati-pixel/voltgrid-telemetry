@@ -13,7 +13,7 @@ Built with **Node.js (Express)**, **SQLite (`better-sqlite3` in WAL mode)**, and
 │   Messy Traffic Simulator      │
 │   (2,000 vehicles @ 400 req/s) │
 │   - 5% Duplicates              │
-│   - 10% Late Queue (<= 60s)    │
+│   - 10% Late Queue (<= 10m)    │
 │   - +-30s Clock Drift          │
 │   - 2% Malformed Payloads      │
 └───────────────┬────────────────┘
@@ -66,7 +66,7 @@ API_URL=http://localhost:3000/v1/telemetry/batch \
 NUM_VEHICLES=2000 \
 DUPLICATE_RATE=0.05 \
 LATE_RATE=0.10 \
-MAX_LATE_MS=60000 \
+MAX_LATE_MS=600000 \
 MAX_DRIFT_MS=30000 \
 MALFORMED_RATE=0.02 \
 node simulator/simulator.js
