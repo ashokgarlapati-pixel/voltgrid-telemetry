@@ -409,4 +409,173 @@ describe('A3 Comprehensive Alert Engine Edge Cases & Lifecycle Tests', () => {
       assert.strictEqual(alertsAfter.length, 1, 'Restarted engine evaluation must NOT duplicate resolved alerts');
     });
   });
+
+  describe('Issue 3: Geofence Intermediate Transitions & Chronological Evaluation', () => {
+    test('Inside -> Outside -> Inside in one batch', async () => {
+      const vid = `VG-GEO-ONEBATCH-${Date.now()}`;
+      const now = Date.now();
+      const t1 = new Date(now - 15000).toISOString();
+      const t2 = new Date(now - 10000).toISOString();
+      const t3 = new Date(now - 5000).toISOString();
+
+      const batch = [
+        { vehicle_id: vid, seq: 1, ts: t1, soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 13.0800, lng: 80.2500, odometer_km: 10, charging: false, fault_codes: [] }, // Inside
+        { vehicle_id: vid, seq: 2, ts: t2, soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 14.5000, lng: 81.0000, odometer_km: 10.5, charging: false, fault_codes: [] }, // Outside
+        { vehicle_id: vid, seq: 3, ts: t3, soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 13.0900, lng: 80.2600, odometer_km: 11, charging: false, fault_codes: [] }  // Inside
+      ];
+
+      const res = await postSignedBatch(batch);
+      assert.strictEqual(res.status, 200);
+
+      const alerts = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'geofence_breach'").all(vid);
+      assert.strictEqual(alerts.length, 1, 'Intermediate breach within single batch must be captured as 1 alert');
+      assert.strictEqual(alerts[0].status, 'resolved', 'Must resolve upon vehicle return inside');
+      assert.strictEqual(alerts[0].opened_at, t2, 'Alert opened_at must match the outside reading timestamp');
+      assert.strictEqual(alerts[0].resolved_at, t3, 'Alert resolved_at must match the inside return timestamp');
+      assert.strictEqual(alerts[0].version, 2, 'Version must be 2 for resolved alert');
+    });
+
+    test('The same sequence across separate batches', async () => {
+      const vid = `VG-GEO-SEPBATCH-${Date.now()}`;
+      const now = Date.now();
+      const t1 = new Date(now - 15000).toISOString();
+      const t2 = new Date(now - 10000).toISOString();
+      const t3 = new Date(now - 5000).toISOString();
+
+      // Batch 1: Inside
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 1, ts: t1, soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 13.0800, lng: 80.2500, odometer_km: 10, charging: false, fault_codes: [] }
+      ]);
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ?").get(vid).total, 0);
+
+      // Batch 2: Outside
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 2, ts: t2, soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 14.5000, lng: 81.0000, odometer_km: 10.5, charging: false, fault_codes: [] }
+      ]);
+      const alertOpen = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'geofence_breach'").get(vid);
+      assert.ok(alertOpen);
+      assert.strictEqual(alertOpen.status, 'open');
+      assert.strictEqual(alertOpen.opened_at, t2);
+      assert.strictEqual(alertOpen.version, 1);
+
+      // Batch 3: Inside
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 3, ts: t3, soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 13.0900, lng: 80.2600, odometer_km: 11, charging: false, fault_codes: [] }
+      ]);
+
+      const alerts = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'geofence_breach'").all(vid);
+      assert.strictEqual(alerts.length, 1, 'Separate batches must produce exact same single alert');
+      assert.strictEqual(alerts[0].status, 'resolved');
+      assert.strictEqual(alerts[0].opened_at, t2);
+      assert.strictEqual(alerts[0].resolved_at, t3);
+      assert.strictEqual(alerts[0].version, 2);
+    });
+
+    test('Multiple outside/inside transitions', async () => {
+      const vid = `VG-GEO-MULTI-${Date.now()}`;
+      const now = Date.now();
+      const t1 = new Date(now - 25000).toISOString();
+      const t2 = new Date(now - 20000).toISOString(); // Breach 1 open
+      const t3 = new Date(now - 15000).toISOString(); // Breach 1 resolve
+      const t4 = new Date(now - 10000).toISOString(); // Breach 2 open
+      const t5 = new Date(now - 5000).toISOString();  // Breach 2 resolve
+
+      const multiBatch = [
+        { vehicle_id: vid, seq: 1, ts: t1, soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 13.0800, lng: 80.2500, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: t2, soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 14.5000, lng: 81.0000, odometer_km: 10.5, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: t3, soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 13.0900, lng: 80.2600, odometer_km: 11, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 4, ts: t4, soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 14.5200, lng: 81.0200, odometer_km: 11.5, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 5, ts: t5, soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 13.0850, lng: 80.2550, odometer_km: 12, charging: false, fault_codes: [] }
+      ];
+
+      await postSignedBatch(multiBatch);
+
+      const alerts = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'geofence_breach' ORDER BY id ASC").all(vid);
+      assert.strictEqual(alerts.length, 2, 'Two outside/inside excursions must generate exactly 2 alerts');
+      assert.strictEqual(alerts[0].status, 'resolved');
+      assert.strictEqual(alerts[0].opened_at, t2);
+      assert.strictEqual(alerts[0].resolved_at, t3);
+      assert.strictEqual(alerts[1].status, 'resolved');
+      assert.strictEqual(alerts[1].opened_at, t4);
+      assert.strictEqual(alerts[1].resolved_at, t5);
+    });
+
+    test('Out-of-order readings', async () => {
+      const vid = `VG-GEO-OOO-${Date.now()}`;
+      const now = Date.now();
+      const t1 = new Date(now - 20000).toISOString();
+      const t2 = new Date(now - 15000).toISOString(); // Arrives late (outside)
+      const t3 = new Date(now - 10000).toISOString();
+
+      // Batch 1: Vehicle is inside at T1 and T3
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 1, ts: t1, soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 13.0800, lng: 80.2500, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: t3, soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 13.0900, lng: 80.2600, odometer_km: 11, charging: false, fault_codes: [] }
+      ]);
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ?").get(vid).total, 0);
+
+      // Batch 2: Late reading at T2 arrives (outside geofence)
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 2, ts: t2, soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 14.5000, lng: 81.0000, odometer_km: 10.5, charging: false, fault_codes: [] }
+      ]);
+
+      const alerts = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'geofence_breach'").all(vid);
+      assert.strictEqual(alerts.length, 1, 'Late-arriving breach reading must create resolved alert');
+      assert.strictEqual(alerts[0].status, 'resolved');
+      assert.strictEqual(alerts[0].opened_at, t2);
+      assert.strictEqual(alerts[0].resolved_at, t3);
+
+      const active = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND status != 'resolved'").all(vid);
+      assert.strictEqual(active.length, 0, 'No active alert must remain because latest reading T3 is inside');
+    });
+
+    test('Repeated evaluation and duplicate prevention', async () => {
+      const vid = `VG-GEO-DUP-${Date.now()}`;
+      const now = Date.now();
+      const batch = [
+        { vehicle_id: vid, seq: 1, ts: new Date(now - 15000).toISOString(), soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 13.0800, lng: 80.2500, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 10000).toISOString(), soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 14.5000, lng: 81.0000, odometer_km: 10.5, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: new Date(now - 5000).toISOString(), soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 13.0900, lng: 80.2600, odometer_km: 11, charging: false, fault_codes: [] }
+      ];
+
+      await postSignedBatch(batch);
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ?").get(vid).total, 1);
+
+      // Re-send same batch
+      const res2 = await postSignedBatch(batch);
+      assert.strictEqual(res2.body.duplicates, 3);
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ?").get(vid).total, 1);
+
+      // Direct engine re-evaluation
+      const changed = evaluateVehicleAlerts(vid);
+      assert.strictEqual(changed.length, 0, 'Must produce 0 changed alerts on re-evaluation');
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ?").get(vid).total, 1);
+    });
+
+    test('Application restart and alert persistence', async () => {
+      const vid = `VG-GEO-RESTART-${Date.now()}`;
+      const now = Date.now();
+
+      // Open an alert
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 1, ts: new Date(now - 15000).toISOString(), soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 14.5000, lng: 81.0000, odometer_km: 10, charging: false, fault_codes: [] }
+      ]);
+      const openAlert = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'geofence_breach'").get(vid);
+      assert.strictEqual(openAlert.status, 'open');
+
+      // Simulate restart: re-evaluate vehicle with existing state
+      const rechecked = evaluateVehicleAlerts(vid);
+      assert.strictEqual(rechecked.length, 0, 'No change on restart without new readings');
+
+      // Now send returning reading inside polygon
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 5000).toISOString(), soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 13.0800, lng: 80.2500, odometer_km: 10.5, charging: false, fault_codes: [] }
+      ]);
+
+      const alerts = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'geofence_breach'").all(vid);
+      assert.strictEqual(alerts.length, 1, 'Persisted alert resolved without duplication');
+      assert.strictEqual(alerts[0].status, 'resolved');
+      assert.strictEqual(alerts[0].version, 2);
+    });
+  });
 });

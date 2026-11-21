@@ -207,40 +207,109 @@ function evaluateRapidDischarge(readings, activeAlert = null) {
 
 /**
  * Rule 3: Geofence Breach
- * - Trigger: Latest reading by ts is outside the operating polygon.
- * - Resolve: Latest reading by ts is back inside the polygon.
+ * - Trigger: Vehicle moves outside the operating polygon.
+ * - Resolve: Vehicle returns inside the operating polygon.
+ * - Evaluates readings chronologically to capture intermediate outside/inside transitions
+ *   even when they occur within a single ingestion batch.
  */
-function evaluateGeofenceBreach(readings) {
+function evaluateGeofenceBreach(readings, activeAlert = null) {
   const sorted = normalizeReadings(readings);
   if (sorted.length === 0) {
-    return { triggered: false, resolved: false };
+    return { triggered: false, resolved: false, episodes: [] };
+  }
+
+  const episodes = [];
+  let inBreach = false;
+  let currentOpenedAt = null;
+  let currentOpenDetails = null;
+
+  const alertOpenTs = activeAlert && activeAlert.opened_at ? Date.parse(activeAlert.opened_at) : null;
+
+  for (const r of sorted) {
+    const rTs = Date.parse(r.ts);
+
+    // If an active alert is currently open/acknowledged and we reach or pass its opened_at, synchronize in-breach state
+    if (activeAlert && alertOpenTs !== null && rTs >= alertOpenTs && !currentOpenedAt && !inBreach) {
+      inBreach = true;
+      currentOpenedAt = activeAlert.opened_at;
+      currentOpenDetails = typeof activeAlert.details === 'string'
+        ? JSON.parse(activeAlert.details || '{}')
+        : (activeAlert.details || { lat: r.lat, lng: r.lng, status: 'outside_operating_polygon' });
+    }
+
+    const isInside = isPointInPolygon(r.lat, r.lng);
+
+    if (!isInside) {
+      if (!inBreach) {
+        inBreach = true;
+        currentOpenedAt = r.ts;
+        currentOpenDetails = {
+          lat: r.lat,
+          lng: r.lng,
+          status: 'outside_operating_polygon'
+        };
+      }
+    } else {
+      if (inBreach) {
+        inBreach = false;
+        episodes.push({
+          status: 'resolved',
+          openedAt: currentOpenedAt,
+          resolvedAt: r.ts,
+          openDetails: currentOpenDetails,
+          details: {
+            lat: r.lat,
+            lng: r.lng,
+            status: 'inside_operating_polygon'
+          }
+        });
+        currentOpenedAt = null;
+        currentOpenDetails = null;
+      }
+    }
   }
 
   const latest = sorted[sorted.length - 1];
-  const isInside = isPointInPolygon(latest.lat, latest.lng);
 
-  if (!isInside) {
-    return {
-      triggered: true,
-      resolved: false,
-      openedAt: latest.ts,
-      details: {
+  if (inBreach) {
+    episodes.push({
+      status: 'open',
+      openedAt: currentOpenedAt || latest.ts,
+      resolvedAt: null,
+      details: currentOpenDetails || {
         lat: latest.lat,
         lng: latest.lng,
         status: 'outside_operating_polygon'
       }
+    });
+
+    return {
+      triggered: true,
+      resolved: false,
+      openedAt: currentOpenedAt || latest.ts,
+      details: currentOpenDetails || {
+        lat: latest.lat,
+        lng: latest.lng,
+        status: 'outside_operating_polygon'
+      },
+      episodes
     };
   }
+
+  // Currently inside polygon (not in breach)
+  const lastResolvedEpisode = episodes.length > 0 ? episodes[episodes.length - 1] : null;
 
   return {
     triggered: false,
     resolved: true,
-    resolvedAt: latest.ts,
+    openedAt: lastResolvedEpisode ? lastResolvedEpisode.openedAt : null,
+    resolvedAt: lastResolvedEpisode ? lastResolvedEpisode.resolvedAt : latest.ts,
     details: {
       lat: latest.lat,
       lng: latest.lng,
       status: 'inside_operating_polygon'
-    }
+    },
+    episodes
   };
 }
 
@@ -272,7 +341,7 @@ const getFiveMinHistoryStmt = db.prepare(`
 `);
 
 const getActiveAlertStmt = db.prepare(`
-  SELECT id, status, version, details
+  SELECT id, status, version, details, opened_at
   FROM alerts
   WHERE vehicle_id = ? AND rule = ? AND status != 'resolved'
 `);
@@ -289,6 +358,16 @@ const getAlertByOpenedAtStmt = db.prepare(`
   SELECT id, status, version, opened_at, resolved_at
   FROM alerts
   WHERE vehicle_id = ? AND rule = ? AND opened_at = ?
+`);
+
+const getOverlappingAlertStmt = db.prepare(`
+  SELECT id, status, version, opened_at, resolved_at
+  FROM alerts
+  WHERE vehicle_id = ? AND rule = ?
+    AND (opened_at <= ? OR ? IS NULL)
+    AND (resolved_at >= ? OR status != 'resolved')
+  ORDER BY id ASC
+  LIMIT 1
 `);
 
 const getActiveOfflineAlertStmt = db.prepare(`
@@ -368,62 +447,119 @@ const evaluateVehicleAlertsTx = db.transaction((vehicleId, nowIso) => {
     const activeAlert = getActiveAlertStmt.get(vehicleId, ruleName);
     const outcome = evaluate(readings, activeAlert);
 
-    if (outcome.triggered) {
-      if (!activeAlert) {
-        // Prevent duplicate alerts for historical incidents that were already resolved
-        const lastAlert = getLastAlertStmt.get(vehicleId, ruleName);
-        const incidentOpenedAt = outcome.openedAt || nowIso;
-        const alreadyResolved = lastAlert && lastAlert.status === 'resolved' &&
-          lastAlert.resolved_at && incidentOpenedAt <= lastAlert.resolved_at;
-        const alreadyExists = getAlertByOpenedAtStmt.get(vehicleId, ruleName, incidentOpenedAt);
+    if (outcome.episodes && outcome.episodes.length > 0) {
+      for (const ep of outcome.episodes) {
+        const matchingAlert = getOverlappingAlertStmt.get(
+          vehicleId,
+          ruleName,
+          ep.resolvedAt || null,
+          ep.resolvedAt || null,
+          ep.openedAt
+        );
 
-        if (!alreadyResolved && !alreadyExists) {
-          // Genuinely new incident -> Open new alert (version = 1, status = 'open')
-          const insertInfo = insertAlertStmt.run({
-            vehicle_id: vehicleId,
-            rule: ruleName,
-            details: JSON.stringify(outcome.details || {}),
-            now: incidentOpenedAt
-          });
-          const newAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(insertInfo.lastInsertRowid);
-          if (newAlert) {
-            changedAlerts.push(newAlert);
+        if (matchingAlert) {
+          if (matchingAlert.status !== 'resolved' && ep.status === 'resolved') {
+            resolveAlertStmt.run({
+              id: matchingAlert.id,
+              details: JSON.stringify(ep.details || {}),
+              resolved_at: ep.resolvedAt || nowIso,
+              now: nowIso
+            });
+            const resolvedAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(matchingAlert.id);
+            if (resolvedAlert) {
+              changedAlerts.push(resolvedAlert);
+            }
           }
+          continue;
         }
-      }
-      // If already open or acknowledged, maintain existing alert without duplication
-    } else if (outcome.resolved) {
-      if (activeAlert) {
-        // Active alert exists -> Transition to 'resolved' (version incremented)
-        resolveAlertStmt.run({
-          id: activeAlert.id,
-          details: JSON.stringify(outcome.details || {}),
-          resolved_at: outcome.resolvedAt || nowIso,
-          now: nowIso
-        });
-        const resolvedAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(activeAlert.id);
-        if (resolvedAlert) {
-          changedAlerts.push(resolvedAlert);
-        }
-      } else if (outcome.openedAt) {
-        // Out-of-order state reconstruction: only insert if this incident was NEVER previously recorded
-        const lastAlert = getLastAlertStmt.get(vehicleId, ruleName);
-        const alreadyResolved = lastAlert && lastAlert.status === 'resolved' &&
-          lastAlert.resolved_at && outcome.openedAt <= lastAlert.resolved_at;
-        const alreadyExists = getAlertByOpenedAtStmt.get(vehicleId, ruleName, outcome.openedAt);
 
-        if (!alreadyResolved && !alreadyExists) {
+        if (ep.status === 'open') {
+          const currentActive = getActiveAlertStmt.get(vehicleId, ruleName);
+          if (!currentActive) {
+            const insertInfo = insertAlertStmt.run({
+              vehicle_id: vehicleId,
+              rule: ruleName,
+              details: JSON.stringify(ep.details || {}),
+              now: ep.openedAt || nowIso
+            });
+            const newAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(insertInfo.lastInsertRowid);
+            if (newAlert) {
+              changedAlerts.push(newAlert);
+            }
+          }
+        } else if (ep.status === 'resolved') {
           const insertInfo = insertResolvedAlertStmt.run({
             vehicle_id: vehicleId,
             rule: ruleName,
-            details: JSON.stringify(outcome.details || {}),
-            opened_at: outcome.openedAt,
-            resolved_at: outcome.resolvedAt || nowIso,
+            details: JSON.stringify(ep.details || {}),
+            opened_at: ep.openedAt,
+            resolved_at: ep.resolvedAt || nowIso,
             now: nowIso
           });
           const resolvedAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(insertInfo.lastInsertRowid);
           if (resolvedAlert) {
             changedAlerts.push(resolvedAlert);
+          }
+        }
+      }
+    } else {
+      if (outcome.triggered) {
+        if (!activeAlert) {
+          // Prevent duplicate alerts for historical incidents that were already resolved
+          const lastAlert = getLastAlertStmt.get(vehicleId, ruleName);
+          const incidentOpenedAt = outcome.openedAt || nowIso;
+          const alreadyResolved = lastAlert && lastAlert.status === 'resolved' &&
+            lastAlert.resolved_at && incidentOpenedAt <= lastAlert.resolved_at;
+          const alreadyExists = getAlertByOpenedAtStmt.get(vehicleId, ruleName, incidentOpenedAt);
+
+          if (!alreadyResolved && !alreadyExists) {
+            // Genuinely new incident -> Open new alert (version = 1, status = 'open')
+            const insertInfo = insertAlertStmt.run({
+              vehicle_id: vehicleId,
+              rule: ruleName,
+              details: JSON.stringify(outcome.details || {}),
+              now: incidentOpenedAt
+            });
+            const newAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(insertInfo.lastInsertRowid);
+            if (newAlert) {
+              changedAlerts.push(newAlert);
+            }
+          }
+        }
+        // If already open or acknowledged, maintain existing alert without duplication
+      } else if (outcome.resolved) {
+        if (activeAlert) {
+          // Active alert exists -> Transition to 'resolved' (version incremented)
+          resolveAlertStmt.run({
+            id: activeAlert.id,
+            details: JSON.stringify(outcome.details || {}),
+            resolved_at: outcome.resolvedAt || nowIso,
+            now: nowIso
+          });
+          const resolvedAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(activeAlert.id);
+          if (resolvedAlert) {
+            changedAlerts.push(resolvedAlert);
+          }
+        } else if (outcome.openedAt) {
+          // Out-of-order state reconstruction: only insert if this incident was NEVER previously recorded
+          const lastAlert = getLastAlertStmt.get(vehicleId, ruleName);
+          const alreadyResolved = lastAlert && lastAlert.status === 'resolved' &&
+            lastAlert.resolved_at && outcome.openedAt <= lastAlert.resolved_at;
+          const alreadyExists = getAlertByOpenedAtStmt.get(vehicleId, ruleName, outcome.openedAt);
+
+          if (!alreadyResolved && !alreadyExists) {
+            const insertInfo = insertResolvedAlertStmt.run({
+              vehicle_id: vehicleId,
+              rule: ruleName,
+              details: JSON.stringify(outcome.details || {}),
+              opened_at: outcome.openedAt,
+              resolved_at: outcome.resolvedAt || nowIso,
+              now: nowIso
+            });
+            const resolvedAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(insertInfo.lastInsertRowid);
+            if (resolvedAlert) {
+              changedAlerts.push(resolvedAlert);
+            }
           }
         }
       }
