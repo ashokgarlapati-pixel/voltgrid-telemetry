@@ -14,6 +14,8 @@ process.env.PORT = '0';
 const db = require('../src/db');
 const { app, server } = require('../src/server');
 const { stopOfflineWorker } = require('../src/offlineWorker');
+const { stopAlertOutboxWorker } = require('../src/alertOutboxWorker');
+const { stopStreamWorker } = require('../src/stream');
 
 const API_KEY = 'voltgrid-dev-key';
 const API_SECRET = 'voltgrid-dev-secret';
@@ -30,7 +32,9 @@ describe('Part A1, A4, A6 Integration Tests (Real Temp SQLite DB)', () => {
   });
 
   after(() => {
+    stopStreamWorker();
     stopOfflineWorker();
+    stopAlertOutboxWorker();
     server.close();
     try {
       db.close();

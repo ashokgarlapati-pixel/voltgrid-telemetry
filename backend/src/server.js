@@ -297,10 +297,11 @@ app.get('/v1/stream', sseStreamHandler);
 const server = app.listen(PORT, () => {
   const actualPort = server.address()?.port || PORT;
   console.log(`[VoltGrid API] Listening on port ${actualPort}`);
-  // Start background offline detection worker
-  startOfflineWorker();
-  // Start background transactional alert outbox worker for crash recovery
-  startAlertOutboxWorker();
+  // Start background workers in non-test environments
+  if (process.env.NODE_ENV !== 'test') {
+    startOfflineWorker();
+    startAlertOutboxWorker();
+  }
 });
 
 // Graceful shutdown handling

@@ -177,29 +177,36 @@ function publishVehicleUpdate(vehicle) {
 function flushCoalescedVehicles() {
   if (pendingVehicles.size === 0) return;
 
-  const updates = Array.from(pendingVehicles.values());
-  pendingVehicles.clear();
+  try {
+    const updates = Array.from(pendingVehicles.values());
+    pendingVehicles.clear();
 
-  for (const v of updates) {
-    const eventData = {
-      event_type: 'vehicle_update',
-      vehicle_id: v.vehicle_id,
-      state: {
-        soc_pct: v.soc_pct,
-        battery_temp_c: v.battery_temp_c,
-        speed_kmh: v.speed_kmh,
-        lat: v.lat,
-        lng: v.lng,
-        odometer_km: v.odometer_km,
-        charging: Boolean(v.charging),
-        status: v.status || 'online',
-        last_seq: v.last_seq,
-        last_ts: v.last_ts
-      },
-      ts: v.last_ts || new Date().toISOString()
-    };
+    for (const v of updates) {
+      const eventData = {
+        event_type: 'vehicle_update',
+        vehicle_id: v.vehicle_id,
+        state: {
+          soc_pct: v.soc_pct,
+          battery_temp_c: v.battery_temp_c,
+          speed_kmh: v.speed_kmh,
+          lat: v.lat,
+          lng: v.lng,
+          odometer_km: v.odometer_km,
+          charging: Boolean(v.charging),
+          status: v.status || 'online',
+          last_seq: v.last_seq,
+          last_ts: v.last_ts
+        },
+        ts: v.last_ts || new Date().toISOString()
+      };
 
-    recordAndBroadcastEvent('vehicle_update', eventData);
+      recordAndBroadcastEvent('vehicle_update', eventData);
+    }
+  } catch (err) {
+    if (err && (err.message?.includes('database is not open') || err.code === 'ERR_SQLITE_NOT_OPEN')) {
+      return;
+    }
+    console.error('[Stream Coalescing Error]', err);
   }
 }
 
@@ -249,6 +256,9 @@ function pruneOldEvents() {
       WHERE id < (SELECT MAX(id) - ? FROM stream_events)
     `).run(EVENT_RETENTION_LIMIT);
   } catch (err) {
+    if (err && (err.message?.includes('database is not open') || err.code === 'ERR_SQLITE_NOT_OPEN')) {
+      return;
+    }
     console.error('[Stream Prune Error]', err);
   }
 }

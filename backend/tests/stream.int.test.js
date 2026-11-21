@@ -16,6 +16,7 @@ process.env.STREAM_COALESCE_INTERVAL_MS = '500'; // 500ms for fast test runs
 const db = require('../src/db');
 const { app, server } = require('../src/server');
 const { stopOfflineWorker } = require('../src/offlineWorker');
+const { stopAlertOutboxWorker } = require('../src/alertOutboxWorker');
 const {
   publishVehicleUpdate,
   publishAlertChange,
@@ -122,6 +123,10 @@ describe('Part A5: Live Stream (SSE) Integration & Performance Tests', () => {
     db.prepare('UPDATE api_keys SET rate_limit_per_sec = 10000, burst_capacity = 10000 WHERE api_key = ?').run(API_KEY);
     db.prepare('INSERT OR REPLACE INTO rate_limits (api_key, tokens, last_refill_ms) VALUES (?, 10000, ?)').run(API_KEY, Date.now());
 
+    stopOfflineWorker();
+    stopAlertOutboxWorker();
+    flushCoalescedVehicles();
+
     const address = server.address();
     baseUrl = `http://127.0.0.1:${address.port}`;
   });
@@ -129,6 +134,7 @@ describe('Part A5: Live Stream (SSE) Integration & Performance Tests', () => {
   after(() => {
     stopStreamWorker();
     stopOfflineWorker();
+    stopAlertOutboxWorker();
     server.close();
     try {
       db.close();
@@ -853,6 +859,9 @@ describe('Part A5: Live Stream (SSE) Integration & Performance Tests', () => {
       const vidFailed = `VG-I11-FAIL-${Date.now()}`;
       const now = Date.now();
 
+      // Flush any queued vehicle updates from previous tests so background buffer is completely empty
+      flushCoalescedVehicles();
+
       const sseClient = createSseClient(`${baseUrl}/v1/stream?api_key=${API_KEY}`);
       await sseClient.ready;
       await new Promise(r => setTimeout(r, 50));
@@ -891,6 +900,14 @@ describe('Part A5: Live Stream (SSE) Integration & Performance Tests', () => {
         // Verify SSE client received zero events for failed vehicle
         const clientEvents = sseClient.getEvents().filter(e => e.event === 'alert_change' && e.data && e.data.vehicle_id === vidFailed);
         assert.strictEqual(clientEvents.length, 0, 'No SSE alert_change events must be emitted when transaction rolls back');
+
+        // Verify zero stream_events rows were inserted for failed vehicle
+        const failedStreamEvents = db.prepare(`
+          SELECT * FROM stream_events
+          WHERE json_extract(data, '$.vehicle_id') = ?
+             OR data LIKE ?
+        `).all(vidFailed, `%"vehicle_id":"${vidFailed}"%`);
+        assert.strictEqual(failedStreamEvents.length, 0, 'Zero rows for failed vehicle must be added to stream_events table');
 
         // Verify no stream_events rows were inserted
         const countAfter = db.prepare('SELECT COUNT(*) AS c FROM stream_events').get().c;
