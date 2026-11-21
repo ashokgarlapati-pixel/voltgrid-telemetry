@@ -1,132 +1,62 @@
-# VoltGrid Fleet Telemetry Service — System Design & Architecture
+# DESIGN.md
 
-## 1. Scale: Scaling to 200,000 Vehicles (Theoretical ~40,000 readings/sec)
+Everything below refers to this repo's code and to numbers I measured (`loadtest/results.md`). Where something isn't built, I say so.
 
-### The First Failure Point
-The single-writer bottleneck in SQLite's WAL mode breaks first. While WAL allows concurrent readers, write transactions (`BEGIN IMMEDIATE`) are strictly serialized. At our 2,000-vehicle baseline fleet (~400 readings/s theoretical volume), lock hold times average 5–15 ms (well within `busy_timeout = 5000ms`). In contrast, 40,000 readings/s is a theoretical 100x projection for 200,000 vehicles, not demonstrated system throughput. Write request rates follow $\text{Batches/s} = \text{Readings/s} / \text{Avg Batch Size}$. The theoretical 40,000 readings/s breaks down into different request rates: ~400 batches/s *only* at an assumed average of 100 readings/batch; 80 batches/s at the maximum permitted chunk size of 500 (`server.js`); 800 batches/s at 50 readings/batch (`scripts/loadtest.js`); or 40,000 req/s unbatched. In the simulator, `BATCH_SIZE=500` is a maximum chunk size, and actual batches can contain fewer than 500 readings (e.g. ~400/tick). Meanwhile, actual historical tests measured 415 batches across 30.7s at 100 readings/batch (~13.5 batches/s, ~1,350 readings/s). Under any batch size, serialized SQLite WAL writes queue up faster than disk commits under 40k readings/s, triggering `SQLITE_BUSY`. Furthermore, SQLite WAL mode requires same-host shared-memory coordination via its memory-mapped WAL index (`.shm`), making it unsuitable for multi-machine scale-out over network filesystems (NFS/EFS).
+## 1. Scale: 200,000 vehicles
 
-### Subsequent Bottlenecks & Fixes
-1. **Node.js Event Loop Saturation**: Parsing ~20 MB/s of JSON and computing 400 HMAC-SHA256 hashes/s saturates a single CPU core.
-   * *Fix*: Offload HMAC verification to an API Gateway and deploy stateless Node instances in cluster mode behind an ALB/Nginx.
-2. **Disk I/O Write Amplification**: Ingesting ~3.45 billion rows/day across composite indexes `(vehicle_id, seq)` and `(vehicle_id, ts)` exhausts NVMe write endurance.
-   * *Fix*: Stream telemetry into Apache Kafka, then batch-load into a columnar time-series database (ClickHouse) partitioned daily.
-3. **In-Memory SSE Fan-out & Heartbeat Scans**: Scanning 200k vehicles every 10s takes ~100 ms; pushing 40k events/s exhausts Node heap memory.
-   * *Fix*: Use a Redis Sorted Set (`ZREVRANGEBYSCORE`) for $O(\log N)$ offline sweeps, and fan out SSE via Redis Pub/Sub.
+Load goes from ~400 to ~40,000 readings/s. My best sustained ingest was ~1,350 readings/s (415 batches of 100 in 30.7 s, 10 workers, reads running at the same time), with batch p95 at 735 ms. I'm about 30x below the target rate.
 
----
+1. **SQLite's single writer breaks first.** Ingestion, nonce inserts and token-bucket updates all write to one file behind one lock. Fleet-summary p95 went from 8.6 ms (quiet, 5M rows) to 651 ms in the mixed run. I put that down to write-lock queueing, though the two runs used different datasets. Fix: PostgreSQL with batched, time-partitioned inserts for telemetry, state and alerts, and Redis for nonces and rate limits, so auth traffic stops competing with ingestion.
+2. **Inline alert evaluation.** `ingestBatch` evaluates alerts before responding and re-reads recent history for every touched vehicle. Fix: commit the reading and an outbox row in one transaction, respond, and let workers drain the outbox partitioned by `vehicle_id`. Partitioning keeps per-vehicle order, and the outbox closes the crash gap between storing a reading and evaluating it.
+3. **Stream fan-out.** One `stream_events` row plus an in-process broadcast per update won't survive 40,000/s. Fix: a broker for cross-instance notification, periodic snapshots instead of per-update events, and a durable sequence ID on every event. Alert changes stay in durable history so `Last-Event-ID` resume works. Pub/sub alone can't replay.
+4. **Storage.** 3.456 billion rows/day at my measured 273 B/row (indexes included) is ~943 GB/day. Fix: TimescaleDB or ClickHouse with daily partitions, dropping raw partitions only after rollups are verified.
 
-## 2. Ingestion Delivery & Idempotency
+## 2. Delivery guarantees
 
-We use an **at-least-once delivery model with idempotent writes** to achieve effectively-once state:
-1. `telemetry_history` enforces database-level idempotency via compound `PRIMARY KEY (vehicle_id, seq)`.
-2. In `ingestion.js`, batches execute inside an immediate transaction using `INSERT OR IGNORE`. Existing readings are dropped (`changes === 0`), duplicate counters increment, and vehicle state upserts are safely bypassed.
-3. Our 20-client concurrency test validates this: submitting the same 50-item batch across 20 parallel connections yields exactly 50 accepted rows, 950 duplicate drops, and zero data corruption.
+Devices retry, so delivery is at-least-once. Storage is effectively-once per `(vehicle_id, seq)`: that pair is the primary key and `INSERT OR IGNORE` runs inside a `BEGIN IMMEDIATE` transaction. A duplicate adds no history row, doesn't touch current state and doesn't bump `received_count`.
 
-### Edge Failure Modes
-* **Firmware Sequence Reset**: If an IoT device resets hardware `seq` to 0 post-flash, `INSERT OR IGNORE` drops legitimate readings until `seq` exceeds the historical maximum.
-* **Network Partition on Commit**: If SQLite commits a batch but cellular connection drops before HTTP 200 reaches the vehicle, the client retries. Deduplication prevents duplicates, but client confirmation is delayed.
+The concurrency test sends one 50-reading batch from 20 clients and gets 50 accepted, 950 duplicates. It runs in one Node process with a synchronous driver, so it proves the constraint and counters, not multi-process or multi-host behaviour.
 
----
+Where it can still go wrong:
+- After a reflash a device may reset `seq`, and its new readings are labelled duplicates. A repeated `seq` with different values keeps the first payload. A boot or session ID should join the dedup key.
+- Alert evaluation is a separate transaction from ingestion. A crash in between delays evaluation until that vehicle's next reading. The outbox in §1 closes this.
+- Stream events are published from memory after commit, so a crash can lose one. Durable history and replay are needed for reliable recovery.
 
-## 3. Clock Drift, Timestamps & Ordering
+## 3. Time
 
-### What We Trust
-* **Device Time (`ts`)**: Trusted for telemetry history, downsampling, and alert evaluations. In `ingestion.js`, we update the `vehicles` state table using:
-  `last_ts = CASE WHEN excluded.last_ts > vehicles.last_ts OR (excluded.last_ts = vehicles.last_ts AND excluded.last_seq > vehicles.last_seq) THEN excluded.last_ts ELSE vehicles.last_ts END`
-  This guarantees that delayed readings emerging from cellular dead-zones never overwrite newer state.
-* **Server Time (`updated_at` / `received_at`)**: Trusted for offline detection sweeps (`offlineWorker.js`) and HMAC replay window checks (`security.js`). A disconnected vehicle cannot report its own death; silence must be measured by the server clock.
+Device `ts` orders a vehicle's observations, picks its current state (highest `ts` wins, `seq` breaks ties) and drives the alert rules. Server time covers what the device can't establish: `updated_at`, offline detection and the 5-minute HMAC window.
 
-### Decoupled Timestamp Validations
-We enforce two completely independent timestamp validations operating at different lifecycle layers:
-1. **HTTP Transport Authentication (`X-Timestamp`)**: Evaluated in `security.js` against a $\pm 5$-minute tolerance window ($|T_{\text{server}} - T_{\text{req}}| \le 300\text{s}$) to prevent replay attacks. Expired or future-skewed timestamps halt processing at the auth boundary, returning **`HTTP 401 Unauthorized`**.
-2. **Telemetry Reading Timestamp (`reading.ts`)**: Evaluated per reading inside the ingestion pipeline (`ingestion.js`) against $[T_{\text{server}} - 10\text{m}, T_{\text{server}} + 30\text{s}]$. Stale readings (>10 min lateness) or future-skewed readings (>30s clock drift) are individually rejected, returning **`HTTP 207 Multi-Status`** with `status: 'rejected'` (never HTTP 401).
+**25 seconds fast:** accepted, since I allow `ts` up to 30 s ahead of the server. Its own readings stay consistently ordered, but comparisons with other vehicles are skewed by 25 s.
 
-*The "1-Day Clock Error" Distinction*: If a vehicle with a valid HMAC signature and fresh `X-Timestamp` submits a reading dated 1 day in the past or future, transport authentication succeeds and hands off to ingestion (`next()`). The ingestion engine then rejects the stale reading with `HTTP 207 Multi-Status`—**never** `HTTP 401`.
+**A day wrong:** every reading fails validation and is rejected individually. `updated_at` never advances, so the vehicle goes offline after 90 s, which at least flags the problem. The data is lost.
 
----
+The 10-minute lateness cutoff is also too strict for the batching the brief describes. 500 readings at 5 s intervals span ~41 minutes, so legitimate catch-up data can be rejected. I would accept old readings into history, mark them late and never let them replace newer state. I would also estimate each vehicle's clock offset from a rolling median of `received_at - ts`, flag large or sudden changes, and never silently rewrite stored timestamps.
 
-## 4. Alert Engine & Order Independence
+## 4. Storage and cost (today's 2,000 vehicles)
 
-### Rule Logic
-* **Overheat**: Triggers after 3 consecutive readings `> 55.0°C`. Resolves after 3 consecutive readings `<= 50.0°C` (50–55°C hysteresis prevents flapping).
-* **Rapid Discharge**: Triggers if SOC drops $> 8.0\%$ across non-charging readings within a rolling 5-minute window. Resolves when charging starts, discharge slows, or the 5m window expires.
-* **Geofence Breach**: Ray-casting point-in-polygon algorithm checks coordinates against the Chennai operating perimeter. Re-entry clears the alert.
-* **Offline Detection**: A background worker checks online vehicles whose server `updated_at` is older than 90s. When new telemetry arrives, the vehicle resets to `online` and resolves the offline alert in the same database transaction.
+34.56M rows/day. I measured 5M rows at 1,365 MB including indexes, so 273 B/row, about **9.4 GB/day** raw. The prototype keeps raw rows forever; this is a proposal.
 
-### Replay & Order Independence
-When packets arrive out-of-order, we pull recent history ordered chronologically:
-```sql
-SELECT * FROM (SELECT * FROM telemetry_history WHERE vehicle_id = ? ORDER BY ts DESC, seq DESC LIMIT 100) ORDER BY ts ASC, seq ASC;
-```
-Replaying over this chronological slice reconstructs identical state transitions regardless of arrival order. Alert changes are committed inside `BEGIN IMMEDIATE` transactions; SSE events (`publishAlertChange`) are emitted strictly **post-commit**, preventing phantom events on rollback.
+- **Days 0–7:** raw 5 s readings, ~66 GB.
+- **Days 8–90:** 1-minute buckets per vehicle (min/max/avg of SoC, temperature and speed; last position; received and expected counts; fault-code set). That is 2,000 × 1,440 = 2.88M rows/day. I haven't measured a bucket row, so I'd benchmark the real schema before quoting a size.
+- **Days 90–365:** hourly buckets, 48,000 rows/day.
+- **Alerts:** kept for audit.
 
----
+After raw expiry an operator can no longer see individual readings, timing finer than a minute, or exact `seq` gaps. Min/max keep peaks and troughs but not their duration or shape. Received/expected counts per bucket keep a coarser completeness figure. At 200,000 vehicles every number above is 100x larger.
 
-## 5. Storage Economics (~35M Rows/Day)
+## 5. Threat model
 
-### Implementation Reality vs. Production Architecture
-The prototype stores all telemetry as raw records in SQLite `telemetry_history`. It does **not** implement automated background rollups, warm-tier aggregation tables, or cold-tier Parquet archival (only `stream_events` implements retention pruning, capped at 10,000 events). The tiered model below outlines the proposed production lifecycle.
+1. **Captured-request replay.** The HMAC covers the timestamp and exact body bytes. Requests outside ±5 minutes are rejected, and accepted signatures are kept in `used_nonces` for 5 minutes. A second use gets 401, and the shared database makes this hold across both API instances. TLS must be terminated securely in front.
+2. **Stolen device-group key.** Keys aren't scoped to vehicle IDs, so a holder can post readings for any vehicle: falsify state, affect alerts or inflate `max_seq`. Range validation, a shared per-key token bucket (20/s, burst 40) and production checks against dev or weak secrets reduce the risk but don't fix scope. I would bind keys to vehicle IDs, add rotation and revocation, and encrypt secrets at rest (they're plaintext in `api_keys` now).
+3. **Request and connection flooding.** Bad headers and stale timestamps are rejected before any write, but valid requests cost nonce and bucket writes. The 10 MB body limit is far above a 500-reading batch (~150 KB), so I'd cut it to 512 KB. The read API, `/metrics` and `/v1/stream` have no auth or connection cap, so they need both.
 
-### Ingestion Volume & Sizing (2,000 Vehicles @ 400 readings/s = 34.56M rows/day)
-* **Theoretical Sizing (~220 B/row)**: ~120 B payload + ~100 B index overhead across `PRIMARY KEY (vehicle_id, seq)` and `(vehicle_id, ts)`.
-  * *Daily*: $34.56\text{M} \times 220\text{ B} \approx 7.60\text{ GB/day}$ ($7.08\text{ GiB}$; rounded 35M: $7.70\text{ GB/day}$).
-  * *7-Day Hot Tier*: $7 \times 7.60\text{ GB} \approx 53.22\text{ GB}$ ($49.57\text{ GiB}$; rounded 35M: $53.90\text{ GB} \approx \mathbf{54\text{ GB}}$).
-* **Empirical Measurement (~273 B/reading)**: The dedicated 5M benchmark database is exactly $1{,}365{,}295{,}104\text{ bytes}$ ($1{,}302.05\text{ MiB}$ binary / $1{,}365.30\text{ MB}$ decimal), yielding $273.06\text{ bytes/reading}$ across the full database file (`telemetry_history`, `vehicles`, `alerts`, indexes, and B-tree page allocations).
-  * *Daily*: $34.56\text{M} \times 273.06\text{ B} \approx 9.44\text{ GB/day}$ ($8.79\text{ GiB}$; rounded 35M: $9.56\text{ GB/day}$).
-  * *7-Day Hot Tier*: $7 \times 9.44\text{ GB} \approx 66.06\text{ GB}$ ($61.52\text{ GiB}$; rounded 35M: $66.90\text{ GB} \approx \mathbf{67\text{ GB}}$).
-* **Storage Realities**: Actual SQLite page overhead depends on schema, page size (4KB), index count, and insertion patterns (empirical measurement, not a universal B-tree fill-factor guarantee). SQLite `-wal` size is workload- and checkpoint-dependent temporary disk usage.
+## 6. Trade-offs: three things I didn't build
 
-### Tiered Retention Strategy (Architectural Proposal)
-1. **Hot Tier (0–7 Days)**: Full raw 5s readings in SQLite/NVMe for live triage (53–54 GB theoretical raw; 66–67 GB empirical database allocation).
-2. **Warm Tier (8–90 Days — Illustrative Design Target)**: Proposed nightly rollups downsampling into 1-minute `min/max/avg` buckets ($2{,}000\text{ vehicles} \times 1{,}440\text{ min/day} \times 83\text{ days} = 239{,}040{,}000\text{ rows}$). Uncompressed SQLite storage (~160 B/row with indexes) requires **~38.2–41.5 GB**, not 15 GB. The ~15 GB figure is an **unverified design target** assuming either $\ge 2.5:1$ columnar/compressed storage (~60 B/row: $239\text{M} \times 60\text{ B} \approx 14.3\text{ GB} \approx 15\text{ GB}$) or a 1,000-vehicle baseline fleet ($1{,}000 \times 1{,}440 \times 90 \times 116\text{ B} \approx 15.0\text{ GB}$).
-3. **Cold Tier (91–365 Days)**: Hourly rollups exported to compressed Parquet files on S3 Glacier ($0.0036/GB/month). Drop raw partitions.
-*Trade-off*: Downsampling loses sub-minute transient thermal spikes and fine-grained sequence gap detection.
+1. **PostgreSQL, Redis and a broker.** SQLite on a shared local volume kept the prototype simple. It is single-host (WAL relies on local shared memory), has one writer, and in-process stream broadcasts don't reach clients on the other API instance. Coalescing is also per vehicle only. Each vehicle reports every 5 s, so a client still sees about 400 events/s, not one frame per flush.
+2. **Retention and rollups.** `telemetry_history` is never pruned, so storage grows ~9.4 GB/day now, and ~943 GB/day at 200,000 vehicles.
+3. **Clock correction and long-backlog handling.** The 10-minute cutoff can reject valid catch-up readings, and a badly clocked vehicle can have everything rejected. The offset estimation and late-data handling in §3 aren't implemented.
 
----
+## 7. A real bug
 
-## 6. Threat Model & Abuse Protection
+Correctly signed requests returned `401 Invalid HMAC signature`. I was verifying `JSON.stringify(req.body)` after `express.json` had parsed the body. Re-serialising doesn't reproduce the client's bytes: whitespace, number formatting (`13.0800` becomes `13.08`) and Unicode escapes can all change. The simulator's compact JSON happened to round-trip, which hid the bug, and a pretty-printed curl request exposed it.
 
-* **Request Tampering**: All batch ingestion requires `X-API-Key`, `X-Timestamp`, and `X-Signature`. We verify HMAC-SHA256 signatures over `${timestamp}.${rawBody}` using `crypto.timingSafeEqual`.
-* **Replay Attacks**: Signatures are cached in `used_nonces` table with a 5-minute expiry. Duplicate signatures fail immediately. Expired nonces are purged via throttled cleanups.
-* **Distributed DoS / Spam**: We maintain an atomic token-bucket rate limiter in SQLite (`rate_limits` table: capacity 40, refill 20 req/s). Exceeded quotas return `HTTP 429` with `Retry-After`.
-* **Environment Credential Safety & Dev Key Rejection**: Seeded migration credentials (`voltgrid-dev-key` / `voltgrid-dev-secret`) are explicitly permitted only when `NODE_ENV` is explicitly `development` or `test` (or unset with explicit opt-in `ALLOW_DEV_CREDENTIALS=true`, which cannot override deployment environments). All deployment and unset environments (`production`, `staging`, unset, unknown) require explicitly configured credentials (`VOLTGRID_API_KEYS` or `API_KEY`/`API_SECRET`) with $\ge 16$-char structural length baseline and character-diversity heuristic ($\ge 8$ unique chars, filtering low-variety sequences without claiming to mathematically measure entropy, never logging secrets), immediately purge dev defaults from `api_keys`, and fail startup on missing, duplicate, or unsafe keys, with `hmacAuth` enforcing runtime HTTP 401 rejection on dev keys.
-* **Multi-Instance Scope & Volume Driver Boundaries**: In `docker-compose.yml`, `api` and `api2` share `/data/voltgrid.db` via named volume `sqlite_data` using Docker's default `local` driver on the same host. `BEGIN IMMEDIATE` starts a write transaction and obtains the required write lock, allowing SQLite's transaction and locking mechanisms to coordinate competing writers and protect token buckets, nonces, and idempotent ingestions without Redis. In WAL mode, the memory-mapped WAL index (`.shm` file) supports same-host WAL coordination and reader/writer synchronization, rather than independently serializing application state. This safe multi-process sharing applies specifically to this same-host local volume setup and must not be generalized to remote or network volume drivers. WAL mode requires same-host shared-memory coordination and is unsuitable across machines over network filesystems (NFS/EFS). Conversely, file-based rollback journals (`DELETE`, `TRUNCATE`, `PERSIST`) write journals to disk and rely on filesystem locks rather than shared memory, while `MEMORY` mode stores its rollback journal entirely in memory without a journal file; however, network filesystem locking flaws (`lockd`) and cache incoherency still pose high data-corruption risks across configurations. Multi-host scaling requires PostgreSQL, Redis, and Kafka/ClickHouse.
-
----
-
-## 7. Real Production Bug Hit During Development
-
-### Express `express.json()` Breaking HMAC Signatures
-* **Symptom**: Validly signed batches intermittently returned `HTTP 401 Unauthorized: Invalid HMAC signature`.
-* **Cause**: We initially re-serialized `JSON.stringify(req.body)` to verify the HMAC. Express's JSON parser strips arbitrary whitespace and re-formats floating-point numbers (e.g. `13.0800` becomes `13.08`), changing the byte stream and invalidating cryptographic hashes.
-* **Fix**: In `server.js`, we used Express's `verify` callback to capture the raw UTF-8 payload buffer directly into `req.rawBody`:
-  ```javascript
-  app.use(express.json({ limit: '10mb', verify: (req, res, buf) => { req.rawBody = buf.toString('utf8'); } }));
-  ```
-  `security.js` now verifies against `req.rawBody`, matching the device's exact transmitted bytes.
-
----
-
-## 8. Query Engine & Optimization
-
-* **Keyset Pagination (`GET /v1/vehicles`)**: Avoided `OFFSET` because it requires scanning and dropping $N$ rows and drifts under streaming writes. Instead, we use `WHERE vehicle_id > @cursor ORDER BY vehicle_id ASC LIMIT @limit + 1`, backed by index `idx_vehicles_status_id (status, vehicle_id)`. `EXPLAIN QUERY PLAN` confirms zero temporary B-tree sorting.
-* **Peak-Preserving Downsampling**: Naive interval sampling skips sharp temperature spikes. We split the time window into $\lfloor (P - 2) / 4 \rfloor$ buckets and extract minimum and maximum values for temperature, minimum SOC, and maximum speed, preserving peaks under 140 ms for 17,280 readings.
-* **Fleet Summary SLA**: Derived strictly from `vehicles` (1,000–2,000 rows) and active `alerts` (`WHERE status != 'resolved'`). Never scans `telemetry_history`. SQLite query executes in < 1 ms (end-to-end HTTP $p95$ under 10 ms vs 150 ms SLA limit).
-* **Optimistic Locking on Alert Ack**: Dispatchers include `version` in `POST /v1/alerts/:id/ack`. The query runs `WHERE id = @id AND version = @version AND status = 'open'`. If another dispatcher already acknowledged it, SQLite updates 0 rows and returns `409 Conflict`.
-
----
-
-## 9. Live Stream (SSE) & Back-Pressure
-
-* **Durable Event Outbox**: Rather than volatile in-memory queues that vanish on container reboot, events are written to `stream_events (id INTEGER PRIMARY KEY AUTOINCREMENT)`. Clients reconnecting with `Last-Event-ID` get exact monotonic replay across server restarts.
-* **Replay-to-Live Handoff**: When a reconnecting client is catching up on historical events, incoming live events are queued in memory. Once database replay catches up, the queue is drained and deduplicated before switching to live broadcast.
-* **1-Second Vehicle Coalescing**: Fanning out 400 events/sec floods client UI threads. We coalesce vehicle updates into an in-memory map for 1 second, flushing only the latest state per vehicle. Alert events bypass this and fire instantly.
-* **Back-Pressure Disconnect**: If a client's TCP socket saturates (`res.write()` returns `false`), frames buffer in memory up to 100 items. If the client stays stalled beyond 100 frames, we close the socket to protect server heap.
-
----
-
-## 10. Migrations, Query Plans & Observability
-
-* **Migration Tracking**: `schema_migrations` tracks versions (`001_init.sql` to `004_stream.sql`). Each unapplied migration runs in an atomic `BEGIN IMMEDIATE` block. Running the app repeatedly skips applied scripts with zero locks.
-* **Top Query Plans**: Both history downsampling (`idx_history_vehicle_ts_seq`) and keyset vehicle listing (`idx_vehicles_status_id`) run via composite index seeks with zero full table scans.
-* **Structured Logs & Probes**: Requests generate or propagate `X-Request-Id` and log single-line JSON with duration and status, keeping credentials redacted. `/health/live` checks process responsiveness, while `/health/ready` runs `SELECT 1` on SQLite, returning 503 if disk I/O fails. `/metrics` exposes process latency percentiles (p50/p95/p99) and domain counters without external agents.
+I compared a digest of the bytes the server received against the digest the verifier computed and found the mismatch. The fix captures the raw bytes in `express.json`'s `verify` callback as `req.rawBody` and verifies against those. The security test posts an indented body containing `13.0800`, signed over the exact bytes, and expects 200. Changing one byte must return 401.
