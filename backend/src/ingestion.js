@@ -149,6 +149,7 @@ const resolveOfflineAlertStmt = db.prepare(`
 const executeBatchTransaction = db.transaction((validItems, nowIso) => {
   const transactionResults = [];
   const acceptedVehicleIds = new Set();
+  const alertsToPublish = [];
   let accepted = 0;
   let duplicates = 0;
 
@@ -215,7 +216,8 @@ const executeBatchTransaction = db.transaction((validItems, nowIso) => {
       });
       const resolvedAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(activeOffline.id);
       if (resolvedAlert) {
-        publishAlertChange(resolvedAlert);
+        // Collect resolved alerts to be broadcast strictly AFTER the transaction has successfully committed
+        alertsToPublish.push(resolvedAlert);
       }
     }
 
@@ -227,7 +229,7 @@ const executeBatchTransaction = db.transaction((validItems, nowIso) => {
     });
   }
 
-  return { accepted, duplicates, transactionResults, acceptedVehicleIds };
+  return { accepted, duplicates, transactionResults, acceptedVehicleIds, alertsToPublish };
 }).immediate;
 
 /**
@@ -278,6 +280,17 @@ function ingestBatch(readings, nowIso = new Date().toISOString()) {
       results[item.index] = item;
     }
 
+    // Publish resolved offline alerts strictly AFTER the transaction has successfully committed!
+    if (txResult.alertsToPublish && txResult.alertsToPublish.length > 0) {
+      const publishedAlertIds = new Set();
+      for (const alert of txResult.alertsToPublish) {
+        if (!publishedAlertIds.has(alert.id)) {
+          publishedAlertIds.add(alert.id);
+          publishAlertChange(alert);
+        }
+      }
+    }
+
     // Step 3: Trigger order-independent alert rule evaluation for vehicles with new readings
     if (txResult.acceptedVehicleIds && txResult.acceptedVehicleIds.size > 0) {
       evaluateAlertsForVehicles(txResult.acceptedVehicleIds, nowIso);
@@ -311,5 +324,6 @@ function ingestBatch(readings, nowIso = new Date().toISOString()) {
 
 module.exports = {
   validateReading,
-  ingestBatch
+  ingestBatch,
+  executeBatchTransaction
 };

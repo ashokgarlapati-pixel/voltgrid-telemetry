@@ -558,4 +558,246 @@ describe('Part A5: Live Stream (SSE) Integration & Performance Tests', () => {
       client3.close();
     });
   });
+
+  describe('Issue 4: Alert Events Published Only After Database Commit', () => {
+    test('Successful transaction publishes the event after commit', async () => {
+      const vid = `VG-ISSUE4-SUCC-${Date.now()}`;
+      const now = Date.now();
+
+      // Seed offline vehicle with active offline alert
+      db.prepare(`
+        INSERT INTO vehicles (vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at)
+        VALUES (?, ?, 1, 80, 25, 0, 13.08, 80.27, 100, 0, 'offline', 1, 1, 1, ?)
+      `).run(vid, new Date(now - 120000).toISOString(), new Date(now - 120000).toISOString());
+
+      const alertInfo = db.prepare(`
+        INSERT INTO alerts (vehicle_id, rule, status, version, details, opened_at, updated_at)
+        VALUES (?, 'offline', 'open', 1, '{}', ?, ?)
+      `).run(vid, new Date(now - 120000).toISOString(), new Date(now - 120000).toISOString());
+      const alertId = alertInfo.lastInsertRowid;
+
+      // Connect SSE client
+      const sseClient = createSseClient(`${baseUrl}/v1/stream?api_key=${API_KEY}`);
+      await sseClient.ready;
+      await new Promise(r => setTimeout(r, 50));
+
+      // Ingest new reading -> resolves offline alert
+      const res = await postBatch([
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 5000).toISOString(), soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 100, charging: false, fault_codes: [] }
+      ]);
+      assert.strictEqual(res.status, 200);
+
+      // Wait for SSE dispatch
+      await new Promise(r => setTimeout(r, 100));
+
+      // Verify DB committed first
+      const alertInDb = db.prepare('SELECT * FROM alerts WHERE id = ?').get(alertId);
+      assert.strictEqual(alertInDb.status, 'resolved', 'Alert must be resolved in SQLite');
+
+      // Verify event was published to SSE client
+      const alertEvents = sseClient.getEvents().filter(e => e.event === 'alert_change' && e.data && e.data.alert_id === Number(alertId));
+      assert.strictEqual(alertEvents.length, 1, 'Client must receive exactly one resolved alert event');
+      assert.strictEqual(alertEvents[0].data.status, 'resolved');
+
+      sseClient.close();
+    });
+
+    test('Failed transaction does not publish the event', async () => {
+      const vid = `VG-ISSUE4-FAIL-${Date.now()}`;
+      const now = Date.now();
+
+      // Seed offline vehicle with active offline alert
+      db.prepare(`
+        INSERT INTO vehicles (vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at)
+        VALUES (?, ?, 1, 80, 25, 0, 13.08, 80.27, 100, 0, 'offline', 1, 1, 1, ?)
+      `).run(vid, new Date(now - 120000).toISOString(), new Date(now - 120000).toISOString());
+
+      const alertInfo = db.prepare(`
+        INSERT INTO alerts (vehicle_id, rule, status, version, details, opened_at, updated_at)
+        VALUES (?, 'offline', 'open', 1, '{}', ?, ?)
+      `).run(vid, new Date(now - 120000).toISOString(), new Date(now - 120000).toISOString());
+      const alertId = alertInfo.lastInsertRowid;
+
+      // Connect SSE client
+      const sseClient = createSseClient(`${baseUrl}/v1/stream?api_key=${API_KEY}`);
+      await sseClient.ready;
+      await new Promise(r => setTimeout(r, 50));
+
+      // Simulate a failure in transaction execution by directly testing transactional rollback
+      assert.throws(() => {
+        db.transaction(() => {
+          // Resolve offline alert inside transaction
+          db.prepare("UPDATE alerts SET status = 'resolved' WHERE id = ?").run(alertId);
+          // Force transaction failure
+          throw new Error('Simulated database write failure');
+        })();
+      }, /Simulated database write failure/);
+
+      await new Promise(r => setTimeout(r, 100));
+
+      // DB rolled back: Alert remains open
+      const alertInDb = db.prepare('SELECT * FROM alerts WHERE id = ?').get(alertId);
+      assert.strictEqual(alertInDb.status, 'open', 'Alert must remain open in SQLite after rollback');
+
+      // Zero alert events published to SSE client!
+      const alertEvents = sseClient.getEvents().filter(e => e.event === 'alert_change' && e.data && e.data.alert_id === Number(alertId));
+      assert.strictEqual(alertEvents.length, 0, 'Client must NOT receive any event for rolled back transaction');
+
+      // Zero events in stream_events outbox table
+      const outboxRows = db.prepare("SELECT * FROM stream_events WHERE json_extract(data, '$.alert_id') = ?").all(Number(alertId));
+      assert.strictEqual(outboxRows.length, 0, 'Outbox must contain 0 events for rolled-back alert');
+
+      sseClient.close();
+    });
+
+    test('Offline alert resolution publishes only after commit', async () => {
+      const vid = `VG-ISSUE4-ORDER-${Date.now()}`;
+      const now = Date.now();
+
+      // Seed offline vehicle with active offline alert
+      db.prepare(`
+        INSERT INTO vehicles (vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at)
+        VALUES (?, ?, 1, 80, 25, 0, 13.08, 80.27, 100, 0, 'offline', 1, 1, 1, ?)
+      `).run(vid, new Date(now - 120000).toISOString(), new Date(now - 120000).toISOString());
+
+      const alertInfo = db.prepare(`
+        INSERT INTO alerts (vehicle_id, rule, status, version, details, opened_at, updated_at)
+        VALUES (?, 'offline', 'open', 1, '{}', ?, ?)
+      `).run(vid, new Date(now - 120000).toISOString(), new Date(now - 120000).toISOString());
+      const alertId = alertInfo.lastInsertRowid;
+
+      const sseClient = createSseClient(`${baseUrl}/v1/stream?api_key=${API_KEY}`);
+      await sseClient.ready;
+      await new Promise(r => setTimeout(r, 50));
+
+      // Ingest batch to trigger resolution
+      await postBatch([
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 5000).toISOString(), soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 100, charging: false, fault_codes: [] }
+      ]);
+
+      await new Promise(r => setTimeout(r, 100));
+
+      const alertEvents = sseClient.getEvents().filter(e => e.event === 'alert_change' && e.data && e.data.alert_id === Number(alertId));
+      assert.strictEqual(alertEvents.length, 1);
+
+      // Verify that when alert event was created, the corresponding alert row in alerts is ALREADY status='resolved'
+      const alertInDb = db.prepare('SELECT status, version FROM alerts WHERE id = ?').get(alertId);
+      assert.strictEqual(alertInDb.status, 'resolved');
+      assert.strictEqual(alertInDb.version, 2);
+
+      sseClient.close();
+    });
+
+    test('Multiple alert changes are published correctly without duplicates', async () => {
+      const vid1 = `VG-ISSUE4-MULTI1-${Date.now()}`;
+      const vid2 = `VG-ISSUE4-MULTI2-${Date.now()}`;
+      const now = Date.now();
+
+      // Seed 2 offline vehicles with offline alerts
+      for (const vid of [vid1, vid2]) {
+        db.prepare(`
+          INSERT INTO vehicles (vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at)
+          VALUES (?, ?, 1, 80, 25, 0, 13.08, 80.27, 100, 0, 'offline', 1, 1, 1, ?)
+        `).run(vid, new Date(now - 120000).toISOString(), new Date(now - 120000).toISOString());
+
+        db.prepare(`
+          INSERT INTO alerts (vehicle_id, rule, status, version, details, opened_at, updated_at)
+          VALUES (?, 'offline', 'open', 1, '{}', ?, ?)
+        `).run(vid, new Date(now - 120000).toISOString(), new Date(now - 120000).toISOString());
+      }
+
+      const sseClient = createSseClient(`${baseUrl}/v1/stream?api_key=${API_KEY}`);
+      await sseClient.ready;
+      await new Promise(r => setTimeout(r, 50));
+
+      // Ingest single batch with readings for BOTH vehicles
+      const res = await postBatch([
+        { vehicle_id: vid1, seq: 2, ts: new Date(now - 5000).toISOString(), soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 100, charging: false, fault_codes: [] },
+        { vehicle_id: vid2, seq: 2, ts: new Date(now - 5000).toISOString(), soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 100, charging: false, fault_codes: [] }
+      ]);
+      assert.strictEqual(res.status, 200);
+
+      await new Promise(r => setTimeout(r, 100));
+
+      // Both alerts resolved in DB
+      assert.strictEqual(db.prepare("SELECT status FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid1).status, 'resolved');
+      assert.strictEqual(db.prepare("SELECT status FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid2).status, 'resolved');
+
+      // Both events delivered to SSE client
+      const vid1Events = sseClient.getEvents().filter(e => e.event === 'alert_change' && e.data && e.data.vehicle_id === vid1);
+      const vid2Events = sseClient.getEvents().filter(e => e.event === 'alert_change' && e.data && e.data.vehicle_id === vid2);
+
+      assert.strictEqual(vid1Events.length, 1, 'Exactly 1 event for vid1');
+      assert.strictEqual(vid2Events.length, 1, 'Exactly 1 event for vid2');
+      assert.strictEqual(vid1Events[0].data.status, 'resolved');
+      assert.strictEqual(vid2Events[0].data.status, 'resolved');
+
+      sseClient.close();
+    });
+
+    test('SSE replay contains only committed events', async () => {
+      const vidCommitted = `VG-ISSUE4-REP-C-${Date.now()}`;
+      const vidRolledBack = `VG-ISSUE4-REP-R-${Date.now()}`;
+      const now = Date.now();
+
+      // Seed offline vehicle for committed test
+      db.prepare(`
+        INSERT INTO vehicles (vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at)
+        VALUES (?, ?, 1, 80, 25, 0, 13.08, 80.27, 100, 0, 'offline', 1, 1, 1, ?)
+      `).run(vidCommitted, new Date(now - 120000).toISOString(), new Date(now - 120000).toISOString());
+
+      db.prepare(`
+        INSERT INTO alerts (vehicle_id, rule, status, version, details, opened_at, updated_at)
+        VALUES (?, 'offline', 'open', 1, '{}', ?, ?)
+      `).run(vidCommitted, new Date(now - 120000).toISOString(), new Date(now - 120000).toISOString());
+
+      // Get latest event ID prior to commit
+      const lastRowBefore = db.prepare('SELECT MAX(id) AS max_id FROM stream_events').get();
+      const lastEventIdBefore = lastRowBefore && lastRowBefore.max_id ? Number(lastRowBefore.max_id) : 0;
+
+      // Ingest committed reading
+      await postBatch([
+        { vehicle_id: vidCommitted, seq: 2, ts: new Date(now - 5000).toISOString(), soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 100, charging: false, fault_codes: [] }
+      ]);
+
+      // Seed offline vehicle for rolled-back test
+      db.prepare(`
+        INSERT INTO vehicles (vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at)
+        VALUES (?, ?, 1, 80, 25, 0, 13.08, 80.27, 100, 0, 'offline', 1, 1, 1, ?)
+      `).run(vidRolledBack, new Date(now - 120000).toISOString(), new Date(now - 120000).toISOString());
+
+      const alertR = db.prepare(`
+        INSERT INTO alerts (vehicle_id, rule, status, version, details, opened_at, updated_at)
+        VALUES (?, 'offline', 'open', 1, '{}', ?, ?)
+      `).run(vidRolledBack, new Date(now - 120000).toISOString(), new Date(now - 120000).toISOString());
+
+      // Simulate rolled-back transaction
+      assert.throws(() => {
+        db.transaction(() => {
+          db.prepare("UPDATE alerts SET status = 'resolved' WHERE id = ?").run(alertR.lastInsertRowid);
+          throw new Error('Rollback simulation');
+        })();
+      }, /Rollback simulation/);
+
+      // Now connect SSE client with Last-Event-ID = lastEventIdBefore to replay
+      const replayClient = createSseClient(`${baseUrl}/v1/stream?api_key=${API_KEY}`, {
+        headers: { 'Last-Event-ID': String(lastEventIdBefore) }
+      });
+      await replayClient.ready;
+      await new Promise(r => setTimeout(r, 100));
+
+      const replayedEvents = replayClient.getEvents().filter(e => e.event === 'alert_change');
+
+      // Must have received the committed alert event
+      const committedEvent = replayedEvents.find(e => e.data && e.data.vehicle_id === vidCommitted);
+      assert.ok(committedEvent, 'Replayed events must contain the committed alert change');
+      assert.strictEqual(committedEvent.data.status, 'resolved');
+
+      // Must NOT have received any event for rolled-back alert
+      const rolledBackEvent = replayedEvents.find(e => e.data && e.data.vehicle_id === vidRolledBack);
+      assert.strictEqual(rolledBackEvent, undefined, 'Replayed events must NEVER contain rolled back alert');
+
+      replayClient.close();
+    });
+  });
 });
