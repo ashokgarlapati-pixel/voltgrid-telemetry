@@ -46,26 +46,47 @@ function normalizeReadings(readings) {
  * - Trigger: 3 consecutive valid readings with battery_temp_c > 55°C.
  * - Resolve: 3 consecutive valid readings with battery_temp_c <= 50°C.
  * - Between 50°C and 55°C, maintain previous alert state (hysteresis).
+ * - Tracks discrete incident episodes for complete order-independent lifecycle reconstruction.
  */
-function evaluateOverheat(readings) {
+function evaluateOverheat(readings, activeAlert = null) {
   const sorted = normalizeReadings(readings);
   if (sorted.length === 0) {
-    return { triggered: false, resolved: false };
+    return { triggered: false, resolved: false, episodes: [] };
   }
 
+  const episodes = [];
   let state = 'normal'; // 'normal' | 'triggered' | 'resolved'
   let hotStreak = 0;
   let coolStreak = 0;
   let openedAt = null;
+  let openDetails = null;
   let resolvedAt = null;
 
+  const alertOpenTs = activeAlert && activeAlert.opened_at ? Date.parse(activeAlert.opened_at) : null;
+
   for (const r of sorted) {
+    const rTs = Date.parse(r.ts);
+
+    // If an active alert is currently open/acknowledged and we reach or pass its opened_at, synchronize in-triggered state
+    if (activeAlert && alertOpenTs !== null && rTs >= alertOpenTs && !openedAt && state !== 'triggered') {
+      state = 'triggered';
+      openedAt = activeAlert.opened_at;
+      openDetails = typeof activeAlert.details === 'string'
+        ? JSON.parse(activeAlert.details || '{}')
+        : (activeAlert.details || { current_temp_c: r.battery_temp_c, threshold: 55.0 });
+    }
+
     if (r.battery_temp_c > 55.0) {
       hotStreak++;
       coolStreak = 0;
       if (hotStreak >= 3) {
         if (state !== 'triggered') {
           openedAt = r.ts;
+          openDetails = {
+            current_temp_c: r.battery_temp_c,
+            threshold: 55.0,
+            consecutive_hot: hotStreak
+          };
         }
         state = 'triggered';
       }
@@ -75,8 +96,22 @@ function evaluateOverheat(readings) {
       if (coolStreak >= 3) {
         if (state === 'triggered') {
           resolvedAt = r.ts;
+          const resolveDetails = {
+            current_temp_c: r.battery_temp_c,
+            cooling_threshold: 50.0,
+            consecutive_cool: coolStreak
+          };
+          episodes.push({
+            status: 'resolved',
+            openedAt,
+            resolvedAt,
+            openDetails,
+            details: resolveDetails
+          });
+          openedAt = null;
+          openDetails = null;
+          state = 'resolved';
         }
-        state = 'resolved';
       }
     } else {
       // Hysteresis range (50°C < temp <= 55°C): resets streaks, maintains existing state
@@ -87,6 +122,18 @@ function evaluateOverheat(readings) {
 
   const latest = sorted[sorted.length - 1];
   if (state === 'triggered') {
+    const currentOpenEp = {
+      status: 'open',
+      openedAt: openedAt || latest.ts,
+      resolvedAt: null,
+      details: openDetails || {
+        current_temp_c: latest.battery_temp_c,
+        threshold: 55.0,
+        consecutive_hot: hotStreak
+      }
+    };
+    episodes.push(currentOpenEp);
+
     return {
       triggered: true,
       resolved: false,
@@ -95,23 +142,26 @@ function evaluateOverheat(readings) {
         current_temp_c: latest.battery_temp_c,
         threshold: 55.0,
         consecutive_hot: hotStreak
-      }
+      },
+      episodes
     };
-  } else if (state === 'resolved') {
+  } else if (state === 'resolved' || episodes.length > 0) {
+    const lastResolvedEp = episodes.length > 0 ? episodes[episodes.length - 1] : null;
     return {
       triggered: false,
       resolved: true,
-      openedAt,
-      resolvedAt: resolvedAt || latest.ts,
+      openedAt: lastResolvedEp ? lastResolvedEp.openedAt : openedAt,
+      resolvedAt: lastResolvedEp ? lastResolvedEp.resolvedAt : (resolvedAt || latest.ts),
       details: {
         current_temp_c: latest.battery_temp_c,
         cooling_threshold: 50.0,
         consecutive_cool: coolStreak
-      }
+      },
+      episodes
     };
   }
 
-  return { triggered: false, resolved: false };
+  return { triggered: false, resolved: false, episodes: [] };
 }
 
 /**
@@ -319,16 +369,11 @@ const TELEMETRY_RULES = [
   { name: 'geofence_breach', evaluate: evaluateGeofenceBreach }
 ];
 
-// Query latest 100 readings in ascending chronological order (subquery sorts descending first)
+// Query vehicle telemetry history in ascending chronological order for comprehensive alert evaluation
 const getRecentHistoryStmt = db.prepare(`
   SELECT vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging
-  FROM (
-    SELECT vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging
-    FROM telemetry_history
-    WHERE vehicle_id = ?
-    ORDER BY ts DESC, seq DESC
-    LIMIT 100
-  )
+  FROM telemetry_history
+  WHERE vehicle_id = ?
   ORDER BY ts ASC, seq ASC
 `);
 
@@ -411,7 +456,7 @@ const evaluateVehicleAlertsTx = db.transaction((vehicleId, nowIso) => {
   let readings = getRecentHistoryStmt.all(vehicleId);
   if (!readings || readings.length === 0) return [];
 
-  // Check if 100 readings cover the full 5-minute window for rapid discharge
+  // Ensure full 5-minute window for rapid discharge if needed
   const latest = readings[readings.length - 1];
   const earliest = readings[0];
   const fiveMinAgoIso = new Date(Date.parse(latest.ts) - (5 * 60 * 1000)).toISOString();

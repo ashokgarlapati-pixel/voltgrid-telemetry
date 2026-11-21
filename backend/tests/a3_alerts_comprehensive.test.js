@@ -112,6 +112,25 @@ describe('A3 Comprehensive Alert Engine Edge Cases & Lifecycle Tests', () => {
       assert.strictEqual(outcome.triggered, false);
       assert.strictEqual(outcome.resolved, true, 'Exactly 50.0°C is <= 50.0°C, must resolve');
     });
+
+    test('evaluateOverheat tracks discrete episodes with openedAt and resolvedAt', () => {
+      const readings = [
+        { seq: 1, ts: '2026-11-20T10:00:00Z', battery_temp_c: 56.0 },
+        { seq: 2, ts: '2026-11-20T10:00:05Z', battery_temp_c: 57.0 },
+        { seq: 3, ts: '2026-11-20T10:00:10Z', battery_temp_c: 58.0 },
+        { seq: 4, ts: '2026-11-20T10:00:15Z', battery_temp_c: 49.0 },
+        { seq: 5, ts: '2026-11-20T10:00:20Z', battery_temp_c: 48.0 },
+        { seq: 6, ts: '2026-11-20T10:00:25Z', battery_temp_c: 47.0 }
+      ];
+      const outcome = evaluateOverheat(readings);
+      assert.strictEqual(outcome.triggered, false);
+      assert.strictEqual(outcome.resolved, true);
+      assert.ok(Array.isArray(outcome.episodes), 'outcome.episodes must be an array');
+      assert.strictEqual(outcome.episodes.length, 1);
+      assert.strictEqual(outcome.episodes[0].status, 'resolved');
+      assert.strictEqual(outcome.episodes[0].openedAt, '2026-11-20T10:00:10Z');
+      assert.strictEqual(outcome.episodes[0].resolvedAt, '2026-11-20T10:00:25Z');
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -666,6 +685,102 @@ describe('A3 Comprehensive Alert Engine Edge Cases & Lifecycle Tests', () => {
       const alertResolved = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'rapid_discharge'").get(vid);
       assert.strictEqual(alertResolved.status, 'resolved', 'Charging vehicle must resolve rapid discharge alert');
       assert.strictEqual(alertResolved.version, 2);
+    });
+
+    test('Order-independent alert reconstruction: 118 readings with oldest 18 containing hot streak arriving late', async () => {
+      const vidIn = `VG-118-IN-${Date.now()}`;
+      const vidOut = `VG-118-OUT-${Date.now()}`;
+      const now = Date.now();
+      const readings = [];
+
+      for (let i = 0; i < 118; i++) {
+        const ts = new Date(now - (118 - i) * 3000).toISOString();
+        let temp = 40.0;
+        if (i >= 5 && i <= 8) {
+          temp = 58.0; // hot streak
+        } else if (i >= 9 && i <= 13) {
+          temp = 48.0; // cool streak
+        }
+        readings.push({
+          seq: i + 1,
+          ts,
+          soc_pct: 80,
+          battery_temp_c: temp,
+          speed_kmh: 30,
+          lat: 13.08,
+          lng: 80.27,
+          odometer_km: 10 + i * 0.1,
+          charging: false,
+          fault_codes: []
+        });
+      }
+
+      // In-order: first 18, then remaining 100
+      const rIn = readings.map(r => ({ ...r, vehicle_id: vidIn }));
+      await postSignedBatch(rIn.slice(0, 18));
+      await postSignedBatch(rIn.slice(18));
+      const alertsIn = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").all(vidIn);
+
+      // Out-of-order: newest 100 first, then oldest 18 late
+      const rOut = readings.map(r => ({ ...r, vehicle_id: vidOut }));
+      await postSignedBatch(rOut.slice(18));
+      await postSignedBatch(rOut.slice(0, 18));
+      const alertsOut = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").all(vidOut);
+
+      assert.strictEqual(alertsIn.length, 1);
+      assert.strictEqual(alertsOut.length, 1);
+      assert.strictEqual(alertsIn[0].status, 'resolved');
+      assert.strictEqual(alertsOut[0].status, 'resolved');
+      assert.strictEqual(alertsIn[0].opened_at, alertsOut[0].opened_at);
+      assert.strictEqual(alertsIn[0].resolved_at, alertsOut[0].resolved_at);
+    });
+
+    test('Order-independent alert reconstruction: 150 readings with oldest 18 containing hot streak arriving late', async () => {
+      const vidIn = `VG-150-IN-${Date.now()}`;
+      const vidOut = `VG-150-OUT-${Date.now()}`;
+      const now = Date.now();
+      const readings = [];
+
+      for (let i = 0; i < 150; i++) {
+        const ts = new Date(now - (150 - i) * 3000).toISOString();
+        let temp = 40.0;
+        if (i >= 5 && i <= 8) {
+          temp = 58.0; // hot streak in oldest 18
+        } else if (i >= 9 && i <= 13) {
+          temp = 48.0; // cool streak in oldest 18
+        }
+        readings.push({
+          seq: i + 1,
+          ts,
+          soc_pct: 80,
+          battery_temp_c: temp,
+          speed_kmh: 30,
+          lat: 13.08,
+          lng: 80.27,
+          odometer_km: 10 + i * 0.1,
+          charging: false,
+          fault_codes: []
+        });
+      }
+
+      // In-order: first 18, then remaining 132
+      const rIn = readings.map(r => ({ ...r, vehicle_id: vidIn }));
+      await postSignedBatch(rIn.slice(0, 18));
+      await postSignedBatch(rIn.slice(18));
+      const alertsIn = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").all(vidIn);
+
+      // Out-of-order: newest 132 first, then oldest 18 arriving late
+      const rOut = readings.map(r => ({ ...r, vehicle_id: vidOut }));
+      await postSignedBatch(rOut.slice(18));
+      await postSignedBatch(rOut.slice(0, 18));
+      const alertsOut = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").all(vidOut);
+
+      assert.strictEqual(alertsIn.length, 1);
+      assert.strictEqual(alertsOut.length, 1);
+      assert.strictEqual(alertsIn[0].status, 'resolved');
+      assert.strictEqual(alertsOut[0].status, 'resolved');
+      assert.strictEqual(alertsIn[0].opened_at, alertsOut[0].opened_at);
+      assert.strictEqual(alertsIn[0].resolved_at, alertsOut[0].resolved_at);
     });
   });
 });
