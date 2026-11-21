@@ -12,7 +12,9 @@
     "simulate": "node ../simulator/simulator.js",
     "loadtest": "node ../scripts/loadtest.js",
     "benchmark:5m": "node ../scripts/benchmark_5m.js",
-    "benchmark:summary": "node ../scripts/benchmark_5m.js"
+    "benchmark:summary": "node ../scripts/benchmark_5m.js",
+    "benchmark:17k": "node ../scripts/benchmark_history_17k.js",
+    "benchmark:history": "node ../scripts/benchmark_history_17k.js"
   },
   "dependencies": {
     "express": "^4.21.2"

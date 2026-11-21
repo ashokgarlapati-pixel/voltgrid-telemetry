@@ -48,17 +48,36 @@ EXPLAIN QUERY PLAN
 SELECT seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging 
 FROM telemetry_history 
 WHERE vehicle_id = ? AND ts >= ? AND ts <= ? 
-ORDER BY ts ASC;
+ORDER BY ts ASC, seq ASC;
 ```
 **SQLite Execution Output:**
 ```text
-SEARCH telemetry_history USING INDEX idx_history_vehicle_ts (vehicle_id=? AND ts>? AND ts<?)
+SEARCH telemetry_history USING INDEX idx_history_vehicle_ts_seq (vehicle_id=? AND ts>? AND ts<?)
 ```
-* **Index Justification**: Uses composite index `idx_history_vehicle_ts (vehicle_id, ts)`. Seeks directly to the vehicle and start timestamp in $O(\log N)$ time and traverses ordered leaf pages, eliminating full table scans and temporary sort buffers.
+* **Index Justification**: Uses composite index `idx_history_vehicle_ts_seq (vehicle_id, ts DESC, seq DESC)`. Seeks directly to the vehicle and start timestamp in $O(\log N)$ time and traverses ordered leaf pages, eliminating full table scans and temporary sort buffers.
 
 ---
 
-### Query 2: Fleet Summary Aggregation Query
+### Query 2: Keyset Paginated Vehicle Listing with Status Filter
+```sql
+EXPLAIN QUERY PLAN 
+SELECT vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c,
+       speed_kmh, lat, lng, odometer_km, charging, status,
+       min_seq, max_seq, received_count, updated_at
+FROM vehicles
+WHERE status = ? AND vehicle_id > ?
+ORDER BY vehicle_id ASC
+LIMIT 51;
+```
+**SQLite Execution Output:**
+```text
+SEARCH vehicles USING INDEX idx_vehicles_status_id (status=? AND vehicle_id>?)
+```
+* **Index Justification**: Uses covering index `idx_vehicles_status_id (status, vehicle_id)`. Seeks directly to `status = ? AND vehicle_id > ?` in index order, completely avoiding both full table scans and temporary B-tree sorting.
+
+---
+
+### Query 3: Fleet Summary Aggregation Query
 ```sql
 EXPLAIN QUERY PLAN 
 SELECT 
@@ -74,11 +93,11 @@ FROM vehicles;
 ```text
 SCAN vehicles
 ```
-* **Index Justification**: Aggregates strictly from the 2,000-row `vehicles` summary table, never touching multi-million row `telemetry_history`. Executed in under 2ms.
+* **Execution Analysis**: `SCAN vehicles` scans the canonical 1,000–2,000 row `vehicles` state table. Because it reads strictly from `vehicles` (taking $< 0.3\text{ ms}$) and never touches the multi-million row `telemetry_history` table, fleet metrics aggregate in constant time relative to history size.
 
 ---
 
-### Query 3: Fleet Summary Open Alerts Query
+### Query 4: Fleet Summary Open Alerts Query
 ```sql
 EXPLAIN QUERY PLAN 
 SELECT rule, COUNT(*) AS count
@@ -88,10 +107,10 @@ GROUP BY rule;
 ```
 **SQLite Execution Output:**
 ```text
-SCAN alerts USING INDEX idx_alerts_active_unique
+SCAN alerts USING INDEX idx_alerts_active_rule
 USE TEMP B-TREE FOR GROUP BY
 ```
-* **Index Justification**: Scans the partial unique index `idx_alerts_active_unique` which only contains unresolved active alerts. Avoids scanning resolved alerts in history.
+* **Index Justification**: Scans the partial index `idx_alerts_active_rule` / `idx_alerts_active_unique` which only contains unresolved active alerts (`WHERE status != 'resolved'`), avoiding scanning historical resolved alerts.
 
 ---
 
@@ -134,29 +153,40 @@ A reproducible performance benchmark (`scripts/benchmark_5m.js`) tests `GET /v1/
 | **Max Latency** | **10.37 ms** | **11.29 ms** | - | Completed |
 
 ### Query Engine Justification & Optimization
+* **Root Bottleneck Avoidance**: In this dedicated isolated benchmark, `GET /v1/fleet/summary` aggregates strictly from the 1,000-row `vehicles` state table and active `alerts`. It never scans `telemetry_history`. Query execution in SQLite completes in 0.3–0.5 ms, yielding an HTTP end-to-end p95 response time of 7.23 ms (initial run) and 8.64 ms (latest verification run), satisfying the sub-150 ms requirement.
+* **Interpretation of Performance Evidence**: This isolated benchmark proves that the query architecture does not degrade with history volume ($O(V)$ scaling rather than $O(N)$). However, as honestly demonstrated in the mixed-workload load test (Section 2, where fleet summary p95 reached 651 ms), read latency degrades significantly under heavy concurrent write load due to SQLite's serialized write transactions (`BEGIN IMMEDIATE`). In a multi-worker production environment handling 40,000 readings/s, scaling reads and writes independently requires migrating to PostgreSQL/TimescaleDB with partitioned tables and Redis for auth/rate limits, as detailed in `DESIGN.md`.
 
-```sql
-EXPLAIN QUERY PLAN 
-SELECT 
-  COUNT(*) AS total_vehicles,
-  COALESCE(SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END), 0) AS online_count,
-  COALESCE(SUM(CASE WHEN status = 'offline' THEN 1 ELSE 0 END), 0) AS offline_count,
-  COALESCE(SUM(CASE WHEN status = 'maintenance' THEN 1 ELSE 0 END), 0) AS maintenance_count,
-  COALESCE(AVG(soc_pct), 0) AS avg_soc,
-  COALESCE(SUM(received_count), 0) AS total_received,
-  COALESCE(SUM(max_seq - min_seq + 1), 0) AS total_expected
-FROM vehicles;
-```
-* **Execution Plan**: `SCAN vehicles` (1,000 rows).
-* **Alerts Plan**: `SCAN alerts USING INDEX idx_alerts_active_rule` (partial index `WHERE status != 'resolved'`).
-* **Root Bottleneck Avoidance**: In this dedicated isolated benchmark, `GET /v1/fleet/summary` aggregates strictly from the 1,000-row `vehicles` state table and active `alerts`. It never scans `telemetry_history`. Query execution in SQLite completes in 0.3–0.5 ms, yielding an HTTP end-to-end p95 response time of 7.23 ms (initial run) and 8.64 ms (latest verification run), satisfying the sub-150 ms requirement. (Note: Under the concurrent batch write contention of the historical mixed-workload test, read queries queued behind serialized SQLite disk commits, which explains why `GET /v1/fleet/summary` reached 651 ms p95 in Section 2).
+---
+
+## 5. 17,280-Reading History Downsampling Benchmark (24-Hour Window)
+
+A reproducible benchmark runner (`scripts/benchmark_history_17k.js`) evaluates the streaming time-bucketed peak/trough downsampler across a full 24-hour telemetry window containing 17,280 readings (1 reading every 5 seconds) down to 200 points.
+
+### Methodology & Bounded Memory Streaming
+* **Streaming Execution**: Uses SQLite statement iterator (`stmt.iterate()`) to process rows one-by-one. Rows are partitioned into time buckets on-the-fly to extract battery temperature peaks/troughs, minimum SOC, and maximum speed.
+* **Bounded Memory**: Memory consumption is strictly bounded to $O(\text{targetPoints})$ rather than loading all 17,280 rows into JavaScript memory.
+* **Physical Extreme Preservation**: The benchmark verifies that a thermal spike (74.5°C) and a thermal trough (14.2°C) inserted into the 17,280 readings are strictly retained in the 200 returned downsampled points.
+
+### Empirical Measurement Results (50 Iterations)
+
+| Metric | Measured Value | Requirement / SLA | Status |
+| :--- | :---: | :---: | :---: |
+| **Raw Telemetry Readings Window** | **17,280** (24 hours @ 5s) | ~17,000 | Populated |
+| **Downsampled Points Returned** | **196 points** | Target: 200 | Verified |
+| **Thermal Peak Preserved (74.5°C)** | **true** | Required | **PASSED** |
+| **Thermal Trough Preserved (14.2°C)** | **true** | Required | **PASSED** |
+| **Min Latency** | **43.36 ms** | - | Completed |
+| **Average Latency** | **47.52 ms** | - | Completed |
+| **p50 Latency** | **46.44 ms** | Sub-150ms | Completed |
+| **p95 Latency** | **55.86 ms** | **< 150.0 ms** | **PASSED (Target Satisfied)** |
+| **p99 Latency** | **67.78 ms** | < 150.0 ms | Completed |
+| **Max Latency** | **67.78 ms** | - | Completed |
 
 ### How to Reproduce
 ```bash
-# Run standalone benchmark
-node scripts/benchmark_5m.js
+# Run 5-million-record fleet summary benchmark
+cd backend && npm run benchmark:5m
 
-# Or via npm script in backend
-cd backend
-npm run benchmark:5m
+# Run 17,280-reading 24-hour history downsampling benchmark
+cd backend && npm run benchmark:history
 ```

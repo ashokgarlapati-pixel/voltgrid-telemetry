@@ -245,4 +245,35 @@ describe('Part A6 Observability, Logging, Probes & Metrics Tests', () => {
     assert.strictEqual(postRes.security.auth_failures_total, preAuthFails + 1, 'Auth failure counter must increment by 1');
     assert.strictEqual(postRes.telemetry.readings_accepted_total, preAccepted + 2, 'Telemetry accepted counter must increment by 2');
   });
+
+  test('Prometheus Exposition Format: GET /metrics with text/plain or ?format=prometheus returns standard Prometheus format', async () => {
+    // 1. Request with Accept: text/plain
+    const textRes = await fetch(`${baseUrl}/metrics`, {
+      headers: { 'Accept': 'text/plain; version=0.0.4' }
+    });
+    assert.strictEqual(textRes.status, 200);
+    assert.ok(textRes.headers.get('content-type')?.includes('text/plain'), 'Content-Type must be text/plain');
+    const textBody = await textRes.text();
+
+    assert.ok(textBody.includes('# HELP voltgrid_uptime_seconds'), 'Must contain uptime help comment');
+    assert.ok(textBody.includes('# TYPE voltgrid_uptime_seconds gauge'), 'Must contain uptime type comment');
+    assert.match(textBody, /^voltgrid_uptime_seconds \d+/m, 'Must output uptime metric value');
+
+    assert.ok(textBody.includes('# HELP voltgrid_requests_total'), 'Must contain requests total help');
+    assert.ok(textBody.includes('# TYPE voltgrid_requests_total counter'), 'Must contain requests total type');
+    assert.match(textBody, /^voltgrid_requests_total \d+/m, 'Must output requests total value');
+
+    assert.ok(textBody.includes('# HELP voltgrid_request_duration_ms'), 'Must contain duration quantile help');
+    assert.ok(textBody.includes('voltgrid_request_duration_ms{quantile="0.95"}'), 'Must output p95 quantile');
+
+    assert.ok(textBody.includes('voltgrid_readings_accepted_total'), 'Must output telemetry accepted metric');
+    assert.ok(textBody.includes('voltgrid_database_vehicles_total'), 'Must output database vehicles metric');
+
+    // 2. Request with ?format=prometheus query parameter
+    const queryRes = await fetch(`${baseUrl}/metrics?format=prometheus`);
+    assert.strictEqual(queryRes.status, 200);
+    assert.ok(queryRes.headers.get('content-type')?.includes('text/plain'), 'Content-Type must be text/plain for ?format=prometheus');
+    const queryBody = await queryRes.text();
+    assert.ok(queryBody.includes('voltgrid_uptime_seconds'), 'Query param format must output Prometheus metrics');
+  });
 });

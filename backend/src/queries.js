@@ -292,8 +292,115 @@ function getVehiclesHandler(req, res) {
 }
 
 /**
+ * Streams telemetry history directly from SQLite using a time-bucketed peak/trough
+ * downsampling algorithm. Never loads the full result set into application memory.
+ * Bounded memory usage O(targetPoints), regardless of whether 100 or 100,000 rows match.
+ * 
+ * @param {string} vehicleId - Target vehicle ID
+ * @param {string} fromIso - ISO timestamp start window
+ * @param {string} toIso - ISO timestamp end window
+ * @param {number} targetPoints - Maximum number of data points to return
+ * @returns {{ rawCount: number, points: Array<object> }}
+ */
+function streamDownsampleHistory(vehicleId, fromIso, toIso, targetPoints) {
+  // Query total matching count
+  const countRow = db.prepare(`
+    SELECT COUNT(*) AS total
+    FROM telemetry_history
+    WHERE vehicle_id = ? AND ts >= ? AND ts <= ?
+  `).get(vehicleId, fromIso, toIso);
+
+  const rawCount = Number(countRow?.total || 0);
+  if (rawCount === 0) {
+    return { rawCount: 0, points: [] };
+  }
+
+  const querySql = `
+    SELECT seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging
+    FROM telemetry_history
+    WHERE vehicle_id = ? AND ts >= ? AND ts <= ?
+    ORDER BY ts ASC, seq ASC
+  `;
+
+  // If total matching rows is already within requested points budget, return directly
+  if (rawCount <= targetPoints) {
+    const rows = db.prepare(querySql).all(vehicleId, fromIso, toIso);
+    return { rawCount, points: rows };
+  }
+
+  // Handle single-point request
+  if (targetPoints === 1) {
+    const single = db.prepare(`
+      ${querySql}
+      LIMIT 1
+    `).all(vehicleId, fromIso, toIso);
+    return { rawCount, points: single };
+  }
+
+  const fromMs = Date.parse(fromIso);
+  const toMs = Date.parse(toIso);
+  const totalDurationMs = Math.max(1, toMs - fromMs);
+
+  // Reserve 2 points for absolute first and last readings
+  const maxInterior = targetPoints - 2;
+  const numBuckets = Math.max(1, Math.floor(maxInterior / 4));
+  const bucketDurationMs = totalDurationMs / numBuckets;
+
+  // Pre-allocate fixed bucket state (zero heap allocations during streaming loop)
+  const buckets = new Array(numBuckets);
+  for (let b = 0; b < numBuckets; b++) {
+    buckets[b] = { minTemp: null, maxTemp: null, minSoc: null, maxSpeed: null };
+  }
+
+  let firstRow = null;
+  let lastRow = null;
+
+  const stmt = db.prepare(querySql);
+
+  // Stream rows one by one through the iterator without materializing the full dataset
+  for (const row of stmt.iterate(vehicleId, fromIso, toIso)) {
+    if (!firstRow) firstRow = row;
+    lastRow = row;
+
+    const rowMs = Date.parse(row.ts);
+    const bucketIdx = Math.min(numBuckets - 1, Math.max(0, Math.floor((rowMs - fromMs) / bucketDurationMs)));
+    const b = buckets[bucketIdx];
+
+    if (!b.minTemp || row.battery_temp_c < b.minTemp.battery_temp_c) b.minTemp = row;
+    if (!b.maxTemp || row.battery_temp_c > b.maxTemp.battery_temp_c) b.maxTemp = row;
+    if (!b.minSoc || row.soc_pct < b.minSoc.soc_pct) b.minSoc = row;
+    if (!b.maxSpeed || row.speed_kmh > b.maxSpeed.speed_kmh) b.maxSpeed = row;
+  }
+
+  // Collect candidates from time buckets
+  const selectedMap = new Map();
+  function addPoint(r) {
+    if (!r) return;
+    const key = r.seq !== undefined && r.seq !== null ? `${r.ts}_${r.seq}` : r.ts;
+    if (!selectedMap.has(key)) selectedMap.set(key, r);
+  }
+
+  addPoint(firstRow);
+  for (const b of buckets) {
+    if (selectedMap.size < targetPoints - 1) addPoint(b.maxTemp);
+    if (selectedMap.size < targetPoints - 1) addPoint(b.minTemp);
+    if (selectedMap.size < targetPoints - 1) addPoint(b.minSoc);
+    if (selectedMap.size < targetPoints - 1) addPoint(b.maxSpeed);
+  }
+  addPoint(lastRow);
+
+  const points = Array.from(selectedMap.values()).sort((a, b) => {
+    const timeDiff = Date.parse(a.ts) - Date.parse(b.ts);
+    return timeDiff !== 0 ? timeDiff : ((a.seq || 0) - (b.seq || 0));
+  });
+
+  return { rawCount, points };
+}
+
+/**
  * GET /v1/vehicles/:id/history?from=&to=&points=
  * Returns peak-preserving downsampled time-series for a vehicle over a given window.
+ * Uses bounded streaming iteration to handle large windows (e.g. 17,000+ readings) fast.
  */
 function getVehicleHistoryHandler(req, res) {
   try {
@@ -348,22 +455,14 @@ function getVehicleHistoryHandler(req, res) {
       safePoints = parsedPoints;
     }
 
-    // Fast indexed query on (vehicle_id, ts)
-    const sql = `
-      SELECT seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging
-      FROM telemetry_history
-      WHERE vehicle_id = ? AND ts >= ? AND ts <= ?
-      ORDER BY ts ASC, seq ASC
-    `;
-
-    const rawRows = db.prepare(sql).all(cleanId, fromIso, toIso);
-    const downsampled = downsampleMinMax(rawRows, safePoints);
+    // Stream-assisted time-bucketed downsampling: bounded memory O(safePoints)
+    const { rawCount, points: downsampled } = streamDownsampleHistory(cleanId, fromIso, toIso, safePoints);
 
     res.json({
       vehicle_id: cleanId,
       from: fromIso,
       to: toIso,
-      raw_count: rawRows.length,
+      raw_count: rawCount,
       returned_count: downsampled.length,
       points: downsampled
     });
@@ -533,6 +632,7 @@ function ackAlertHandler(req, res) {
 
 module.exports = {
   downsampleMinMax,
+  streamDownsampleHistory,
   getVehiclesHandler,
   getVehicleHistoryHandler,
   getFleetSummaryHandler,

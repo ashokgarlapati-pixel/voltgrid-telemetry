@@ -207,8 +207,104 @@ function readinessHandler(req, res) {
 }
 
 /**
+ * Formats process-local metrics into standard Prometheus text exposition format
+ * (text/plain; version=0.0.4; charset=utf-8) with # HELP and # TYPE annotations.
+ */
+function formatPrometheusMetrics(metrics) {
+  const lines = [];
+
+  // Uptime
+  lines.push('# HELP voltgrid_uptime_seconds Total service uptime in seconds.');
+  lines.push('# TYPE voltgrid_uptime_seconds gauge');
+  lines.push(`voltgrid_uptime_seconds ${metrics.process.uptime_sec}`);
+
+  // Memory usage
+  lines.push('# HELP voltgrid_memory_usage_mb Process heap memory usage in megabytes.');
+  lines.push('# TYPE voltgrid_memory_usage_mb gauge');
+  lines.push(`voltgrid_memory_usage_mb ${metrics.process.memory_usage_mb}`);
+
+  // Requests total
+  lines.push('# HELP voltgrid_requests_total Total number of HTTP requests received.');
+  lines.push('# TYPE voltgrid_requests_total counter');
+  lines.push(`voltgrid_requests_total ${metrics.requests.total}`);
+
+  // Errors total
+  lines.push('# HELP voltgrid_errors_total Total number of HTTP error responses (4xx and 5xx).');
+  lines.push('# TYPE voltgrid_errors_total counter');
+  lines.push(`voltgrid_errors_total ${metrics.requests.errors}`);
+
+  // Requests by endpoint
+  lines.push('# HELP voltgrid_requests_by_endpoint_total Total HTTP requests grouped by endpoint.');
+  lines.push('# TYPE voltgrid_requests_by_endpoint_total counter');
+  for (const [route, count] of Object.entries(metrics.requests.by_endpoint || {})) {
+    const [method, ...pathParts] = route.split(' ');
+    const endpointPath = pathParts.join(' ');
+    lines.push(`voltgrid_requests_by_endpoint_total{method="${method}",endpoint="${endpointPath}"} ${count}`);
+  }
+
+  // Request duration quantiles
+  lines.push('# HELP voltgrid_request_duration_ms HTTP request latency in milliseconds.');
+  lines.push('# TYPE voltgrid_request_duration_ms summary');
+  lines.push(`voltgrid_request_duration_ms{quantile="0.5"} ${metrics.latency_ms.p50}`);
+  lines.push(`voltgrid_request_duration_ms{quantile="0.95"} ${metrics.latency_ms.p95}`);
+  lines.push(`voltgrid_request_duration_ms{quantile="0.99"} ${metrics.latency_ms.p99}`);
+
+  // Telemetry counts
+  lines.push('# HELP voltgrid_readings_accepted_total Total telemetry readings successfully accepted.');
+  lines.push('# TYPE voltgrid_readings_accepted_total counter');
+  lines.push(`voltgrid_readings_accepted_total ${metrics.telemetry.readings_accepted_total}`);
+
+  lines.push('# HELP voltgrid_readings_duplicates_total Total duplicate telemetry readings detected.');
+  lines.push('# TYPE voltgrid_readings_duplicates_total counter');
+  lines.push(`voltgrid_readings_duplicates_total ${metrics.telemetry.readings_duplicates_total}`);
+
+  lines.push('# HELP voltgrid_readings_rejected_total Total malformed telemetry readings rejected.');
+  lines.push('# TYPE voltgrid_readings_rejected_total counter');
+  lines.push(`voltgrid_readings_rejected_total ${metrics.telemetry.readings_rejected_total}`);
+
+  // Security
+  lines.push('# HELP voltgrid_auth_failures_total Total HMAC authentication failures.');
+  lines.push('# TYPE voltgrid_auth_failures_total counter');
+  lines.push(`voltgrid_auth_failures_total ${metrics.security.auth_failures_total}`);
+
+  lines.push('# HELP voltgrid_rate_limit_rejections_total Total requests rejected due to rate limiting (HTTP 429).');
+  lines.push('# TYPE voltgrid_rate_limit_rejections_total counter');
+  lines.push(`voltgrid_rate_limit_rejections_total ${metrics.security.rate_limit_rejections_total}`);
+
+  // SSE Stream
+  lines.push('# HELP voltgrid_active_sse_connections Current active Server-Sent Events subscriber connections.');
+  lines.push('# TYPE voltgrid_active_sse_connections gauge');
+  lines.push(`voltgrid_active_sse_connections ${metrics.stream.active_sse_connections}`);
+
+  // Alerts
+  lines.push('# HELP voltgrid_alerts_created_total Total alerts opened across all rules.');
+  lines.push('# TYPE voltgrid_alerts_created_total counter');
+  lines.push(`voltgrid_alerts_created_total ${metrics.alerts.created_total}`);
+
+  lines.push('# HELP voltgrid_alerts_resolved_total Total alerts resolved across all rules.');
+  lines.push('# TYPE voltgrid_alerts_resolved_total counter');
+  lines.push(`voltgrid_alerts_resolved_total ${metrics.alerts.resolved_total}`);
+
+  // Database aggregates
+  lines.push('# HELP voltgrid_database_vehicles_total Total vehicle records in database.');
+  lines.push('# TYPE voltgrid_database_vehicles_total gauge');
+  lines.push(`voltgrid_database_vehicles_total ${metrics.database.vehicles_total}`);
+
+  lines.push('# HELP voltgrid_database_history_total Total telemetry history readings in database.');
+  lines.push('# TYPE voltgrid_database_history_total gauge');
+  lines.push(`voltgrid_database_history_total ${metrics.database.history_total}`);
+
+  lines.push('# HELP voltgrid_database_active_alerts_total Current active unresolved alerts in database.');
+  lines.push('# TYPE voltgrid_database_active_alerts_total gauge');
+  lines.push(`voltgrid_database_active_alerts_total ${metrics.database.active_alerts_total}`);
+
+  return lines.join('\n') + '\n';
+}
+
+/**
  * GET /metrics
- * Returns comprehensive operational metrics (process-local).
+ * Returns comprehensive operational metrics.
+ * Supports standard Prometheus text format (text/plain) or JSON.
  */
 function getMetricsHandler(req, res) {
   try {
@@ -243,7 +339,7 @@ function getMetricsHandler(req, res) {
       activeAlertsCount = Number(countActiveAlertsStmt?.get()?.total || 0);
     } catch (_) {}
 
-    res.json({
+    const payload = {
       process: {
         uptime_sec: uptimeSec,
         memory_usage_mb: Number((process.memoryUsage().heapUsed / (1024 * 1024)).toFixed(2)),
@@ -286,7 +382,20 @@ function getMetricsHandler(req, res) {
         history_total: historyCount,
         active_alerts_total: activeAlertsCount
       }
-    });
+    };
+
+    // Standard Prometheus format content negotiation
+    const acceptHeader = req.headers.accept || '';
+    const wantsPrometheus = req.query.format === 'prometheus' || 
+                            req.query.format === 'prom' || 
+                            acceptHeader.includes('text/plain');
+
+    if (wantsPrometheus) {
+      res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+      return res.send(formatPrometheusMetrics(payload));
+    }
+
+    res.json(payload);
   } catch (err) {
     console.error('[Metrics Error]', err);
     res.status(500).json({ error: 'Failed to collect metrics' });
@@ -298,6 +407,7 @@ module.exports = {
   livenessHandler,
   readinessHandler,
   getMetricsHandler,
+  formatPrometheusMetrics,
   trackTelemetryBatch,
   trackAuthFailure,
   trackRateLimitRejection,

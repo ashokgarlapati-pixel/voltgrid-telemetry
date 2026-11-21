@@ -119,9 +119,9 @@ All requests to `POST /v1/telemetry/batch` must include HMAC-SHA256 authenticati
 #### 2. History & Peak-Preserving Downsampling (`GET /v1/vehicles/:id/history`)
 * **Time Range**: Accepts ISO-8601 timestamps `from` and `to`. Validates formats and ensures `from < to`. Defaults to preceding 24 hours.
 * **Vehicle Existence**: Returns `404 Not Found` if the requested vehicle does not exist in `vehicles` or `telemetry_history`.
-* **Downsampling Algorithm**: Divides the query window into equal buckets based on `points` parameter ($2 \le \text{points} \le 5000$, default 200). Retains the minimum and maximum values for critical physical metrics (battery temperature peaks/troughs, minimum SOC, maximum speed) within each bucket.
-* **Chronological Guarantees**: Always retains the initial and terminal points of the range. Returns points sorted in strict chronological order.
-* **High Performance**: Evaluated against 17,280 readings (24 hours of 5-second telemetry) in under 150 ms (sub-second target).
+* **Streaming Time-Bucketed Peak/Trough Algorithm**: Divides the temporal query window $[T_{\text{from}}, T_{\text{to}}]$ into equal time buckets based on `points` parameter ($2 \le \text{points} \le 5000$, default 200). Streams rows directly from SQLite using statement iterators (`stmt.iterate()`) with bounded $O(\text{points})$ memory, never buffering full matching datasets into application memory. Within each bucket, captures critical physical operational extremes: battery temperature peaks and troughs, minimum state of charge (SoC), and maximum vehicle speed. This is a domain-specific physical extreme downsampling algorithm (rather than general-purpose visual LTTB), ensuring critical battery overheating spikes and thermal drops are never smoothed away or missed.
+* **Chronological Guarantees**: Retains the boundary readings (initial and terminal points) and returns all points sorted in strict chronological order (`ts ASC, seq ASC`).
+* **Empirical 17,280-Reading Benchmark**: Benchmarked against a full 24-hour window (17,280 readings @ 5-second intervals) downsampling to 200 points (`npm run benchmark:history`), achieving a p50 latency of **46.44 ms** and p95 of **55.86 ms** (comfortably below the 150 ms SLA target) while strictly preserving injected thermal peaks (74.5°C) and troughs (14.2°C).
 
 #### 3. Fleet Aggregation SLA (`GET /v1/fleet/summary`)
 * **High-Speed Summary**: Aggregates fleet counts by status (`online`, `offline`, `maintenance`), fleet average SOC (`avg_soc_pct`), observed sequence completeness (`data_completeness_pct`), and open/acknowledged alerts grouped by rule.
@@ -536,7 +536,7 @@ npm run benchmark:5m
 * **Readiness Probe (`GET /health/ready`)**: Actively tests SQLite connectivity via a lightweight `SELECT 1` probe. Returns `200 OK` (`{"status":"ready","database":"connected"}`) when ready, or `503 Service Unavailable` if database I/O fails.
 
 ### 4. Process-Local Metrics (`GET /metrics`)
-Returns process health, request counts, error rates, latency percentiles, domain counters, and live SQLite row aggregates:
+Supports both standard **Prometheus text exposition format** (`text/plain; version=0.0.4; charset=utf-8`) with `# HELP` and `# TYPE` annotations (when requested via `Accept: text/plain` or `?format=prometheus`), and structured JSON format (default):
 * `process`: uptime, heap memory usage, Node version, scope.
 * `requests`: total requests, 5xx errors, status code breakdown, grouped endpoint counts.
 * `latency_ms`: min, avg, p50, p95, p99, and max.
