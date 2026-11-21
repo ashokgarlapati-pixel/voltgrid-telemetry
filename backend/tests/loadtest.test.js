@@ -13,6 +13,7 @@ describe('Repeatable Load Test Verification Suite', () => {
 
     const env = {
       ...process.env,
+      NODE_ENV: 'test',
       DB_PATH: testDbPath,
       PORT: '0',
       DURATION_SEC: '1',

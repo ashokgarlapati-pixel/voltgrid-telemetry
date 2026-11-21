@@ -14,6 +14,7 @@ describe('Fleet Summary 5M Performance Benchmark Test Suite', () => {
 
     const env = {
       ...process.env,
+      NODE_ENV: 'test',
       BENCH_DB_PATH: testDbPath,
       PORT: '0',
       TARGET_READINGS: '10000',
@@ -56,6 +57,7 @@ describe('Fleet Summary 5M Performance Benchmark Test Suite', () => {
 
     const env = {
       ...process.env,
+      NODE_ENV: 'test',
       BENCH_DB_PATH: testDbPath,
       PORT: '0',
       TARGET_READINGS: '5000',

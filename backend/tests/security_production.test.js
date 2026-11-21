@@ -38,15 +38,140 @@ describe('Part A2 / Issue 15: Production & Staging Credential Security Tests', (
       assert.strictEqual(resTest.isProduction, false);
 
       const devRow = db.prepare('SELECT * FROM api_keys WHERE api_key = ?').get(DEV_API_KEY);
-      assert.ok(devRow, 'Development key must exist in non-production');
+      assert.ok(devRow, 'Development key must exist in test environment');
       assert.strictEqual(devRow.secret, DEV_API_SECRET);
 
       const resDev = validateAndInitSecurityCredentials({ NODE_ENV: 'development' });
       assert.strictEqual(resDev.isProduction, false);
+      const devRow2 = db.prepare('SELECT * FROM api_keys WHERE api_key = ?').get(DEV_API_KEY);
+      assert.ok(devRow2, 'Development key must exist in development environment');
+    });
 
-      // Unset/empty NODE_ENV defaults safely to local development workflow
-      const resUnset = validateAndInitSecurityCredentials({});
-      assert.strictEqual(resUnset.isProduction, false);
+    test('Unset NODE_ENV is treated as unsupported environment and rejects missing credentials', () => {
+      assert.throws(
+        () => {
+          validateAndInitSecurityCredentials({});
+        },
+        (err) => {
+          assert.match(err.message, /Startup rejected in environment "unset": No valid HMAC credentials configured/);
+          return true;
+        }
+      );
+
+      assert.throws(
+        () => {
+          validateAndInitSecurityCredentials({ NODE_ENV: '' });
+        },
+        (err) => {
+          assert.match(err.message, /Startup rejected in environment "unset": No valid HMAC credentials configured/);
+          return true;
+        }
+      );
+
+      const devRow = db.prepare('SELECT * FROM api_keys WHERE api_key = ?').get(DEV_API_KEY);
+      assert.strictEqual(devRow, undefined, 'Development key must be purged when NODE_ENV is unset without opt-in');
+    });
+
+    test('Unset NODE_ENV rejects default development credentials', () => {
+      assert.throws(
+        () => {
+          validateAndInitSecurityCredentials({
+            API_KEY: 'voltgrid-dev-key',
+            API_SECRET: crypto.randomBytes(32).toString('hex')
+          });
+        },
+        (err) => {
+          assert.match(err.message, /Cannot use development key \("voltgrid-dev-key"\)/);
+          assert.match(err.message, /environment "unset"/);
+          return true;
+        }
+      );
+
+      assert.throws(
+        () => {
+          validateAndInitSecurityCredentials({
+            API_KEY: 'unset-custom-key',
+            API_SECRET: 'voltgrid-dev-secret'
+          });
+        },
+        (err) => {
+          assert.match(err.message, /Cannot use default development secret \("voltgrid-dev-secret"\)/);
+          return true;
+        }
+      );
+    });
+
+    test('Unset NODE_ENV permits development credentials ONLY with explicit local opt-in flag', () => {
+      const resOptIn1 = validateAndInitSecurityCredentials({ ALLOW_DEV_CREDENTIALS: 'true' });
+      assert.strictEqual(resOptIn1.isProduction, false);
+      const devRow1 = db.prepare('SELECT * FROM api_keys WHERE api_key = ?').get(DEV_API_KEY);
+      assert.ok(devRow1, 'Development key must exist when ALLOW_DEV_CREDENTIALS=true');
+
+      // Purge to test secondary flag
+      db.prepare('DELETE FROM api_keys WHERE api_key = ?').run(DEV_API_KEY);
+
+      const resOptIn2 = validateAndInitSecurityCredentials({ VOLTGRID_ALLOW_DEV_CREDENTIALS: 'true' });
+      assert.strictEqual(resOptIn2.isProduction, false);
+      const devRow2 = db.prepare('SELECT * FROM api_keys WHERE api_key = ?').get(DEV_API_KEY);
+      assert.ok(devRow2, 'Development key must exist when VOLTGRID_ALLOW_DEV_CREDENTIALS=true');
+    });
+
+    test('Local opt-in flag CANNOT override production, staging, or deployment environments', () => {
+      assert.throws(
+        () => {
+          validateAndInitSecurityCredentials({
+            NODE_ENV: 'production',
+            ALLOW_DEV_CREDENTIALS: 'true'
+          });
+        },
+        (err) => {
+          assert.match(err.message, /Startup rejected in environment "production": No valid HMAC credentials configured/);
+          return true;
+        }
+      );
+
+      assert.throws(
+        () => {
+          validateAndInitSecurityCredentials({
+            NODE_ENV: 'production',
+            ALLOW_DEV_CREDENTIALS: 'true',
+            API_KEY: 'voltgrid-dev-key',
+            API_SECRET: crypto.randomBytes(32).toString('hex')
+          });
+        },
+        (err) => {
+          assert.match(err.message, /Cannot use development key \("voltgrid-dev-key"\)/);
+          return true;
+        }
+      );
+
+      assert.throws(
+        () => {
+          validateAndInitSecurityCredentials({
+            NODE_ENV: 'staging',
+            ALLOW_DEV_CREDENTIALS: 'true'
+          });
+        },
+        (err) => {
+          assert.match(err.message, /Startup rejected in environment "staging": No valid HMAC credentials configured/);
+          return true;
+        }
+      );
+
+      assert.throws(
+        () => {
+          validateAndInitSecurityCredentials({
+            NODE_ENV: 'staging',
+            VOLTGRID_ALLOW_DEV_CREDENTIALS: 'true',
+            API_KEY: 'staging-app-key',
+            API_SECRET: 'voltgrid-dev-secret'
+          });
+        },
+        (err) => {
+          assert.match(err.message, /Cannot use default development secret/);
+          return true;
+        }
+      );
     });
 
     test('Production environment rejects missing credentials and purges dev defaults', () => {
@@ -160,7 +285,7 @@ describe('Part A2 / Issue 15: Production & Staging Credential Security Tests', (
     });
   });
 
-  describe('2. Secret Strength & Entropy Validation', () => {
+  describe('2. Secret Strength & Character-Diversity Heuristic Validation', () => {
     test('Rejects secrets shorter than 16 characters (structural baseline failure)', () => {
       assert.throws(
         () => {
@@ -168,7 +293,7 @@ describe('Part A2 / Issue 15: Production & Staging Credential Security Tests', (
         },
         (err) => {
           assert.match(err.message, /Minimum length of 16 characters required/);
-          assert.match(err.message, /Minimum length is a necessary structural baseline, not a guarantee of entropy/);
+          assert.match(err.message, /Minimum length is a structural baseline, not proof of cryptographic strength/);
           // Crucial: verify raw secret is not leaked in the error
           assert.strictEqual(err.message.includes('short123456789'), false);
           return true;
@@ -176,14 +301,14 @@ describe('Part A2 / Issue 15: Production & Staging Credential Security Tests', (
       );
     });
 
-    test('Rejects 16+ character secrets with low character diversity / low entropy (e.g. repetitive patterns)', () => {
+    test('Rejects 16+ character secrets with low character diversity (character-diversity heuristic)', () => {
       // 16 characters but only 1 unique character
       assert.throws(
         () => {
           validateSecretStrength('test-key', 'aaaaaaaaaaaaaaaa', 'production');
         },
         (err) => {
-          assert.match(err.message, /Insufficient character diversity and entropy \(1 unique characters\)/);
+          assert.match(err.message, /Insufficient character diversity \(1 unique characters; minimum 8 required\)/);
           assert.strictEqual(err.message.includes('aaaaaaaaaaaaaaaa'), false);
           return true;
         }
@@ -195,7 +320,7 @@ describe('Part A2 / Issue 15: Production & Staging Credential Security Tests', (
           validateSecretStrength('test-key', 'abababababababab', 'production');
         },
         (err) => {
-          assert.match(err.message, /Insufficient character diversity and entropy \(2 unique characters\)/);
+          assert.match(err.message, /Insufficient character diversity \(2 unique characters; minimum 8 required\)/);
           assert.strictEqual(err.message.includes('abababababababab'), false);
           return true;
         }
@@ -537,6 +662,107 @@ describe('Part A2 / Issue 15: Production & Staging Credential Security Tests', (
 
       assert.notStrictEqual(exitResult.code, 0, 'Unknown environment process without credentials must fail startup');
       assert.match(exitResult.stderr, /Startup rejected in environment "unknown_cloud_region": No valid HMAC credentials configured/);
+    });
+
+    test('Server process with unset NODE_ENV fails startup when credentials are not configured', async () => {
+      const childEnv = {
+        ...process.env,
+        PORT: '0',
+        DB_PATH: isolateDbPath,
+        API_KEY: '',
+        API_SECRET: '',
+        VOLTGRID_API_KEYS: ''
+      };
+      delete childEnv.NODE_ENV;
+      delete childEnv.ALLOW_DEV_CREDENTIALS;
+      delete childEnv.VOLTGRID_ALLOW_DEV_CREDENTIALS;
+
+      const exitResult = await new Promise((resolve) => {
+        const proc = spawn(process.execPath, [path.join(__dirname, '../src/server.js')], {
+          env: childEnv,
+          stdio: ['ignore', 'pipe', 'pipe']
+        });
+
+        let stderr = '';
+        proc.stderr.on('data', chunk => { stderr += chunk.toString(); });
+        proc.on('exit', (code, signal) => {
+          resolve({ code, signal, stderr });
+        });
+      });
+
+      assert.notStrictEqual(exitResult.code, 0, 'Unset NODE_ENV process without credentials must fail startup');
+      assert.match(exitResult.stderr, /Startup rejected in environment "unset": No valid HMAC credentials configured/);
+    });
+
+    test('Server process with unset NODE_ENV and ALLOW_DEV_CREDENTIALS=true boots successfully with dev key', async () => {
+      const childEnv = {
+        ...process.env,
+        PORT: '0',
+        DB_PATH: isolateDbPath,
+        ALLOW_DEV_CREDENTIALS: 'true'
+      };
+      delete childEnv.NODE_ENV;
+
+      let serverProc;
+      let serverPort;
+
+      const bootResult = await new Promise((resolve, reject) => {
+        const proc = spawn(process.execPath, [path.join(__dirname, '../src/server.js')], {
+          env: childEnv,
+          stdio: ['ignore', 'pipe', 'pipe']
+        });
+
+        serverProc = proc;
+        let stdout = '';
+        let stderr = '';
+
+        proc.stdout.on('data', chunk => {
+          stdout += chunk.toString();
+          const match = stdout.match(/\[VoltGrid API\] Listening on port (\d+)/);
+          if (match) {
+            serverPort = parseInt(match[1], 10);
+            resolve({ port: serverPort, stdout });
+          }
+        });
+
+        proc.stderr.on('data', chunk => { stderr += chunk.toString(); });
+
+        proc.on('exit', (code, signal) => {
+          if (!serverPort) {
+            reject(new Error(`Server exited prematurely code=${code} signal=${signal}\nStderr: ${stderr}\nStdout: ${stdout}`));
+          }
+        });
+      });
+
+      assert.ok(bootResult.port > 0, 'Server must start when ALLOW_DEV_CREDENTIALS=true is set with unset NODE_ENV');
+      serverProc.kill('SIGTERM');
+    });
+
+    test('Server process with NODE_ENV=production and ALLOW_DEV_CREDENTIALS=true still fails startup', async () => {
+      const exitResult = await new Promise((resolve) => {
+        const proc = spawn(process.execPath, [path.join(__dirname, '../src/server.js')], {
+          env: {
+            ...process.env,
+            PORT: '0',
+            DB_PATH: isolateDbPath,
+            NODE_ENV: 'production',
+            ALLOW_DEV_CREDENTIALS: 'true',
+            API_KEY: '',
+            API_SECRET: '',
+            VOLTGRID_API_KEYS: ''
+          },
+          stdio: ['ignore', 'pipe', 'pipe']
+        });
+
+        let stderr = '';
+        proc.stderr.on('data', chunk => { stderr += chunk.toString(); });
+        proc.on('exit', (code, signal) => {
+          resolve({ code, signal, stderr });
+        });
+      });
+
+      assert.notStrictEqual(exitResult.code, 0, 'Production process must fail startup even if ALLOW_DEV_CREDENTIALS=true');
+      assert.match(exitResult.stderr, /Startup rejected in environment "production": No valid HMAC credentials configured/);
     });
 
     test('Server process in staging boots with secure credentials and rejects dev credentials at runtime', async () => {

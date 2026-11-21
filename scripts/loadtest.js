@@ -17,6 +17,8 @@
 const crypto = require('crypto');
 const http = require('http');
 
+process.env.NODE_ENV = process.env.NODE_ENV || 'test';
+
 // Configurable Parameters
 const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
 const VUS = parseInt(process.env.VUS || '10', 10);

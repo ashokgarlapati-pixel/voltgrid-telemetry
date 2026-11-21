@@ -9,26 +9,53 @@ const DEV_API_KEY = 'voltgrid-dev-key';
 const DEV_API_SECRET = 'voltgrid-dev-secret';
 
 const DEV_PERMITTED_ENVIRONMENTS = new Set(['development', 'test']);
+const DEPLOYMENT_ENVIRONMENTS = new Set(['production', 'staging', 'qa', 'uat', 'prod']);
 
 /**
  * Checks whether the current execution environment explicitly permits development credentials.
- * Only 'development' and 'test' (or unset in local developer workflows) are permitted.
- * All deployment environments (staging, production, qa, uat, etc.) or unknown environments
- * strictly require explicitly configured credentials.
+ * - Permit development credentials ONLY when NODE_ENV is explicitly 'development' or 'test'.
+ * - An unset or empty NODE_ENV is treated as an unsupported/deployment environment by default.
+ * - Local development without setting NODE_ENV is supported ONLY via an explicit opt-in flag:
+ *   ALLOW_DEV_CREDENTIALS=true or VOLTGRID_ALLOW_DEV_CREDENTIALS=true.
+ * - Crucial: This opt-in flag CANNOT override production, staging, or any other deployment environment.
  */
 function isDevelopmentPermitted(env = process.env) {
-  const nodeEnv = env.NODE_ENV !== undefined ? String(env.NODE_ENV).trim().toLowerCase() : 'development';
-  return DEV_PERMITTED_ENVIRONMENTS.has(nodeEnv);
+  const rawNodeEnv = env.NODE_ENV !== undefined ? String(env.NODE_ENV).trim().toLowerCase() : '';
+
+  // 1. Explicit deployment environments STRICTLY reject development credentials, ignoring any opt-in flag
+  if (DEPLOYMENT_ENVIRONMENTS.has(rawNodeEnv)) {
+    return false;
+  }
+
+  // 2. Explicit development or test environments permit development credentials
+  if (DEV_PERMITTED_ENVIRONMENTS.has(rawNodeEnv)) {
+    return true;
+  }
+
+  // 3. When NODE_ENV is unset or empty, require explicit local opt-in flag
+  if (!rawNodeEnv) {
+    const optIn = String(env.ALLOW_DEV_CREDENTIALS || env.VOLTGRID_ALLOW_DEV_CREDENTIALS || '').trim().toLowerCase();
+    if (optIn === 'true' || optIn === '1') {
+      return true;
+    }
+    // Unset NODE_ENV without opt-in is treated as an unsupported/deployment environment
+    return false;
+  }
+
+  // 4. Any other unknown or unsupported NODE_ENV strictly rejects development credentials
+  return false;
 }
 
 /**
  * Validates cryptographic secret strength for deployment environments.
- * - Distinguishes minimum structural length from actual cryptographic entropy (unpredictability).
- * - Enforces minimum length baseline (>= 16 characters).
- * - Enforces character diversity / entropy heuristic (>= 8 unique characters) to reject repetitive patterns,
- *   while cleanly accepting legitimate cryptographic formats (hex tokens, base64 strings, alphanumeric hashes).
+ * - Enforces a structural minimum length baseline (>= 16 characters). Minimum length is a necessary structural baseline,
+ *   not proof of cryptographic strength.
+ * - Enforces a character-diversity heuristic (>= 8 unique characters) to reject trivial repetitive or low-variety strings
+ *   (e.g., 'aaaaaaaaaaaaaaaa', 'abababababababab'). This heuristic filters out low-diversity sequences without claiming
+ *   to mathematically measure cryptographic entropy.
+ * - Securely generated random hexadecimal (e.g., 32-byte hex) and base64 tokens are fully supported.
  * - Rejects known default development secrets.
- * - NEVER prints or logs raw secrets in exception messages, logs, or metrics.
+ * - NEVER exposes or prints actual secrets in exception messages, logs, or metrics.
  */
 function validateSecretStrength(keyId, secret, envName) {
   if (typeof secret !== 'string') {
@@ -44,16 +71,17 @@ function validateSecretStrength(keyId, secret, envName) {
   if (trimmed.length < 16) {
     throw new Error(
       `[Security Configuration Error] Insecure secret for key "${keyId}": Minimum length of 16 characters required (received ${trimmed.length}). ` +
-      `Minimum length is a necessary structural baseline, not a guarantee of entropy.`
+      `Minimum length is a structural baseline, not proof of cryptographic strength.`
     );
   }
 
-  // Entropy & unpredictability check: reject repetitive or low-entropy patterns
+  // Character-diversity heuristic: reject trivial repetitive or low-variety sequences
+  // Note: This heuristic filters out low-diversity strings; it does not claim to mathematically measure entropy.
   const uniqueChars = new Set(trimmed).size;
   if (uniqueChars < 8) {
     throw new Error(
-      `[Security Configuration Error] Insecure secret for key "${keyId}": Insufficient character diversity and entropy (${uniqueChars} unique characters). ` +
-      `Secrets must be cryptographically generated or sufficiently unpredictable.`
+      `[Security Configuration Error] Insecure secret for key "${keyId}": Insufficient character diversity (${uniqueChars} unique characters; minimum 8 required). ` +
+      `Production secrets must be explicitly configured, sufficiently unpredictable, and preferably cryptographically generated.`
     );
   }
 
@@ -293,7 +321,9 @@ function rateLimiter(req, res, next) {
  * Never logs or exposes raw secrets in exceptions, logs, or metrics.
  */
 function validateAndInitSecurityCredentials(env = process.env) {
-  const currentEnv = env.NODE_ENV !== undefined ? String(env.NODE_ENV).trim().toLowerCase() : 'development';
+  const currentEnv = (env.NODE_ENV !== undefined && String(env.NODE_ENV).trim().length > 0)
+    ? String(env.NODE_ENV).trim().toLowerCase()
+    : 'unset';
   const isDevAllowed = isDevelopmentPermitted(env);
 
   if (isDevAllowed) {

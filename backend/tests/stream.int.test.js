@@ -8,6 +8,7 @@ const crypto = require('node:crypto');
 
 // Isolated SQLite database for Part A5 Stream integration tests
 const testDbPath = path.join(os.tmpdir(), `voltgrid-stream-int-${crypto.randomUUID()}.db`);
+process.env.NODE_ENV = process.env.NODE_ENV || 'test';
 process.env.DB_PATH = testDbPath;
 process.env.PORT = '0';
 process.env.STREAM_COALESCE_INTERVAL_MS = '500'; // 500ms for fast test runs

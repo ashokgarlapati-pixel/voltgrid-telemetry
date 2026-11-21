@@ -7,6 +7,7 @@ const crypto = require('node:crypto');
 
 // Use isolated temporary database for alert engine unit tests
 const testDbPath = path.join(os.tmpdir(), `voltgrid-unit-alerts-${crypto.randomUUID()}.db`);
+process.env.NODE_ENV = process.env.NODE_ENV || 'test';
 process.env.DB_PATH = testDbPath;
 
 const db = require('../src/db');

@@ -7,6 +7,7 @@ const crypto = require('node:crypto');
 
 // Use isolated temporary SQLite database and ephemeral port for A4 integration tests
 const testDbPath = path.join(os.tmpdir(), `voltgrid-queries-int-${crypto.randomUUID()}.db`);
+process.env.NODE_ENV = process.env.NODE_ENV || 'test';
 process.env.DB_PATH = testDbPath;
 process.env.PORT = '0';
 

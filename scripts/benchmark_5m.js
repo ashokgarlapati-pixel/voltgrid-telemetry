@@ -21,6 +21,8 @@ const path = require('path');
 const http = require('http');
 const os = require('os');
 
+process.env.NODE_ENV = process.env.NODE_ENV || 'test';
+
 // Parse CLI flags and environment variables
 const args = process.argv.slice(2);
 function getArg(prefix, defaultVal) {
