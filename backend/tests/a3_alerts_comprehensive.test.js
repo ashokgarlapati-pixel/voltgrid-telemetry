@@ -578,4 +578,93 @@ describe('A3 Comprehensive Alert Engine Edge Cases & Lifecycle Tests', () => {
       assert.strictEqual(alerts[0].version, 2);
     });
   });
+
+  describe('Edge Cases: Multi-Episode Overheat and Rapid Discharge Transitions', () => {
+    test('Two complete overheat episodes with intervening hysteresis maintain exact lifecycle', async () => {
+      const vid = `VG-OVERHEAT-MULTI-${Date.now()}`;
+      const now = Date.now();
+
+      // Episode 1: Open alert (3 readings > 55°C)
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 1, ts: new Date(now - 90000).toISOString(), soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 85000).toISOString(), soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: new Date(now - 80000).toISOString(), soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.2, charging: false, fault_codes: [] }
+      ]);
+      const ep1Open = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat' AND status = 'open'").get(vid);
+      assert.ok(ep1Open, 'Episode 1 must open alert');
+      assert.strictEqual(ep1Open.version, 1);
+
+      // Episode 1: Resolve alert (3 readings <= 50°C)
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 4, ts: new Date(now - 75000).toISOString(), soc_pct: 80, battery_temp_c: 49.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.3, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 5, ts: new Date(now - 70000).toISOString(), soc_pct: 80, battery_temp_c: 48.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.4, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 6, ts: new Date(now - 65000).toISOString(), soc_pct: 80, battery_temp_c: 47.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.5, charging: false, fault_codes: [] }
+      ]);
+      const ep1Resolved = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat' AND status = 'resolved'").all(vid);
+      assert.strictEqual(ep1Resolved.length, 1);
+      assert.strictEqual(ep1Resolved[0].version, 2);
+
+      // Intervening readings in hysteresis zone (52°C, 53°C) must not trigger new alert
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 7, ts: new Date(now - 60000).toISOString(), soc_pct: 80, battery_temp_c: 52.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.6, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 8, ts: new Date(now - 55000).toISOString(), soc_pct: 80, battery_temp_c: 53.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.7, charging: false, fault_codes: [] }
+      ]);
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").get(vid).total, 1);
+
+      // Episode 2: Open second alert (3 readings > 55°C)
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 9, ts: new Date(now - 50000).toISOString(), soc_pct: 80, battery_temp_c: 56.5, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.8, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 10, ts: new Date(now - 45000).toISOString(), soc_pct: 80, battery_temp_c: 57.5, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 10.9, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 11, ts: new Date(now - 40000).toISOString(), soc_pct: 80, battery_temp_c: 58.5, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 11.0, charging: false, fault_codes: [] }
+      ]);
+      const alertsMid = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat' ORDER BY id ASC").all(vid);
+      assert.strictEqual(alertsMid.length, 2, 'Must have 2 distinct alerts');
+      assert.strictEqual(alertsMid[0].status, 'resolved');
+      assert.strictEqual(alertsMid[1].status, 'open');
+
+      // Episode 2: Resolve second alert (3 readings <= 50°C)
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 12, ts: new Date(now - 35000).toISOString(), soc_pct: 80, battery_temp_c: 49.5, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 11.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 13, ts: new Date(now - 30000).toISOString(), soc_pct: 80, battery_temp_c: 48.5, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 11.2, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 14, ts: new Date(now - 25000).toISOString(), soc_pct: 80, battery_temp_c: 47.5, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 11.3, charging: false, fault_codes: [] }
+      ]);
+      const alertsFinal = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat' ORDER BY id ASC").all(vid);
+      assert.strictEqual(alertsFinal.length, 2);
+      assert.strictEqual(alertsFinal[0].status, 'resolved');
+      assert.strictEqual(alertsFinal[1].status, 'resolved');
+      assert.notStrictEqual(alertsFinal[0].id, alertsFinal[1].id);
+    });
+
+    test('Rapid discharge: boundary drop (8.0% vs 8.1%) and resolution on charging transition', async () => {
+      const vid = `VG-RAPID-DISCHARGE-${Date.now()}`;
+      const now = Date.now();
+
+      // Reading 1: Baseline 80.0% SoC
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 1, ts: new Date(now - 60000).toISOString(), soc_pct: 80.0, battery_temp_c: 30, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] }
+      ]);
+
+      // Reading 2: Exactly 8.0% drop (SoC = 72.0%) -> Must NOT trigger (strictly >8.0% required)
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 40000).toISOString(), soc_pct: 72.0, battery_temp_c: 30, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 10.5, charging: false, fault_codes: [] }
+      ]);
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ? AND rule = 'rapid_discharge'").get(vid).total, 0);
+
+      // Reading 3: 8.1% drop total (SoC = 71.9%) -> Triggers rapid discharge alert
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 3, ts: new Date(now - 20000).toISOString(), soc_pct: 71.9, battery_temp_c: 30, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 10.7, charging: false, fault_codes: [] }
+      ]);
+      const alertOpen = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'rapid_discharge'").get(vid);
+      assert.ok(alertOpen, 'Rapid discharge alert must be triggered on >8.0% drop');
+      assert.strictEqual(alertOpen.status, 'open');
+
+      // Reading 4: Vehicle plugs in to charge (charging = true) -> Alert resolves
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 4, ts: new Date(now - 5000).toISOString(), soc_pct: 72.5, battery_temp_c: 30, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 10.7, charging: true, fault_codes: [] }
+      ]);
+      const alertResolved = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'rapid_discharge'").get(vid);
+      assert.strictEqual(alertResolved.status, 'resolved', 'Charging vehicle must resolve rapid discharge alert');
+      assert.strictEqual(alertResolved.version, 2);
+    });
+  });
 });

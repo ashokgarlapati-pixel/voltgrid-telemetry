@@ -800,4 +800,58 @@ describe('Part A5: Live Stream (SSE) Integration & Performance Tests', () => {
       replayClient.close();
     });
   });
+
+  describe('Edge Cases: Gap Detection on Old Event IDs & Query Param Resumption', () => {
+    test('Old Last-Event-ID older than minimum retained history emits gap_detected comment', async () => {
+      // Clean old stream events and seed with high IDs (e.g. 500+)
+      db.prepare('DELETE FROM stream_events').run();
+      db.prepare(`
+        INSERT INTO stream_events (id, event_type, data, created_at)
+        VALUES (500, 'vehicle_update', '{"vehicle_id":"VG-GAP-01"}', datetime('now')),
+               (501, 'vehicle_update', '{"vehicle_id":"VG-GAP-02"}', datetime('now'))
+      `).run();
+
+      const minRow = db.prepare('SELECT MIN(id) AS min_id FROM stream_events').get();
+      assert.strictEqual(minRow.min_id, 500);
+
+      // Connect with an old Last-Event-ID (e.g. 50 < 500)
+      const client = createSseClient(`${baseUrl}/v1/stream?api_key=${API_KEY}`, {
+        headers: { 'Last-Event-ID': '50' }
+      });
+      await client.ready;
+      await new Promise(r => setTimeout(r, 100));
+
+      const rawChunks = client.getRawChunks().join('');
+      assert.ok(rawChunks.includes(': gap_detected: requested Last-Event-ID (50) is older than retained history (500)'), 'Server must emit gap_detected comment');
+
+      // Client must still receive all available retained events
+      const events = client.getEvents().filter(e => e.id !== null);
+      assert.strictEqual(events.length, 2);
+      assert.strictEqual(events[0].id, 500);
+      assert.strictEqual(events[1].id, 501);
+
+      client.close();
+    });
+
+    test('Resumption via ?lastEventId= query parameter replays historical events', async () => {
+      // Seed two stream events
+      const res1 = recordAndBroadcastEvent('vehicle_update', { vehicle_id: 'VG-QP-1', speed_kmh: 30 });
+      const res2 = recordAndBroadcastEvent('vehicle_update', { vehicle_id: 'VG-QP-2', speed_kmh: 40 });
+
+      assert.ok(res1 && res1.id);
+      assert.ok(res2 && res2.id);
+
+      // Connect with ?lastEventId= pointing to res1.id
+      const client = createSseClient(`${baseUrl}/v1/stream?api_key=${API_KEY}&lastEventId=${res1.id}`);
+      await client.ready;
+      await new Promise(r => setTimeout(r, 100));
+
+      const events = client.getEvents().filter(e => e.id !== null);
+      const replayed = events.find(e => e.id === res2.id);
+      assert.ok(replayed, `Event ${res2.id} must be replayed when resuming via ?lastEventId`);
+      assert.strictEqual(replayed.data.vehicle_id, 'VG-QP-2');
+
+      client.close();
+    });
+  });
 });

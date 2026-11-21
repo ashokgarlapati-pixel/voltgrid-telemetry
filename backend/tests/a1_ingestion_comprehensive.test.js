@@ -420,4 +420,85 @@ describe('A1 Comprehensive Telemetry Ingestion Tests', () => {
       assert.strictEqual(vAfter.soc_pct, 85.0);
     });
   });
+
+  describe('Edge Cases: Payload Formats and Sequence Completeness', () => {
+    test('Wrapped payload { readings: [...] } is accepted and ingested', async () => {
+      const vid = `VG-WRAP-${Date.now()}`;
+      const payload = {
+        readings: [
+          createValidReading(vid, 1),
+          createValidReading(vid, 2)
+        ]
+      };
+
+      const res = await postSignedBatch(payload);
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual(res.body.accepted, 2);
+      assert.strictEqual(res.body.rejected, 0);
+
+      const rows = db.prepare('SELECT * FROM telemetry_history WHERE vehicle_id = ?').all(vid);
+      assert.strictEqual(rows.length, 2);
+    });
+
+    test('Invalid payload types (string, number, bad object) return HTTP 400', async () => {
+      // 1. Object with incorrect key
+      const resObj = await postSignedBatch({ wrong_key: [createValidReading('VG-ERR', 1)] });
+      assert.strictEqual(resObj.status, 400);
+      assert.match(resObj.body.error, /Invalid payload: expected an array of readings or { readings: \[\.\.\.\] }/);
+
+      // 2. Object with non-array readings property
+      const resNonArray = await postSignedBatch({ readings: 'not-an-array' });
+      assert.strictEqual(resNonArray.status, 400);
+      assert.match(resNonArray.body.error, /Invalid payload: expected an array of readings or { readings: \[\.\.\.\] }/);
+
+      // 3. Raw malformed JSON / non-object payload
+      const resStr = await postSignedBatch('not-a-valid-array');
+      assert.strictEqual(resStr.status, 400);
+      assert.ok(resStr.body.error, 'Must report client error for invalid payload string');
+    });
+
+    test('Batch where 100% of readings are invalid returns HTTP 207 Multi-Status with 0 accepted', async () => {
+      const invalidBatch = [
+        { ...createValidReading('VG-ALL-INV-1', 1), soc_pct: 150.0 }, // invalid SoC > 100
+        { ...createValidReading('VG-ALL-INV-2', 2), battery_temp_c: 'too-hot' }, // non-numeric temp
+        { ...createValidReading('VG-ALL-INV-3', 3), lat: 95.0 } // invalid lat > 90
+      ];
+
+      const res = await postSignedBatch(invalidBatch);
+      assert.strictEqual(res.status, 207);
+      assert.strictEqual(res.body.accepted, 0);
+      assert.strictEqual(res.body.rejected, 3);
+      assert.strictEqual(res.body.results.length, 3);
+      assert.ok(res.body.results.every(r => r.status === 'rejected'));
+    });
+
+    test('GET /v1/completeness: returns 404 for nonexistent vehicle, accurate gaps for non-contiguous sequences', async () => {
+      // 1. Nonexistent vehicle returns 404
+      const missingRes = await fetch(`${baseUrl}/v1/completeness?vehicle_id=VG-NONEXISTENT-${Date.now()}`);
+      assert.strictEqual(missingRes.status, 404);
+      const missingBody = await missingRes.json();
+      assert.match(missingBody.error, /not found/);
+
+      // 2. Ingest non-contiguous sequence [1, 3, 5]
+      const vid = `VG-GAP-TEST-${Date.now()}`;
+      await postSignedBatch([
+        createValidReading(vid, 1),
+        createValidReading(vid, 3),
+        createValidReading(vid, 5)
+      ]);
+
+      const compRes = await fetch(`${baseUrl}/v1/completeness?vehicle_id=${vid}`);
+      assert.strictEqual(compRes.status, 200);
+      const compBody = await compRes.json();
+
+      assert.strictEqual(compBody.vehicle_id, vid);
+      assert.strictEqual(compBody.min_seq, 1);
+      assert.strictEqual(compBody.max_seq, 5);
+      assert.strictEqual(compBody.received_count, 3);
+      assert.strictEqual(compBody.expected_count, 5);
+      assert.strictEqual(compBody.missing_count, 2);
+      assert.strictEqual(compBody.completeness_pct, 60.0);
+      assert.deepStrictEqual(compBody.missing_sequences, [2, 4]);
+    });
+  });
 });

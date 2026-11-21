@@ -463,4 +463,134 @@ describe('A4 Comprehensive Query API Tests', () => {
       assert.ok(data4.points.length <= 4);
     });
   });
+
+  describe('Edge Cases: Query Parameter Validation and Boundary Conditions', () => {
+    test('GET /v1/vehicles: validates limit boundaries (invalid, negative, clamped)', async () => {
+      // 1. limit=0 -> 400
+      const rZero = await fetch(`${baseUrl}/v1/vehicles?limit=0`);
+      assert.strictEqual(rZero.status, 400);
+      assert.match((await rZero.json()).error, /must be a positive integer/);
+
+      // 2. limit=-5 -> 400
+      const rNeg = await fetch(`${baseUrl}/v1/vehicles?limit=-5`);
+      assert.strictEqual(rNeg.status, 400);
+
+      // 3. limit=abc -> 400
+      const rNan = await fetch(`${baseUrl}/v1/vehicles?limit=abc`);
+      assert.strictEqual(rNan.status, 400);
+
+      // 4. limit=500 -> clamped to 200 (returns 200 OK)
+      const rClamped = await fetch(`${baseUrl}/v1/vehicles?limit=500`);
+      assert.strictEqual(rClamped.status, 200);
+      const body = await rClamped.json();
+      assert.ok(body.data.length <= 200, 'Result length must not exceed maximum limit 200');
+    });
+
+    test('GET /v1/vehicles: validates cursor boundaries (empty string, whitespace, excessive length)', async () => {
+      // 1. Empty cursor -> 400
+      const rEmpty = await fetch(`${baseUrl}/v1/vehicles?cursor=`);
+      assert.strictEqual(rEmpty.status, 400);
+      assert.match((await rEmpty.json()).error, /Invalid cursor parameter/);
+
+      // 2. Whitespace cursor -> 400
+      const rSpace = await fetch(`${baseUrl}/v1/vehicles?cursor=%20%20%20`);
+      assert.strictEqual(rSpace.status, 400);
+
+      // 3. Cursor > 128 characters -> 400
+      const longCursor = 'A'.repeat(129);
+      const rLong = await fetch(`${baseUrl}/v1/vehicles?cursor=${longCursor}`);
+      assert.strictEqual(rLong.status, 400);
+    });
+
+    test('GET /v1/vehicles: validates bounding box parameters (partial coordinates, inverted, out of bounds)', async () => {
+      // 1. Partial coordinates (min_lat and max_lat only) -> 400
+      const rPartial = await fetch(`${baseUrl}/v1/vehicles?min_lat=13.0&max_lat=13.2`);
+      assert.strictEqual(rPartial.status, 400);
+      assert.match((await rPartial.json()).error, /min_lat, max_lat, min_lng, and max_lng are all required/);
+
+      // 2. Out-of-bounds latitude -> 400
+      const rLatBounds = await fetch(`${baseUrl}/v1/vehicles?min_lat=-95&max_lat=13.2&min_lng=80.1&max_lng=80.3`);
+      assert.strictEqual(rLatBounds.status, 400);
+      assert.match((await rLatBounds.json()).error, /Latitude coordinates must be between -90 and 90/);
+
+      // 3. Out-of-bounds longitude -> 400
+      const rLngBounds = await fetch(`${baseUrl}/v1/vehicles?min_lat=13.0&max_lat=13.2&min_lng=80.1&max_lng=185`);
+      assert.strictEqual(rLngBounds.status, 400);
+      assert.match((await rLngBounds.json()).error, /Longitude coordinates must be between -180 and 180/);
+
+      // 4. Inverted coordinates min_lat > max_lat -> 400
+      const rInvertedLat = await fetch(`${baseUrl}/v1/vehicles?min_lat=14.0&max_lat=13.0&min_lng=80.1&max_lng=80.3`);
+      assert.strictEqual(rInvertedLat.status, 400);
+      assert.match((await rInvertedLat.json()).error, /min_lat cannot be greater than max_lat/);
+
+      // 5. Inverted coordinates min_lng > max_lng -> 400
+      const rInvertedLng = await fetch(`${baseUrl}/v1/vehicles?min_lat=13.0&max_lat=13.2&min_lng=80.5&max_lng=80.1`);
+      assert.strictEqual(rInvertedLng.status, 400);
+      assert.match((await rInvertedLng.json()).error, /min_lng cannot be greater than max_lng/);
+    });
+
+    test('GET /v1/vehicles/:id/history: nonexistent vehicle returns 404, single point returns 1 point, inverted dates return 400', async () => {
+      // 1. Nonexistent vehicle -> 404
+      const r404 = await fetch(`${baseUrl}/v1/vehicles/VG-DOES-NOT-EXIST-${Date.now()}/history`);
+      assert.strictEqual(r404.status, 404);
+
+      // 2. Inverted dates -> 400
+      const vid = `VG-DATES-${Date.now()}`;
+      db.prepare(`
+        INSERT INTO vehicles (vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at)
+        VALUES (?, '2026-11-20T10:00:00Z', 1, 80, 25, 0, 13.08, 80.27, 10, 0, 'online', 1, 1, 1, datetime('now'))
+      `).run(vid);
+
+      const rInv = await fetch(`${baseUrl}/v1/vehicles/${vid}/history?from=2026-11-20T12:00:00Z&to=2026-11-20T10:00:00Z`);
+      assert.strictEqual(rInv.status, 400);
+      assert.match((await rInv.json()).error, /"from" timestamp must be earlier than "to" timestamp/);
+
+      // 3. Single point vehicle -> returns 1 point
+      db.prepare(`
+        INSERT INTO telemetry_history (vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, fault_codes, received_at)
+        VALUES (?, 1, '2026-11-20T10:00:00Z', 80, 25, 0, 13.08, 80.27, 10, 0, '[]', datetime('now'))
+      `).run(vid);
+
+      const rSingle = await fetch(`${baseUrl}/v1/vehicles/${vid}/history?from=2026-11-20T09:00:00Z&to=2026-11-20T11:00:00Z`);
+      assert.strictEqual(rSingle.status, 200);
+      const dataSingle = await rSingle.json();
+      assert.strictEqual(dataSingle.returned_count, 1);
+      assert.strictEqual(dataSingle.points.length, 1);
+    });
+
+    test('POST /v1/alerts/:id/ack: validates missing alert ID and invalid version payloads', async () => {
+      // 1. Nonexistent alert ID -> 404
+      const r404 = await fetch(`${baseUrl}/v1/alerts/88888888/ack`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ version: 1 })
+      });
+      assert.strictEqual(r404.status, 404);
+      assert.match((await r404.json()).error, /not found/);
+
+      // 2. Missing version in body -> 400
+      const insert = db.prepare(`
+        INSERT INTO alerts (vehicle_id, rule, status, version, opened_at, updated_at)
+        VALUES ('VG-ACK-VALIDATION', 'overheat', 'open', 1, datetime('now'), datetime('now'))
+      `).run();
+      const aid = insert.lastInsertRowid;
+
+      const rNoVer = await fetch(`${baseUrl}/v1/alerts/${aid}/ack`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      assert.strictEqual(rNoVer.status, 400);
+      assert.match((await rNoVer.json()).error, /"version" non-negative integer is required/);
+
+      // 3. String version in body -> 400
+      const rStrVer = await fetch(`${baseUrl}/v1/alerts/${aid}/ack`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ version: "one" })
+      });
+      assert.strictEqual(rStrVer.status, 400);
+      assert.match((await rStrVer.json()).error, /"version" non-negative integer is required/);
+    });
+  });
 });

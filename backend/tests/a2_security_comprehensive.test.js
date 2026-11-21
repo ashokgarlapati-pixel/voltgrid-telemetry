@@ -262,4 +262,60 @@ describe('A2 Comprehensive Authentication and Abuse Protection Tests', () => {
     assert.strictEqual(bodyStr.includes(API_SECRET), false, 'API secret must never appear in response body');
     assert.strictEqual(bodyStr.includes('sqlite'), false, 'Internal database details must not leak');
   });
+
+  describe('Edge Cases: Malformed Signatures and Concurrent Rate Limiting', () => {
+    test('Malformed signature strings (non-hex characters, invalid lengths) return HTTP 401', async () => {
+      // 1. Signature with non-hex characters
+      const nonHexRes = await sendBatch(sampleReading, {
+        signature: 'this-is-not-a-valid-hex-signature-string-at-all-xyz!0123456789abcdef'
+      });
+      assert.strictEqual(nonHexRes.status, 401);
+      assert.match(nonHexRes.body.error, /Invalid HMAC signature/);
+
+      // 2. Truncated signature (wrong length: 16 chars instead of 64 hex chars)
+      const shortSigRes = await sendBatch(sampleReading, {
+        signature: 'deadbeef01234567'
+      });
+      assert.strictEqual(shortSigRes.status, 401);
+      assert.match(shortSigRes.body.error, /Invalid HMAC signature/);
+    });
+
+    test('Concurrent requests safely decrement token bucket without negative token balance or race conditions', async () => {
+      const concKey = `test-conc-${Date.now()}`;
+      const concSecret = 'conc-test-secret';
+      const BURST_CAPACITY = 5;
+
+      // Register key with capacity = 5, refill = 1 token/sec
+      db.prepare(`
+        INSERT INTO api_keys (api_key, secret, rate_limit_per_sec, burst_capacity)
+        VALUES (?, ?, 1, ?)
+      `).run(concKey, concSecret, BURST_CAPACITY);
+
+      db.prepare(`
+        INSERT INTO rate_limits (api_key, tokens, last_refill_ms)
+        VALUES (?, ?, ?)
+      `).run(concKey, BURST_CAPACITY, Date.now());
+
+      // Fire 15 concurrent requests
+      const promises = Array.from({ length: 15 }, (_, i) => {
+        return sendBatch([{
+          ...sampleReading[0],
+          vehicle_id: `VG-CONC-RATE-${i}`,
+          seq: 1
+        }], { apiKey: concKey, secret: concSecret });
+      });
+
+      const results = await Promise.all(promises);
+      const successes = results.filter(r => r.status === 200);
+      const rateLimited = results.filter(r => r.status === 429);
+
+      assert.strictEqual(successes.length, BURST_CAPACITY, `Exactly ${BURST_CAPACITY} requests must succeed`);
+      assert.strictEqual(rateLimited.length, 15 - BURST_CAPACITY, 'Remaining requests must be rate-limited');
+
+      // Check SQLite token balance is non-negative
+      const row = db.prepare('SELECT tokens FROM rate_limits WHERE api_key = ?').get(concKey);
+      assert.ok(row, 'Rate limit record must exist');
+      assert.ok(row.tokens >= 0, `Token balance must never be negative (actual: ${row.tokens})`);
+    });
+  });
 });
