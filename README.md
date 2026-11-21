@@ -47,11 +47,23 @@ Built with **Node.js (Express)**, **SQLite (`better-sqlite3` in WAL mode)**, and
 ## 2. Quick Start
 
 ### Start with Docker Compose
-To build and start the API in production mode:
+To build and start the API in production mode with secure credentials:
 ```bash
+# 1. Copy the environment configuration template
+cp .env.example .env
+
+# 2. Configure production credentials in .env (or export them):
+# API_KEY=voltgrid-fleet-ops
+# API_SECRET=your-secure-production-secret-min-32-chars-long
+
+# 3. Build and launch services
 docker compose up --build
 ```
-The API will automatically run database migrations and listen on `http://localhost:3000`.
+For local development or testing without custom credentials:
+```bash
+NODE_ENV=development docker compose up --build
+```
+The API will automatically run database migrations, enforce environment-specific credential safeguards, and listen on `http://localhost:3000`.
 
 ### Run the Messy Traffic Simulator
 In a separate terminal, launch the 2,000-vehicle traffic simulator:
@@ -290,6 +302,16 @@ To scale horizontally across multiple physical or virtual machines, replace the 
    * Ingest batched telemetry into ClickHouse partitioned by day for sub-second analytical aggregations and cold Parquet export to S3.
 4. **Worker Coordination & Leader Election**:
    * Coordinate background sweeps (`offlineWorker`) and retention pruning using distributed leader election (Kubernetes Leases, etcd, or Redis Redlock) so only a single active leader executes background tasks.
+
+### 6. Production Credential Safety & Rejection of Development Defaults
+* **Development Seed Isolation**: The seeded credentials (`voltgrid-dev-key` / `voltgrid-dev-secret` in migration `003_security.sql`) are strictly intended for offline unit tests and local development (`NODE_ENV !== 'production'`).
+* **Production Startup Safeguards (`validateAndInitSecurityCredentials()`)**: When `NODE_ENV=production`, the application validates required security credentials before binding ports or accepting traffic:
+  * **Explicit Configuration Required**: Production credentials must be supplied via environment variables: `API_KEY` and `API_SECRET` (or `VOLTGRID_API_KEYS` JSON array for multiple device groups).
+  * **Rejection of Unsafe Defaults**: Startup immediately throws a fatal configuration error if `API_KEY` is `'voltgrid-dev-key'`, if `API_SECRET` is `'voltgrid-dev-secret'`, or if the secret is shorter than 16 characters.
+  * **Automatic Dev Key Purge**: Any legacy development credentials in the database `api_keys` table are unconditionally purged on startup in production.
+  * **Failure Over Fallback**: If production credentials are missing or unsafe, the process exits with an error code rather than silently falling back to insecure defaults.
+  * **Runtime Defense-in-Depth**: In `hmacAuth`, any authentication attempt presenting `'voltgrid-dev-key'` or signed with `'voltgrid-dev-secret'` in production returns `HTTP 401 Unauthorized` (`"Development credentials are not permitted in production"`), and `rateLimiter` never defaults to development keys.
+  * **Zero Credential Leaks**: Raw secrets are never logged in console outputs, error responses, or metrics.
 
 ---
 

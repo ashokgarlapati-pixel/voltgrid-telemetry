@@ -12,7 +12,10 @@ services:
     environment:
       - PORT=3000
       - DB_PATH=/data/voltgrid.db
-      - NODE_ENV=production
+      - NODE_ENV=${NODE_ENV:-production}
+      - API_KEY=${API_KEY:-}
+      - API_SECRET=${API_SECRET:-}
+      - VOLTGRID_API_KEYS=${VOLTGRID_API_KEYS:-}
     volumes:
       - sqlite_data:/data
     restart: unless-stopped
@@ -35,7 +38,10 @@ services:
     environment:
       - PORT=3001
       - DB_PATH=/data/voltgrid.db
-      - NODE_ENV=production
+      - NODE_ENV=${NODE_ENV:-production}
+      - API_KEY=${API_KEY:-}
+      - API_SECRET=${API_SECRET:-}
+      - VOLTGRID_API_KEYS=${VOLTGRID_API_KEYS:-}
     volumes:
       - sqlite_data:/data
     restart: unless-stopped

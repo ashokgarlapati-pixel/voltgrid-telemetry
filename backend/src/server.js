@@ -14,11 +14,20 @@ const {
   getFleetSummaryHandler,
   ackAlertHandler
 } = require('./queries');
-const { hmacAuth, rateLimiter } = require('./security');
+const {
+  DEV_API_KEY,
+  DEV_API_SECRET,
+  hmacAuth,
+  rateLimiter,
+  validateAndInitSecurityCredentials
+} = require('./security');
 const { sseStreamHandler, stopStreamWorker } = require('./stream');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Validate security configuration and initialize credentials (fails immediately on unsafe production config)
+validateAndInitSecurityCredentials();
 
 // Observability: attach/generate X-Request-Id and log structured JSON per request
 app.use(requestIdMiddleware);

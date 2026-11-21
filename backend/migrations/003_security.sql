@@ -8,7 +8,9 @@ CREATE TABLE IF NOT EXISTS api_keys (
     burst_capacity INTEGER NOT NULL DEFAULT 20
 );
 
--- Seed default device-group credentials for development and testing
+-- Seed default device-group credentials for development and testing ONLY.
+-- Note: Production environments (NODE_ENV=production) strictly purge and reject
+-- these credentials upon startup via validateAndInitSecurityCredentials().
 INSERT OR IGNORE INTO api_keys (api_key, secret, rate_limit_per_sec, burst_capacity)
 VALUES ('voltgrid-dev-key', 'voltgrid-dev-secret', 20, 40);
 

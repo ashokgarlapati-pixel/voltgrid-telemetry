@@ -5,8 +5,23 @@ const { trackAuthFailure, trackRateLimitRejection } = require('./observability')
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 60 * 1000; // Clean expired nonces at most once every 60 seconds
 
+const DEV_API_KEY = 'voltgrid-dev-key';
+const DEV_API_SECRET = 'voltgrid-dev-secret';
+
 // Prepared statements for api_keys lookup
 const getApiKeyStmt = db.prepare('SELECT api_key, secret, rate_limit_per_sec, burst_capacity FROM api_keys WHERE api_key = ?');
+
+// Prepared statements for API key lifecycle and production safeguards
+const purgeDevKeysStmt = db.prepare('DELETE FROM api_keys WHERE api_key = ? OR secret = ?');
+const ensureDevKeyStmt = db.prepare('INSERT OR IGNORE INTO api_keys (api_key, secret, rate_limit_per_sec, burst_capacity) VALUES (?, ?, 20, 40)');
+const upsertApiKeyStmt = db.prepare(`
+  INSERT INTO api_keys (api_key, secret, rate_limit_per_sec, burst_capacity)
+  VALUES (?, ?, ?, ?)
+  ON CONFLICT(api_key) DO UPDATE SET
+    secret = excluded.secret,
+    rate_limit_per_sec = excluded.rate_limit_per_sec,
+    burst_capacity = excluded.burst_capacity
+`);
 
 // Prepared statements for replay nonce handling
 const purgeExpiredNoncesStmt = db.prepare('DELETE FROM used_nonces WHERE expires_at < ?');
@@ -105,10 +120,21 @@ function hmacAuth(req, res, next) {
       });
     }
 
+    // In production, reject development credentials immediately (defense-in-depth)
+    if (process.env.NODE_ENV === 'production' && (apiKey === DEV_API_KEY || rawSignature === DEV_API_SECRET)) {
+      trackAuthFailure();
+      return res.status(401).json({ error: 'Development credentials are not permitted in production' });
+    }
+
     const apiKeyRow = getApiKeyStmt.get(apiKey);
     if (!apiKeyRow) {
       trackAuthFailure();
       return res.status(401).json({ error: 'Invalid or unknown API key' });
+    }
+
+    if (process.env.NODE_ENV === 'production' && apiKeyRow.secret === DEV_API_SECRET) {
+      trackAuthFailure();
+      return res.status(401).json({ error: 'Development credentials are not permitted in production' });
     }
 
     // Parse and validate request timestamp: supports epoch ms (13 digits), epoch sec (10 digits), and ISO strings
@@ -176,7 +202,7 @@ function hmacAuth(req, res, next) {
  */
 function rateLimiter(req, res, next) {
   try {
-    const apiKey = req.apiKey?.api_key || 'voltgrid-dev-key';
+    const apiKey = req.apiKey?.api_key || (process.env.NODE_ENV === 'production' ? 'unauthenticated' : DEV_API_KEY);
     const rateLimitPerSec = req.apiKey?.rate_limit_per_sec ?? 20;
     const burstCapacity = req.apiKey?.burst_capacity ?? 40;
 
@@ -200,9 +226,117 @@ function rateLimiter(req, res, next) {
   }
 }
 
+/**
+ * Validates and initializes HMAC credentials based on the execution environment.
+ * - Non-production (development / test): ensures default development credentials exist.
+ * - Production: enforces secure configuration, validates secret entropy (>=16 chars),
+ *   purges development defaults, and throws a fatal configuration error on missing or unsafe keys.
+ * 
+ * Never logs or exposes raw secrets.
+ */
+function validateAndInitSecurityCredentials(env = process.env) {
+  const isProduction = env.NODE_ENV === 'production';
+
+  if (!isProduction) {
+    // In development and test environments, ensure development credentials exist
+    ensureDevKeyStmt.run(DEV_API_KEY, DEV_API_SECRET);
+    return { isProduction: false, keysLoaded: 1 };
+  }
+
+  // PRODUCTION SAFEGUARDS:
+  // 1. Purge seeded development credentials from the database immediately
+  purgeDevKeysStmt.run(DEV_API_KEY, DEV_API_SECRET);
+
+  // 2. Parse configured production credentials from secure configuration
+  const keysToLoad = [];
+
+  if (env.VOLTGRID_API_KEYS) {
+    try {
+      const parsed = JSON.parse(env.VOLTGRID_API_KEYS);
+      if (!Array.isArray(parsed)) {
+        throw new Error('VOLTGRID_API_KEYS must be a JSON array of key objects');
+      }
+      keysToLoad.push(...parsed);
+    } catch (err) {
+      throw new Error(`[Security Configuration Error] Failed to parse VOLTGRID_API_KEYS JSON: ${err.message}`);
+    }
+  }
+
+  if (env.API_KEY || env.API_SECRET) {
+    if (!env.API_KEY || !env.API_SECRET) {
+      throw new Error('[Security Configuration Error] Incomplete production credentials: both API_KEY and API_SECRET must be provided.');
+    }
+    keysToLoad.push({
+      api_key: env.API_KEY,
+      secret: env.API_SECRET,
+      rate_limit_per_sec: env.API_RATE_LIMIT ? Number(env.API_RATE_LIMIT) : 20,
+      burst_capacity: env.API_BURST_CAPACITY ? Number(env.API_BURST_CAPACITY) : 40
+    });
+  }
+
+  // 3. Reject startup if no production credentials are provided in configuration or database
+  if (keysToLoad.length === 0) {
+    const existing = db.prepare(`
+      SELECT api_key, secret FROM api_keys WHERE api_key != ? AND secret != ?
+    `).all(DEV_API_KEY, DEV_API_SECRET);
+
+    if (existing.length === 0) {
+      throw new Error(
+        '[Security Configuration Error] Production startup rejected: No production HMAC credentials configured. ' +
+        'Production must not use development defaults. Supply production credentials via VOLTGRID_API_KEYS or API_KEY and API_SECRET.'
+      );
+    }
+
+    for (const row of existing) {
+      if (!row.secret || row.secret.length < 16) {
+        throw new Error(`[Security Configuration Error] Insecure database key "${row.api_key}": secret must be at least 16 characters.`);
+      }
+    }
+
+    console.log(`[Security] Production HMAC authentication verified with ${existing.length} pre-provisioned database key(s). Development credentials purged.`);
+    return { isProduction: true, keysLoaded: existing.length };
+  }
+
+  // 4. Validate configured keys against insecure development defaults and length/entropy requirements
+  for (const entry of keysToLoad) {
+    const key = (entry.api_key || '').trim();
+    const secret = (entry.secret || '').trim();
+
+    if (!key) {
+      throw new Error('[Security Configuration Error] Production api_key cannot be empty.');
+    }
+    if (key === DEV_API_KEY) {
+      throw new Error('[Security Configuration Error] Insecure production configuration: Cannot use development key ("voltgrid-dev-key") in production.');
+    }
+    if (!secret) {
+      throw new Error(`[Security Configuration Error] Production secret for key "${key}" cannot be empty.`);
+    }
+    if (secret === DEV_API_SECRET) {
+      throw new Error(`[Security Configuration Error] Insecure production configuration: Cannot use development secret ("voltgrid-dev-secret") in production.`);
+    }
+    if (secret.length < 16) {
+      throw new Error(`[Security Configuration Error] Insecure production configuration: Secret for key "${key}" is too short (minimum 16 characters required).`);
+    }
+
+    const rate = Number(entry.rate_limit_per_sec) || 20;
+    const burst = Number(entry.burst_capacity) || 40;
+
+    upsertApiKeyStmt.run(key, secret, rate, burst);
+  }
+
+  // Re-verify that dev credentials remain completely absent
+  purgeDevKeysStmt.run(DEV_API_KEY, DEV_API_SECRET);
+
+  console.log(`[Security] Production HMAC authentication initialized with ${keysToLoad.length} configured key(s). Development credentials purged.`);
+  return { isProduction: true, keysLoaded: keysToLoad.length };
+}
+
 module.exports = {
+  DEV_API_KEY,
+  DEV_API_SECRET,
   hmacAuth,
   rateLimiter,
+  validateAndInitSecurityCredentials,
   consumeTokenTx,
   recordNonceTx,
   maybeCleanExpiredNonces
