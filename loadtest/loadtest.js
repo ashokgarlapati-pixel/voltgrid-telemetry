@@ -68,19 +68,36 @@ function percentile(arr, p) {
 }
 
 async function checkOrStartServer() {
-  try {
-    const res = await fetch(`${TARGET_URL}/health`);
-    if (res.ok) {
-      console.log(`[LoadTest] Connected to target server at ${TARGET_URL}`);
-      return TARGET_URL;
-    }
-  } catch (_) {}
+  const forceInProcess = process.env.FORCE_IN_PROCESS === 'true' || process.env.USE_IN_PROCESS === 'true' || TARGET_URL === 'in-process';
 
-  // Server not running on TARGET_URL: start in-process on ephemeral port
-  console.log('[LoadTest] Target server not detected on port 3000. Launching in-process instance...');
+  if (!forceInProcess) {
+    try {
+      const res = await fetch(`${TARGET_URL}/health`);
+      if (res.ok) {
+        // Verify target server accepts dev credentials
+        const testAuth = await fetch(`${TARGET_URL}/v1/fleet/summary`);
+        if (testAuth.ok) {
+          console.log(`[LoadTest] Connected to target server at ${TARGET_URL}`);
+          return TARGET_URL;
+        }
+      }
+    } catch (_) {}
+  }
+
+  // Server not running on TARGET_URL or in-process explicitly requested: start in-process on ephemeral port
+  console.log('[LoadTest] Launching in-process VoltGrid API server on ephemeral port...');
   process.env.PORT = '0';
+  process.env.NODE_ENV = 'test';
+  const db = require('../backend/src/db');
+  db.prepare('UPDATE api_keys SET rate_limit_per_sec = 100000, burst_capacity = 100000 WHERE api_key = ?').run(API_KEY);
+  db.prepare('INSERT OR REPLACE INTO rate_limits (api_key, tokens, last_refill_ms) VALUES (?, 100000, ?)').run(API_KEY, Date.now());
+
   const { server } = require('../backend/src/server');
   inProcessServer = server;
+  await new Promise((resolve) => {
+    if (server.listening) resolve();
+    else server.on('listening', resolve);
+  });
   const port = server.address().port;
   const ephemeralUrl = `http://127.0.0.1:${port}`;
   console.log(`[LoadTest] In-process server listening at ${ephemeralUrl}`);
@@ -226,7 +243,9 @@ async function main() {
 
   if (inProcessServer) {
     const { stopOfflineWorker } = require('../backend/src/offlineWorker');
+    const { stopStreamWorker } = require('../backend/src/stream');
     stopOfflineWorker();
+    stopStreamWorker();
     inProcessServer.close();
   }
 

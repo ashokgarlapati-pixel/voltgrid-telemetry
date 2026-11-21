@@ -80,19 +80,27 @@ function reclaimStaleProcessingRecords(leaseMs = DEFAULT_LEASE_DURATION_MS, nowI
 }
 
 /**
+ * Batched atomic transaction to mark pending outbox events as completed for multiple vehicles.
+ */
+const completeOutboxBatchTx = db.transaction((vehicleIds, nowIso) => {
+  for (const vid of vehicleIds) {
+    completeOutboxByVehiclesStmt.run({
+      vehicle_id: vid,
+      now: nowIso
+    });
+  }
+}).immediate;
+
+/**
  * Mark pending outbox events for given vehicle IDs as completed.
  * Used by inline ingestion to complete outbox rows immediately upon successful evaluation.
  * @param {Set<string>|Array<string>} vehicleIds
  * @param {string} nowIso
  */
 function markOutboxEventsCompleted(vehicleIds, nowIso = new Date().toISOString()) {
-  const distinctIds = vehicleIds instanceof Set ? vehicleIds : new Set(vehicleIds);
-  for (const vid of distinctIds) {
-    completeOutboxByVehiclesStmt.run({
-      vehicle_id: vid,
-      now: nowIso
-    });
-  }
+  const distinctIds = Array.from(vehicleIds instanceof Set ? vehicleIds : new Set(vehicleIds));
+  if (distinctIds.length === 0) return;
+  completeOutboxBatchTx(distinctIds, nowIso);
 }
 
 /**

@@ -143,6 +143,10 @@ const resolveOfflineAlertStmt = db.prepare(`
   WHERE vehicle_id = @vehicle_id AND rule = 'offline' AND status != 'resolved'
 `);
 
+const getActiveOfflineAlertStmt = db.prepare("SELECT id FROM alerts WHERE vehicle_id = ? AND rule = 'offline' AND status != 'resolved'");
+const getAlertByIdStmt = db.prepare('SELECT * FROM alerts WHERE id = ?');
+const getVehicleByIdStmt = db.prepare('SELECT * FROM vehicles WHERE vehicle_id = ?');
+
 /**
  * Transaction wrapped in db.transaction(...).immediate() (BEGIN IMMEDIATE)
  * to acquire write locks upfront and prevent deadlocks under high concurrency.
@@ -209,13 +213,13 @@ const executeBatchTransaction = db.transaction((validItems, nowIso) => {
     });
 
     // Resolve any active 'offline' alert as the vehicle is now actively reporting
-    const activeOffline = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline' AND status != 'resolved'").get(reading.vehicle_id);
+    const activeOffline = getActiveOfflineAlertStmt.get(reading.vehicle_id);
     if (activeOffline) {
       resolveOfflineAlertStmt.run({
         vehicle_id: reading.vehicle_id,
         now: nowIso
       });
-      const resolvedAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(activeOffline.id);
+      const resolvedAlert = getAlertByIdStmt.get(activeOffline.id);
       if (resolvedAlert) {
         // Collect resolved alerts to be broadcast strictly AFTER the transaction has successfully committed
         alertsToPublish.push(resolvedAlert);
@@ -309,7 +313,7 @@ function ingestBatch(readings, nowIso = new Date().toISOString()) {
 
       // Publish latest vehicle state to SSE stream (coalesced 1s buffer)
       for (const vid of txResult.acceptedVehicleIds) {
-        const v = db.prepare('SELECT * FROM vehicles WHERE vehicle_id = ?').get(vid);
+        const v = getVehicleByIdStmt.get(vid);
         if (v) {
           publishVehicleUpdate(v);
         }

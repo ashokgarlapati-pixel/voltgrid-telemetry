@@ -472,6 +472,26 @@ function getVehicleHistoryHandler(req, res) {
   }
 }
 
+// Pre-prepared statements for GET /v1/fleet/summary to eliminate per-request SQL compilation
+const getFleetSummaryVehiclesStmt = db.prepare(`
+  SELECT 
+    COUNT(*) AS total_vehicles,
+    COALESCE(SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END), 0) AS online_count,
+    COALESCE(SUM(CASE WHEN status = 'offline' THEN 1 ELSE 0 END), 0) AS offline_count,
+    COALESCE(SUM(CASE WHEN status = 'maintenance' THEN 1 ELSE 0 END), 0) AS maintenance_count,
+    COALESCE(AVG(soc_pct), 0) AS avg_soc,
+    COALESCE(SUM(received_count), 0) AS total_received,
+    COALESCE(SUM(max_seq - min_seq + 1), 0) AS total_expected
+  FROM vehicles
+`);
+
+const getFleetSummaryAlertsStmt = db.prepare(`
+  SELECT rule, COUNT(*) AS count
+  FROM alerts
+  WHERE status != 'resolved'
+  GROUP BY rule
+`);
+
 /**
  * GET /v1/fleet/summary
  * Ultra-fast fleet summary aggregated strictly from vehicles and alerts tables.
@@ -480,25 +500,10 @@ function getVehicleHistoryHandler(req, res) {
 function getFleetSummaryHandler(req, res) {
   try {
     // 1. Vehicle fleet status and completeness aggregate
-    const fleetRow = db.prepare(`
-      SELECT 
-        COUNT(*) AS total_vehicles,
-        COALESCE(SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END), 0) AS online_count,
-        COALESCE(SUM(CASE WHEN status = 'offline' THEN 1 ELSE 0 END), 0) AS offline_count,
-        COALESCE(SUM(CASE WHEN status = 'maintenance' THEN 1 ELSE 0 END), 0) AS maintenance_count,
-        COALESCE(AVG(soc_pct), 0) AS avg_soc,
-        COALESCE(SUM(received_count), 0) AS total_received,
-        COALESCE(SUM(max_seq - min_seq + 1), 0) AS total_expected
-      FROM vehicles
-    `).get();
+    const fleetRow = getFleetSummaryVehiclesStmt.get();
 
     // 2. Open alerts breakdown by rule type (status != 'resolved' includes open and acknowledged)
-    const alertRows = db.prepare(`
-      SELECT rule, COUNT(*) AS count
-      FROM alerts
-      WHERE status != 'resolved'
-      GROUP BY rule
-    `).all();
+    const alertRows = getFleetSummaryAlertsStmt.all();
 
     const openAlertsByRule = {
       overheat: 0,

@@ -41,4 +41,32 @@ describe('Repeatable Load Test Verification Suite', () => {
       done();
     });
   });
+
+  test('Mixed-workload load test maintains Fleet Summary p95 under 150ms SLA under concurrent ingestion', { timeout: 45000 }, (t, done) => {
+    const scriptPath = path.resolve(__dirname, '../../loadtest/loadtest.js');
+
+    const env = {
+      ...process.env,
+      NODE_ENV: 'test',
+      FORCE_IN_PROCESS: 'true',
+      PORT: '0',
+      DURATION_SEC: '4',
+      CONCURRENCY: '5'
+    };
+
+    execFile('node', [scriptPath], { env }, (err, stdout, stderr) => {
+      assert.ifError(err);
+      assert.ok(stdout.includes('GET /v1/fleet/summary'), 'Must execute fleet summary in mixed test');
+      assert.ok(stdout.includes('PASSED'), 'Must confirm mixed load test passed SLA');
+
+      // Extract Summary p95 from stdout
+      const summaryMatch = stdout.match(/\|\s*\*\*GET \/v1\/fleet\/summary\*\*\s*\|\s*25%\s*\|\s*[\d,]+\s*\|\s*[\d,]+\s*req\/s\s*\|\s*[\d.]+\s*ms\s*\|\s*\*\*([\d.]+)\s*ms\*\*/);
+      if (summaryMatch) {
+        const p95 = parseFloat(summaryMatch[1]);
+        assert.ok(p95 < 150.0, `Fleet summary p95 (${p95} ms) must be below 150 ms SLA target`);
+      }
+
+      done();
+    });
+  });
 });
