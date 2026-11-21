@@ -35,7 +35,8 @@ describe('Database Schema & Migration Lifecycle Tests', () => {
     assert.ok(versions.includes('002_alerts.sql'), 'Must apply 002_alerts.sql');
     assert.ok(versions.includes('003_security.sql'), 'Must apply 003_security.sql');
     assert.ok(versions.includes('004_stream.sql'), 'Must apply 004_stream.sql');
-    assert.strictEqual(versions.length, 4, 'Must apply exactly 4 migrations');
+    assert.ok(versions.includes('005_alert_outbox.sql'), 'Must apply 005_alert_outbox.sql');
+    assert.strictEqual(versions.length, 5, 'Must apply exactly 5 migrations');
 
     for (const r of rows) {
       assert.ok(r.applied_at, 'Applied migration must have a valid timestamp');
@@ -51,6 +52,7 @@ describe('Database Schema & Migration Lifecycle Tests', () => {
     assert.ok(tables.includes('used_nonces'));
     assert.ok(tables.includes('rate_limits'));
     assert.ok(tables.includes('stream_events'));
+    assert.ok(tables.includes('alert_outbox'));
     assert.ok(tables.includes('schema_migrations'));
 
     // Check indexes
@@ -60,6 +62,8 @@ describe('Database Schema & Migration Lifecycle Tests', () => {
     assert.ok(indexes.includes('idx_alerts_active_rule'));
     assert.ok(indexes.includes('idx_alerts_active_unique'));
     assert.ok(indexes.includes('idx_stream_events_id'));
+    assert.ok(indexes.includes('idx_alert_outbox_status_id'));
+    assert.ok(indexes.includes('idx_alert_outbox_vehicle_status'));
   });
 
   test('Idempotency: Re-running migrations on an existing database does not duplicate records or throw errors', () => {

@@ -2,6 +2,7 @@ const express = require('express');
 const db = require('./db');
 const { ingestBatch } = require('./ingestion');
 const { startOfflineWorker, stopOfflineWorker } = require('./offlineWorker');
+const { startAlertOutboxWorker, stopAlertOutboxWorker } = require('./alertOutboxWorker');
 const {
   requestIdMiddleware,
   livenessHandler,
@@ -298,12 +299,15 @@ const server = app.listen(PORT, () => {
   console.log(`[VoltGrid API] Listening on port ${actualPort}`);
   // Start background offline detection worker
   startOfflineWorker();
+  // Start background transactional alert outbox worker for crash recovery
+  startAlertOutboxWorker();
 });
 
 // Graceful shutdown handling
 function handleShutdown(signal) {
   console.log(`[VoltGrid API] Received ${signal}, closing server, background workers, and database...`);
   stopOfflineWorker();
+  stopAlertOutboxWorker();
   stopStreamWorker();
   server.close(() => {
     try {

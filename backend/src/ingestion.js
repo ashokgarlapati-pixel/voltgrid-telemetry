@@ -1,5 +1,6 @@
 const db = require('./db');
 const { evaluateAlertsForVehicles } = require('./alertEngine');
+const { insertOutboxStmt, markOutboxEventsCompleted } = require('./alertOutboxWorker');
 const { publishVehicleUpdate, publishAlertChange } = require('./stream');
 const { trackTelemetryBatch } = require('./observability');
 
@@ -229,6 +230,14 @@ const executeBatchTransaction = db.transaction((validItems, nowIso) => {
     });
   }
 
+  // Record transactional outbox event for crash-resilient alert evaluation
+  for (const vid of acceptedVehicleIds) {
+    insertOutboxStmt.run({
+      vehicle_id: vid,
+      created_at: nowIso
+    });
+  }
+
   return { accepted, duplicates, transactionResults, acceptedVehicleIds, alertsToPublish };
 }).immediate;
 
@@ -294,6 +303,9 @@ function ingestBatch(readings, nowIso = new Date().toISOString()) {
     // Step 3: Trigger order-independent alert rule evaluation for vehicles with new readings
     if (txResult.acceptedVehicleIds && txResult.acceptedVehicleIds.size > 0) {
       evaluateAlertsForVehicles(txResult.acceptedVehicleIds, nowIso);
+
+      // Mark transactional outbox events as completed
+      markOutboxEventsCompleted(txResult.acceptedVehicleIds, nowIso);
 
       // Publish latest vehicle state to SSE stream (coalesced 1s buffer)
       for (const vid of txResult.acceptedVehicleIds) {
