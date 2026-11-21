@@ -410,6 +410,9 @@ async function runBenchmark() {
   console.log('SLA Verification Target   : p95 < 150.0 ms');
   const meetsSla = p95 < 150.0;
   console.log(`SLA Target Status         : ${meetsSla ? 'PASSED (Target Satisfied)' : 'FAILED (Target Exceeded)'}`);
+  if (!meetsSla) {
+    console.error(`\n[ERROR: SLA BREACH] Fleet Summary p95 response time (${p95.toFixed(2)} ms) exceeded the required 150.0 ms SLA target!`);
+  }
   console.log('='.repeat(75));
 
   console.log('\n[SQLite Execution Plans]');
