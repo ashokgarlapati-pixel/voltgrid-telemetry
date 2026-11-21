@@ -57,12 +57,14 @@ It is critical to distinguish between two completely independent timestamp valid
 
 An earlier draft suggested that a telemetry reading with a 1-day clock error returns `HTTP 401 Unauthorized`. That is technically incorrect:
 
-* **Authentication does not inspect payload timestamps**: The authentication middleware (`hmacAuth`) inspects only HTTP transport headers (`X-API-Key`, `X-Timestamp`, `X-Signature`). If `X-Timestamp` matches the server's current wall clock, the request authenticates successfully regardless of payload contents.
-* **Ingestion rejects stale or future readings independently**: If the batch payload contains a reading with a 1-day clock error, `validateReading` rejects that individual reading. The response is `HTTP 207 Multi-Status`, **not** `HTTP 401`.
+* **Authentication does not inspect payload timestamps**: The authentication middleware (`hmacAuth`) inspects only HTTP transport headers (`X-API-Key`, `X-Timestamp`, `X-Signature`). If `X-Timestamp` falls within the allowed 5-minute window and `X-Signature` correctly matches the HMAC digest computed over that timestamp and that specific raw payload body, authentication succeeds (`next()`) and the request proceeds downstream to the ingestion handler.
+* **Ingestion rejects stale or future readings independently**: If the batch payload contains a reading with a 1-day clock error, `validateReading` rejects that individual reading. The final API response sent by the route handler is `HTTP 207 Multi-Status`, **not** `HTTP 401`.
 
 #### Concrete Example:
 A vehicle client transmits an HTTP request at current server time $T_{\text{server}} = \text{12:00:00}$:
-* **Headers**: `X-Timestamp: 12:00:00` (valid wall clock), signed with a valid HMAC.
+* **Headers**:
+  * `X-Timestamp: 12:00:00` (matches current server wall clock).
+  * `X-Signature`: A valid hex digest computed strictly over this specific batch payload: $\text{HMAC-SHA256}(\text{secret}, \text{"12:00:00."} \mathbin{\Vert} \text{rawBody})$. (Note: The signature binds cryptographically to this exact body; any alteration to the body invalidates the signature).
 * **Payload**:
   ```json
   [
@@ -84,9 +86,9 @@ A vehicle client transmits an HTTP request at current server time $T_{\text{serv
   *(Note that `ts` is dated 1 day in the past due to an un-synchronized vehicle RTC clock).*
 
 * **Lifecycle & Result**:
-  1. **Transport Layer (`security.js`)**: $|T_{\text{server}} - \text{X-Timestamp}| = 0 \le 300\text{s}$. Authentication **passes** (`HTTP 200` at middleware).
-  2. **Ingestion Layer (`ingestion.js`)**: `reading.ts` is 24 hours old ($> 10\text{ minutes}$). `validateReading` rejects the reading with `"ts cannot be older than 10 minutes"`.
-  3. **HTTP Response**: The API responds with **`HTTP 207 Multi-Status`** (NOT `HTTP 401`):
+  1. **Transport Layer (`security.js`)**: $|T_{\text{server}} - \text{X-Timestamp}| = 0 \le 300\text{s}$, and the provided `X-Signature` matches the computed digest over the payload. Authentication succeeds and delegates to `next()` without sending a response. The request proceeds to the ingestion route handler.
+  2. **Ingestion Layer (`ingestion.js`)**: The request payload is processed. `reading.ts` is 24 hours old ($> 10\text{ minutes}$). `validateReading` rejects this reading with `"ts cannot be older than 10 minutes"`.
+  3. **Final API Response**: The route handler finishes processing and sends the final response as **`HTTP 207 Multi-Status`** (NOT `HTTP 401`):
      ```json
      {
        "total": 1,
