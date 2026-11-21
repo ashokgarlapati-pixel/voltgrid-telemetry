@@ -3,6 +3,7 @@ const { evaluateVehicleAlerts } = require('./alertEngine');
 
 let workerTimer = null;
 const OUTBOX_POLL_INTERVAL_MS = parseInt(process.env.ALERT_OUTBOX_INTERVAL_MS || '500', 10);
+const DEFAULT_LEASE_DURATION_MS = parseInt(process.env.ALERT_OUTBOX_LEASE_MS || '30000', 10);
 const MAX_ATTEMPTS = 5;
 
 // Prepared statements for alert outbox operations
@@ -11,19 +12,29 @@ const insertOutboxStmt = db.prepare(`
   VALUES (@vehicle_id, 'pending', @created_at)
 `);
 
+// Finds pending records OR stale processing records whose lease has expired
 const findPendingOutboxStmt = db.prepare(`
-  SELECT id, vehicle_id, attempts
+  SELECT id, vehicle_id, attempts, status, claimed_at
   FROM alert_outbox
   WHERE status = 'pending'
+     OR (status = 'processing' AND (claimed_at IS NULL OR claimed_at <= @stale_cutoff))
   ORDER BY id ASC
-  LIMIT ?
+  LIMIT @limit
 `);
 
+// Atomically claims a pending or stale processing record by setting status to 'processing'
+// and updating claimed_at to the current timestamp.
+// If another worker claimed the record concurrently, changes will be 0.
 const claimOutboxStmt = db.prepare(`
   UPDATE alert_outbox
   SET status = 'processing',
+      claimed_at = @now,
       attempts = attempts + 1
-  WHERE id = ? AND status = 'pending'
+  WHERE id = @id
+    AND (
+      status = 'pending'
+      OR (status = 'processing' AND (claimed_at IS NULL OR claimed_at <= @stale_cutoff))
+    )
 `);
 
 const completeOutboxStmt = db.prepare(`
@@ -51,6 +62,24 @@ const failOutboxStmt = db.prepare(`
 `);
 
 /**
+ * Reclaims stale processing records by resetting their status to 'pending'.
+ * @param {number} leaseMs Lease expiration threshold in milliseconds
+ * @param {string} nowIso Current ISO timestamp
+ * @returns {number} Count of reclaimed records
+ */
+function reclaimStaleProcessingRecords(leaseMs = DEFAULT_LEASE_DURATION_MS, nowIso = new Date().toISOString()) {
+  const staleCutoffIso = new Date(Date.parse(nowIso) - leaseMs).toISOString();
+  const result = db.prepare(`
+    UPDATE alert_outbox
+    SET status = 'pending',
+        claimed_at = NULL
+    WHERE status = 'processing'
+      AND (claimed_at IS NULL OR claimed_at <= ?)
+  `).run(staleCutoffIso);
+  return result.changes;
+}
+
+/**
  * Mark pending outbox events for given vehicle IDs as completed.
  * Used by inline ingestion to complete outbox rows immediately upon successful evaluation.
  * @param {Set<string>|Array<string>} vehicleIds
@@ -67,14 +96,24 @@ function markOutboxEventsCompleted(vehicleIds, nowIso = new Date().toISOString()
 }
 
 /**
- * Processes pending alert outbox events.
+ * Processes pending or stale alert outbox events.
  * Safe against crashes and retries without creating duplicate alerts.
+ * Uses atomic leases to guarantee mutual exclusion across concurrent workers/instances.
+ * 
  * @param {number} batchSize Maximum number of events to process in one pass
  * @param {string} nowIso Optional timestamp
+ * @param {number} leaseMs Optional lease duration in milliseconds
  * @returns {object} Summary of processed and failed counts
  */
-function processPendingOutboxEvents(batchSize = 100, nowIso = new Date().toISOString()) {
-  const pendingRows = findPendingOutboxStmt.all(batchSize);
+function processPendingOutboxEvents(batchSize = 100, nowIso = new Date().toISOString(), leaseMs = DEFAULT_LEASE_DURATION_MS) {
+  const serverNowMs = Date.parse(nowIso);
+  const staleCutoffIso = new Date(serverNowMs - leaseMs).toISOString();
+
+  const pendingRows = findPendingOutboxStmt.all({
+    limit: batchSize,
+    stale_cutoff: staleCutoffIso
+  });
+
   if (!pendingRows || pendingRows.length === 0) {
     return { processedCount: 0, failedCount: 0 };
   }
@@ -83,10 +122,15 @@ function processPendingOutboxEvents(batchSize = 100, nowIso = new Date().toISOSt
   let failedCount = 0;
 
   for (const row of pendingRows) {
-    // Atomically claim the row
-    const claimResult = claimOutboxStmt.run(row.id);
+    // Atomically claim the row with lease timestamp
+    const claimResult = claimOutboxStmt.run({
+      id: row.id,
+      now: nowIso,
+      stale_cutoff: staleCutoffIso
+    });
+
     if (claimResult.changes === 0) {
-      // Already claimed or completed by another worker/thread
+      // Concurrently claimed by another worker or lease was refreshed
       continue;
     }
 
@@ -120,18 +164,18 @@ function processPendingOutboxEvents(batchSize = 100, nowIso = new Date().toISOSt
  * Starts the background alert outbox recovery worker.
  * Runs an immediate pass on startup to drain any events orphaned by previous crashes.
  */
-function startAlertOutboxWorker(intervalMs = OUTBOX_POLL_INTERVAL_MS) {
+function startAlertOutboxWorker(intervalMs = OUTBOX_POLL_INTERVAL_MS, leaseMs = DEFAULT_LEASE_DURATION_MS) {
   if (workerTimer) return;
-  // Immediate pass upon startup
+  // Immediate pass upon startup to recover orphaned / pending / stale records
   try {
-    processPendingOutboxEvents();
+    processPendingOutboxEvents(100, new Date().toISOString(), leaseMs);
   } catch (err) {
     console.error('[AlertOutboxWorker Startup Error]', err);
   }
 
   workerTimer = setInterval(() => {
     try {
-      processPendingOutboxEvents();
+      processPendingOutboxEvents(100, new Date().toISOString(), leaseMs);
     } catch (err) {
       console.error('[AlertOutboxWorker Interval Error]', err);
     }
@@ -155,7 +199,9 @@ function stopAlertOutboxWorker() {
 module.exports = {
   insertOutboxStmt,
   markOutboxEventsCompleted,
+  reclaimStaleProcessingRecords,
   processPendingOutboxEvents,
   startAlertOutboxWorker,
-  stopAlertOutboxWorker
+  stopAlertOutboxWorker,
+  DEFAULT_LEASE_DURATION_MS
 };

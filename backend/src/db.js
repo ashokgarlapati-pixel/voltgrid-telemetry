@@ -104,6 +104,15 @@ function runMigrations() {
       throw err;
     }
   }
+
+  // Ensure backward compatibility for alert_outbox claimed_at column
+  try {
+    const cols = db.prepare("PRAGMA table_info(alert_outbox)").all();
+    if (cols.length > 0 && !cols.some(c => c.name === 'claimed_at')) {
+      db.exec("ALTER TABLE alert_outbox ADD COLUMN claimed_at TEXT;");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_alert_outbox_status_claimed ON alert_outbox (status, claimed_at);");
+    }
+  } catch (_) {}
 }
 
 runMigrations();

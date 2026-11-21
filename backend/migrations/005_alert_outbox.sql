@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS alert_outbox (
     status        TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'processing', 'completed', 'failed'
     attempts      INTEGER NOT NULL DEFAULT 0,
     created_at    TEXT NOT NULL,
+    claimed_at    TEXT,
     processed_at  TEXT,
     error         TEXT
 );
@@ -21,3 +22,7 @@ CREATE INDEX IF NOT EXISTS idx_alert_outbox_status_id
 -- Index for vehicle-specific lookups and status updates
 CREATE INDEX IF NOT EXISTS idx_alert_outbox_vehicle_status 
     ON alert_outbox (vehicle_id, status);
+
+-- Index for processing lease timeout and stale job reclamation
+CREATE INDEX IF NOT EXISTS idx_alert_outbox_status_claimed 
+    ON alert_outbox (status, claimed_at);

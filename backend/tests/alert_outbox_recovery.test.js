@@ -35,10 +35,15 @@ describe('Transactional Outbox: Alert Processing Crash Recovery', () => {
     const table = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'alert_outbox'").get();
     assert.ok(table, 'alert_outbox table must exist');
 
+    const columns = db.prepare("PRAGMA table_info(alert_outbox)").all();
+    const colNames = columns.map(c => c.name);
+    assert.ok(colNames.includes('claimed_at'), 'claimed_at column must exist for processing lease');
+
     const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'alert_outbox'").all();
     const indexNames = indexes.map(i => i.name);
     assert.ok(indexNames.includes('idx_alert_outbox_status_id'), 'idx_alert_outbox_status_id must exist');
     assert.ok(indexNames.includes('idx_alert_outbox_vehicle_status'), 'idx_alert_outbox_vehicle_status must exist');
+    assert.ok(indexNames.includes('idx_alert_outbox_status_claimed'), 'idx_alert_outbox_status_claimed must exist');
   });
 
   test('Simulate crash after telemetry insertion but before alert evaluation: worker recovery', () => {
@@ -243,5 +248,107 @@ describe('Transactional Outbox: Alert Processing Crash Recovery', () => {
 
     const afterCount = db.prepare("SELECT COUNT(*) as c FROM alert_outbox").get().c;
     assert.strictEqual(afterCount, initialOutboxCount, 'Aborted transaction must not commit outbox row');
+  });
+
+  test('Crash while in processing status: worker reclaims stale processing record after lease expires', () => {
+    const vid = `VG-STALE-LEASE-${Date.now()}`;
+    const now = Date.now();
+    const staleTime = new Date(now - 60000).toISOString(); // Claimed 60 seconds ago
+
+    // Insert 3 hot readings in telemetry_history for vid
+    for (let seq = 1; seq <= 3; seq++) {
+      db.prepare(`
+        INSERT INTO telemetry_history (vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, fault_codes, received_at)
+        VALUES (?, ?, ?, 80, 58.0, 0, 13.08, 80.27, 100, 0, '[]', ?)
+      `).run(vid, seq, new Date(now - 15000 + seq * 1000).toISOString(), new Date(now).toISOString());
+    }
+
+    // Insert outbox row stuck in 'processing' status with an expired lease timestamp
+    const insertResult = db.prepare(`
+      INSERT INTO alert_outbox (vehicle_id, status, attempts, created_at, claimed_at)
+      VALUES (?, 'processing', 1, ?, ?)
+    `).run(vid, staleTime, staleTime);
+    const outboxId = insertResult.lastInsertRowid;
+
+    // Verify alert does not exist yet
+    assert.strictEqual(db.prepare('SELECT COUNT(*) as c FROM alerts WHERE vehicle_id = ?').get(vid).c, 0);
+
+    // Run recovery worker with leaseMs = 30000 (claimed 60s ago > 30s threshold -> stale)
+    const recoveryResult = processPendingOutboxEvents(100, new Date(now).toISOString(), 30000);
+    assert.strictEqual(recoveryResult.processedCount, 1, 'Worker must reclaim and process the stale processing record');
+
+    // Confirm alert was successfully generated
+    const alerts = db.prepare('SELECT * FROM alerts WHERE vehicle_id = ?').all(vid);
+    assert.strictEqual(alerts.length, 1);
+    assert.strictEqual(alerts[0].rule, 'overheat');
+    assert.strictEqual(alerts[0].status, 'open');
+
+    // Confirm outbox row is marked completed with incremented attempts
+    const row = db.prepare('SELECT * FROM alert_outbox WHERE id = ?').get(outboxId);
+    assert.strictEqual(row.status, 'completed');
+    assert.strictEqual(row.attempts, 2, 'Attempts must be incremented upon reclaiming');
+    assert.ok(row.claimed_at, 'claimed_at must be updated');
+    assert.ok(row.processed_at, 'processed_at must be populated');
+  });
+
+  test('Active processing lease is protected and not reclaimed before expiration', () => {
+    const vid = `VG-ACTIVE-LEASE-${Date.now()}`;
+    const now = Date.now();
+    const freshClaimTime = new Date(now - 5000).toISOString(); // Claimed only 5s ago (active lease)
+
+    // Insert outbox row with fresh active lease
+    const insertResult = db.prepare(`
+      INSERT INTO alert_outbox (vehicle_id, status, attempts, created_at, claimed_at)
+      VALUES (?, 'processing', 1, ?, ?)
+    `).run(vid, freshClaimTime, freshClaimTime);
+    const outboxId = insertResult.lastInsertRowid;
+
+    // Worker pass with leaseMs = 30000 (claimed 5s ago < 30s threshold -> NOT stale)
+    const result = processPendingOutboxEvents(100, new Date(now).toISOString(), 30000);
+    assert.strictEqual(result.processedCount, 0, 'Worker must NOT reclaim active lease');
+
+    const row = db.prepare('SELECT * FROM alert_outbox WHERE id = ?').get(outboxId);
+    assert.strictEqual(row.status, 'processing', 'Record must remain in processing status under active lease');
+    assert.strictEqual(row.attempts, 1, 'Attempts must not be incremented');
+  });
+
+  test('Atomic lease claim prevents simultaneous processing by concurrent workers', () => {
+    const vid = `VG-CONCUR-CLAIM-${Date.now()}`;
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+
+    // Insert pending outbox row
+    const insertResult = db.prepare(`
+      INSERT INTO alert_outbox (vehicle_id, status, created_at)
+      VALUES (?, 'pending', ?)
+    `).run(vid, nowIso);
+    const outboxId = insertResult.lastInsertRowid;
+
+    // Worker 1 and Worker 2 both query pending rows and see outboxId
+    const staleCutoff = new Date(now - 30000).toISOString();
+    const claimStmt = db.prepare(`
+      UPDATE alert_outbox
+      SET status = 'processing',
+          claimed_at = @now,
+          attempts = attempts + 1
+      WHERE id = @id
+        AND (
+          status = 'pending'
+          OR (status = 'processing' AND (claimed_at IS NULL OR claimed_at <= @stale_cutoff))
+        )
+    `);
+
+    // Worker 1 claims atomically
+    const claim1 = claimStmt.run({ id: outboxId, now: nowIso, stale_cutoff: staleCutoff });
+    assert.strictEqual(claim1.changes, 1, 'First worker must successfully claim record');
+
+    // Worker 2 attempts to claim the same record simultaneously
+    const claim2 = claimStmt.run({ id: outboxId, now: nowIso, stale_cutoff: staleCutoff });
+    assert.strictEqual(claim2.changes, 0, 'Second worker must be locked out (changes = 0)');
+
+    // Verify row state
+    const row = db.prepare('SELECT * FROM alert_outbox WHERE id = ?').get(outboxId);
+    assert.strictEqual(row.status, 'processing');
+    assert.strictEqual(row.attempts, 1);
   });
 });
