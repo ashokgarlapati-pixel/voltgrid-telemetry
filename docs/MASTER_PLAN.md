@@ -782,7 +782,7 @@ USE TEMP B-TREE FOR GROUP BY
 
 ### Q3: "How do you guarantee GET /v1/fleet/summary responds under 150ms with 5M+ telemetry rows?"
 > **Answer**:
-> *"We never touch `telemetry_history` in `GET /v1/fleet/summary`. During ingestion, Phase 1 maintains the live aggregated state in the 2,000-row `vehicles` table (`received_count`, `min_seq`, `max_seq`, `soc_pct`, `status`). Summary metrics are computed via a single scan across 2,000 rows in `vehicles` and an indexed count on `alerts` (`WHERE status != 'resolved'`). This query finishes in under 2ms, comfortably below the 150ms p95 requirement."*
+> *"We never touch `telemetry_history` in `GET /v1/fleet/summary`. During ingestion, Phase 1 maintains the live aggregated state in the 2,000-row `vehicles` table (`received_count`, `min_seq`, `max_seq`, `soc_pct`, `status`). Summary metrics are computed via a single scan across 2,000 rows in `vehicles` and an indexed count on `alerts` (`WHERE status != 'resolved'`). On an uncontented database, this raw SQLite query finishes in under 2ms (and achieves 7.23–8.64ms p95 HTTP response time against 5,000,000 rows in `scripts/benchmark_5m.js`, satisfying the sub-150ms SLA). However, under heavy concurrent batch write transactions (`BEGIN IMMEDIATE`), read queries queue behind serialized SQLite disk commits, which drove p95 latency to 651ms in the historical mixed load test — demonstrating the need for read replicas or write de-coupling at high concurrent write volumes."*
 
 ### Q4: "Show me the query plan for the fleet summary. What would change at 100 times the data (200,000 vehicles)?"
 > **Answer**:
@@ -1014,7 +1014,7 @@ Phase 5 delivers comprehensive, multi-layer verification for the VoltGrid backen
 * **Direct Unit Testing of Domain Logic (Part A7)**: Directly evaluates pure alert engine rules (overheat, hysteresis, rapid discharge, geofence, and order-independence) without mocking away actual business logic.
 * **Hermetic Integration Tests on Real SQLite (Part A7)**: Spawns ephemeral Express instances on random ports (`PORT=0`) backed by isolated temporary SQLite database files (`/tmp/voltgrid-test-<uuid>.db`), guaranteeing zero state contamination between test runs.
 * **Explicit Concurrency & Idempotency Testing (Part A1, A7)**: Fired by 20 concurrent clients sending the exact same 50-item batch simultaneously, mathematically proving that exactly 50 rows are stored in `telemetry_history` and `vehicles.received_count` has zero double-counting.
-* **Mixed-Workload Load Testing & EXPLAIN Validation (Part A6)**: A native Node load testing engine (`loadtest/loadtest.js`) validating that `GET /v1/fleet/summary` satisfies the sub-150ms p95 latency requirement while processing hundreds of requests per second.
+* **Mixed-Workload Load Testing & EXPLAIN Validation (Part A6)**: A native Node load testing engine (`loadtest/loadtest.js`) evaluating system behavior and write contention across endpoints (where concurrent batch writes caused fleet summary p95 to reach 651 ms, failing the SLA under write contention; SLA compliance is validated in isolation via `scripts/benchmark_5m.js`).
 
 ```mermaid
 flowchart TD
@@ -1025,7 +1025,7 @@ flowchart TD
     end
 
     subgraph LoadTestEnv ["Load Test Engine (loadtest/loadtest.js)"]
-        LT["Mixed Workload Runner (30s duration)\n- 60% POST /v1/telemetry/batch (100 items/batch, HMAC signed)\n- 25% GET /v1/fleet/summary (sub-150ms check)\n- 15% GET /v1/vehicles/:id/history (200 pts downsampling)"]
+        LT["Mixed Workload Runner (30s duration)\n- 60% POST /v1/telemetry/batch (100 items/batch, HMAC signed)\n- 25% GET /v1/fleet/summary (write contention vs SLA)\n- 15% GET /v1/vehicles/:id/history (200 pts downsampling)"]
         REP["loadtest/results.md\n- Throughput (req/s), Latency percentiles (p50, p95, p99), Error rate\n- SQLite EXPLAIN QUERY PLAN analysis"]
     end
 

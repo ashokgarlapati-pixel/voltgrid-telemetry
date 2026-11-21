@@ -424,9 +424,9 @@ describe('Part A1, A4, A6 Integration Tests (Real Temp SQLite DB)', () => {
     });
 
     test('Exceeding burst capacity returns 429 with Retry-After header', async () => {
-      // Send 50 rapid requests against key with burst capacity 40
+      // Send rapid requests exceeding burst capacity 40 (60 requests guarantees saturation even with refill)
       const testItem = [{ vehicle_id: 'VG-BURST', seq: 1, ts: makeTestTs(0), soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }];
-      const burstCalls = Array.from({ length: 45 }, () => postSignedBatch(testItem));
+      const burstCalls = Array.from({ length: 60 }, () => postSignedBatch(testItem));
       const results = await Promise.all(burstCalls);
 
       const hit429 = results.find(r => r.status === 429);
