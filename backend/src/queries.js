@@ -3,57 +3,157 @@ const { publishAlertChange } = require('./stream');
 
 /**
  * Downsamples time-series telemetry rows while preserving peaks and troughs.
- * Divides data into equal buckets and retains the min/max values for key physical metrics.
+ * Guarantees that the returned point count never exceeds targetPoints.
+ * Preserves the first and last readings whenever the limit allows.
+ * Preserves key physical extremes (thermal peaks, troughs, min SOC, max speed).
+ * Removes duplicates and ensures strictly chronological ordering.
  * 
  * @param {Array<object>} rows - Chronologically sorted telemetry rows
  * @param {number} targetPoints - Maximum number of data points to return
  * @returns {Array<object>} - Downsampled points ordered chronologically
  */
 function downsampleMinMax(rows, targetPoints) {
-  if (!rows || rows.length <= targetPoints) {
-    return rows || [];
+  if (!rows || rows.length === 0 || !Number.isFinite(targetPoints) || targetPoints <= 0) {
+    return [];
   }
 
-  const firstPoint = rows[0];
-  const lastPoint = rows[rows.length - 1];
+  // Deduplicate identical readings while preserving original chronological order
+  const dedupedRows = [];
+  const seenKeys = new Set();
+  for (const r of rows) {
+    if (!r) continue;
+    const key = r.seq !== undefined && r.seq !== null ? `${r.ts}_${r.seq}` : (r.ts || JSON.stringify(r));
+    if (!seenKeys.has(key)) {
+      seenKeys.add(key);
+      dedupedRows.push(r);
+    }
+  }
 
-  const innerRows = rows.slice(1, -1);
-  const budget = Math.max(2, targetPoints - 2);
-  const numBuckets = Math.max(1, Math.floor(budget / 4));
-  const bucketSize = innerRows.length / numBuckets;
+  if (dedupedRows.length <= targetPoints) {
+    return dedupedRows;
+  }
 
-  const sampledSet = new Set();
-  sampledSet.add(firstPoint);
+  // When targetPoints === 1, return the first reading
+  if (targetPoints === 1) {
+    return [dedupedRows[0]];
+  }
 
-  for (let b = 0; b < numBuckets; b++) {
-    const startIdx = Math.floor(b * bucketSize);
-    const endIdx = Math.floor((b + 1) * bucketSize);
-    const bucket = innerRows.slice(startIdx, endIdx);
+  const firstPoint = dedupedRows[0];
+  const lastPoint = dedupedRows[dedupedRows.length - 1];
 
-    if (bucket.length === 0) continue;
+  // When targetPoints === 2, return first and last readings
+  if (targetPoints === 2) {
+    return [firstPoint, lastPoint];
+  }
 
-    let minTempRow = bucket[0];
-    let maxTempRow = bucket[0];
-    let minSocRow = bucket[0];
-    let maxSpeedRow = bucket[0];
+  const innerRows = dedupedRows.slice(1, dedupedRows.length - 1);
+  const maxInterior = targetPoints - 2;
 
-    for (let i = 1; i < bucket.length; i++) {
-      const item = bucket[i];
+  if (innerRows.length <= maxInterior) {
+    return [firstPoint, ...innerRows, lastPoint];
+  }
+
+  // Candidate collector: track points by key
+  const selectedKeys = new Set();
+  const selectedPoints = [];
+
+  function addPoint(p) {
+    if (!p) return;
+    const key = p.seq !== undefined && p.seq !== null ? `${p.ts}_${p.seq}` : (p.ts || JSON.stringify(p));
+    if (!selectedKeys.has(key)) {
+      selectedKeys.add(key);
+      selectedPoints.push(p);
+    }
+  }
+
+  addPoint(firstPoint);
+
+  if (maxInterior < 4) {
+    // For small budgets (maxInterior = 1, 2, or 3, corresponding to targetPoints = 3, 4, 5):
+    // Find the most prominent global extremes in innerRows
+    let minTempRow = innerRows[0];
+    let maxTempRow = innerRows[0];
+    let minSocRow = innerRows[0];
+    let maxSpeedRow = innerRows[0];
+
+    for (let i = 1; i < innerRows.length; i++) {
+      const item = innerRows[i];
       if (item.battery_temp_c < minTempRow.battery_temp_c) minTempRow = item;
       if (item.battery_temp_c > maxTempRow.battery_temp_c) maxTempRow = item;
       if (item.soc_pct < minSocRow.soc_pct) minSocRow = item;
       if (item.speed_kmh > maxSpeedRow.speed_kmh) maxSpeedRow = item;
     }
 
-    sampledSet.add(minTempRow);
-    sampledSet.add(maxTempRow);
-    sampledSet.add(minSocRow);
-    sampledSet.add(maxSpeedRow);
+    // Rank candidates by physical importance (maxTemp, minTemp, minSoc, maxSpeed)
+    const candidates = [maxTempRow, minTempRow, minSocRow, maxSpeedRow];
+    const uniqueCandidates = [];
+    const seenCandKeys = new Set();
+    for (const c of candidates) {
+      const key = c.seq !== undefined && c.seq !== null ? `${c.ts}_${c.seq}` : (c.ts || JSON.stringify(c));
+      if (!seenCandKeys.has(key)) {
+        seenCandKeys.add(key);
+        uniqueCandidates.push(c);
+      }
+    }
+
+    // Add up to maxInterior candidates
+    for (let i = 0; i < Math.min(maxInterior, uniqueCandidates.length); i++) {
+      addPoint(uniqueCandidates[i]);
+    }
+  } else {
+    // For larger budgets (maxInterior >= 4, targetPoints >= 6):
+    // Use multi-bucket peak preservation
+    const numBuckets = Math.max(1, Math.floor(maxInterior / 4));
+    const bucketSize = innerRows.length / numBuckets;
+
+    for (let b = 0; b < numBuckets; b++) {
+      const startIdx = Math.floor(b * bucketSize);
+      const endIdx = Math.floor((b + 1) * bucketSize);
+      const bucket = innerRows.slice(startIdx, endIdx);
+
+      if (bucket.length === 0) continue;
+
+      let minTempRow = bucket[0];
+      let maxTempRow = bucket[0];
+      let minSocRow = bucket[0];
+      let maxSpeedRow = bucket[0];
+
+      for (let i = 1; i < bucket.length; i++) {
+        const item = bucket[i];
+        if (item.battery_temp_c < minTempRow.battery_temp_c) minTempRow = item;
+        if (item.battery_temp_c > maxTempRow.battery_temp_c) maxTempRow = item;
+        if (item.soc_pct < minSocRow.soc_pct) minSocRow = item;
+        if (item.speed_kmh > maxSpeedRow.speed_kmh) maxSpeedRow = item;
+      }
+
+      // Add points while checking available capacity (reserving 1 slot for lastPoint)
+      const candidates = [maxTempRow, minTempRow, minSocRow, maxSpeedRow];
+      for (const cand of candidates) {
+        if (selectedPoints.length < targetPoints - 1) {
+          addPoint(cand);
+        }
+      }
+    }
   }
 
-  sampledSet.add(lastPoint);
+  // Always add last point
+  addPoint(lastPoint);
 
-  return Array.from(sampledSet).sort((a, b) => {
+  // Absolute hard guarantee: if ever selectedPoints exceeds targetPoints,
+  // prune interior points from the middle until selectedPoints.length <= targetPoints
+  if (selectedPoints.length > targetPoints) {
+    const interior = selectedPoints.slice(1, selectedPoints.length - 1);
+    const stride = interior.length / (targetPoints - 2);
+    const prunedInterior = [];
+    for (let i = 0; i < targetPoints - 2; i++) {
+      prunedInterior.push(interior[Math.floor(i * stride)]);
+    }
+    selectedPoints.length = 0;
+    selectedPoints.push(firstPoint, ...prunedInterior, lastPoint);
+  }
+
+  // Sort chronologically by ts, then seq
+  return selectedPoints.sort((a, b) => {
     const timeDiff = Date.parse(a.ts) - Date.parse(b.ts);
     return timeDiff !== 0 ? timeDiff : ((a.seq || 0) - (b.seq || 0));
   });
@@ -239,10 +339,11 @@ function getVehicleHistoryHandler(req, res) {
     }
 
     let safePoints = 200;
-    if (points !== undefined) {
-      const parsedPoints = parseInt(points, 10);
-      if (isNaN(parsedPoints) || parsedPoints < 2 || parsedPoints > 5000) {
-        return res.status(400).json({ error: 'Invalid "points" parameter: must be an integer between 2 and 5000' });
+    const rawPoints = req.query.targetPoints !== undefined ? req.query.targetPoints : req.query.points;
+    if (rawPoints !== undefined) {
+      const parsedPoints = parseInt(rawPoints, 10);
+      if (isNaN(parsedPoints) || parsedPoints < 1 || parsedPoints > 5000) {
+        return res.status(400).json({ error: 'Invalid "points" parameter: must be an integer between 1 and 5000' });
       }
       safePoints = parsedPoints;
     }

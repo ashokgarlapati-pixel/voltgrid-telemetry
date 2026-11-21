@@ -12,6 +12,7 @@ process.env.PORT = '0';
 
 const db = require('../src/db');
 const { app, server } = require('../src/server');
+const { downsampleMinMax } = require('../src/queries');
 const { stopOfflineWorker } = require('../src/offlineWorker');
 const { stopStreamWorker } = require('../src/stream');
 
@@ -266,6 +267,200 @@ describe('A4 Comprehensive Query API Tests', () => {
       const statuses = [r1.status, r2.status].sort();
 
       assert.deepStrictEqual(statuses, [200, 409], 'Exactly one request succeeds with 200, other fails with 409');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // 5. Issue 5: Downsampling Algorithm & Point Limits (A4 History API)
+  // -------------------------------------------------------------------------
+  describe('Issue 5: Telemetry History Downsampling Algorithm & Strict Point Limits', () => {
+    // Generate sample time series data with sharp peaks and troughs
+    function generateTimeSeries(count) {
+      const baseTime = Date.parse('2026-11-20T10:00:00.000Z');
+      const rows = [];
+      for (let i = 1; i <= count; i++) {
+        let temp = 30.0;
+        let soc = 85.0 - (i * 0.2);
+        let speed = 40.0;
+
+        // Sharp peak at index 10 (temp 78°C)
+        if (i === 10) temp = 78.0;
+        // Sharp trough at index 25 (temp 12°C)
+        if (i === 25) temp = 12.0;
+        // Sharp drop in SOC at index 40 (SOC 5%)
+        if (i === 40) soc = 5.0;
+        // Peak speed at index 48 (speed 180 km/h)
+        if (i === 48) speed = 180.0;
+
+        rows.push({
+          seq: i,
+          ts: new Date(baseTime + (i * 1000)).toISOString(),
+          soc_pct: soc,
+          battery_temp_c: temp,
+          speed_kmh: speed,
+          lat: 13.0800,
+          lng: 80.2700,
+          odometer_km: 10 + (i * 0.1),
+          charging: 0
+        });
+      }
+      return rows;
+    }
+
+    test('targetPoints = 1: returns at most 1 point, preserving first reading', () => {
+      const rows = generateTimeSeries(50);
+      const result = downsampleMinMax(rows, 1);
+      assert.ok(result.length <= 1, `Expected <= 1, got ${result.length}`);
+      assert.strictEqual(result.length, 1);
+      assert.strictEqual(result[0].seq, rows[0].seq, 'Must preserve first reading');
+    });
+
+    test('targetPoints = 2: returns at most 2 points, preserving first and last readings', () => {
+      const rows = generateTimeSeries(50);
+      const result = downsampleMinMax(rows, 2);
+      assert.ok(result.length <= 2, `Expected <= 2, got ${result.length}`);
+      assert.strictEqual(result.length, 2);
+      assert.strictEqual(result[0].seq, rows[0].seq, 'Must preserve first reading');
+      assert.strictEqual(result[1].seq, rows[rows.length - 1].seq, 'Must preserve last reading');
+    });
+
+    test('targetPoints = 3: returns at most 3 points, preserving first, last, and prominent peak', () => {
+      const rows = generateTimeSeries(50);
+      const result = downsampleMinMax(rows, 3);
+      assert.ok(result.length <= 3, `Expected <= 3, got ${result.length}`);
+      assert.strictEqual(result[0].seq, rows[0].seq, 'Must preserve first reading');
+      assert.strictEqual(result[result.length - 1].seq, rows[rows.length - 1].seq, 'Must preserve last reading');
+
+      // Verify no duplicates
+      const seqs = result.map(r => r.seq);
+      assert.strictEqual(new Set(seqs).size, seqs.length, 'Must contain no duplicates');
+
+      // Verify strictly chronological
+      for (let i = 1; i < result.length; i++) {
+        assert.ok(Date.parse(result[i].ts) >= Date.parse(result[i - 1].ts), 'Chronological order');
+      }
+    });
+
+    test('targetPoints = 4: returns at most 4 points, preserving first, last, and min/max extremes', () => {
+      const rows = generateTimeSeries(50);
+      const result = downsampleMinMax(rows, 4);
+      assert.ok(result.length <= 4, `Expected <= 4, got ${result.length}`);
+      assert.strictEqual(result[0].seq, rows[0].seq);
+      assert.strictEqual(result[result.length - 1].seq, rows[rows.length - 1].seq);
+
+      const seqs = result.map(r => r.seq);
+      assert.strictEqual(new Set(seqs).size, seqs.length, 'No duplicate points');
+
+      for (let i = 1; i < result.length; i++) {
+        assert.ok(Date.parse(result[i].ts) >= Date.parse(result[i - 1].ts));
+      }
+    });
+
+    test('targetPoints = 5: returns at most 5 points, preserving first, last, and multiple extremes', () => {
+      const rows = generateTimeSeries(50);
+      const result = downsampleMinMax(rows, 5);
+      assert.ok(result.length <= 5, `Expected <= 5, got ${result.length}`);
+      assert.strictEqual(result[0].seq, rows[0].seq);
+      assert.strictEqual(result[result.length - 1].seq, rows[rows.length - 1].seq);
+
+      const seqs = result.map(r => r.seq);
+      assert.strictEqual(new Set(seqs).size, seqs.length, 'No duplicate points');
+
+      for (let i = 1; i < result.length; i++) {
+        assert.ok(Date.parse(result[i].ts) >= Date.parse(result[i - 1].ts));
+      }
+    });
+
+    test('Larger targetPoints values (e.g. 10, 20, 100): strictly respects limit', () => {
+      const rows = generateTimeSeries(500);
+      for (const target of [10, 20, 50, 100]) {
+        const result = downsampleMinMax(rows, target);
+        assert.ok(result.length <= target, `Expected <= ${target}, got ${result.length}`);
+        assert.strictEqual(result[0].seq, rows[0].seq, 'Preserves first');
+        assert.strictEqual(result[result.length - 1].seq, rows[rows.length - 1].seq, 'Preserves last');
+
+        const seqs = result.map(r => r.seq);
+        assert.strictEqual(new Set(seqs).size, seqs.length, 'Zero duplicates');
+
+        for (let i = 1; i < result.length; i++) {
+          assert.ok(Date.parse(result[i].ts) >= Date.parse(result[i - 1].ts), 'Chronological');
+        }
+      }
+    });
+
+    test('Empty input: returns empty array', () => {
+      assert.deepStrictEqual(downsampleMinMax([], 5), []);
+      assert.deepStrictEqual(downsampleMinMax(null, 5), []);
+      assert.deepStrictEqual(downsampleMinMax(undefined, 5), []);
+    });
+
+    test('Input containing fewer points than requested limit: preserves all points', () => {
+      const rows = generateTimeSeries(3);
+      const result = downsampleMinMax(rows, 10);
+      assert.ok(result.length <= 10);
+      assert.strictEqual(result.length, 3);
+      assert.deepStrictEqual(result.map(r => r.seq), [1, 2, 3]);
+    });
+
+    test('Data containing sharp peaks and troughs: captures peak and trough accurately', () => {
+      const rows = generateTimeSeries(100);
+      const result = downsampleMinMax(rows, 15);
+      assert.ok(result.length <= 15, `Expected <= 15, got ${result.length}`);
+
+      const temps = result.map(r => r.battery_temp_c);
+      const socs = result.map(r => r.soc_pct);
+
+      assert.ok(temps.includes(78.0), 'Must capture peak temperature 78°C');
+      assert.ok(temps.includes(12.0), 'Must capture trough temperature 12°C');
+      assert.ok(socs.includes(5.0), 'Must capture minimum SOC 5%');
+    });
+
+    test('Duplicate timestamps and sequence numbers are cleanly deduplicated', () => {
+      const baseTime = Date.parse('2026-11-20T10:00:00.000Z');
+      const rowsWithDups = [
+        { seq: 1, ts: new Date(baseTime).toISOString(), soc_pct: 80, battery_temp_c: 25, speed_kmh: 0 },
+        { seq: 1, ts: new Date(baseTime).toISOString(), soc_pct: 80, battery_temp_c: 25, speed_kmh: 0 }, // Duplicate
+        { seq: 2, ts: new Date(baseTime + 1000).toISOString(), soc_pct: 79, battery_temp_c: 55, speed_kmh: 30 },
+        { seq: 2, ts: new Date(baseTime + 1000).toISOString(), soc_pct: 79, battery_temp_c: 55, speed_kmh: 30 }, // Duplicate
+        { seq: 3, ts: new Date(baseTime + 2000).toISOString(), soc_pct: 78, battery_temp_c: 25, speed_kmh: 0 }
+      ];
+
+      const result = downsampleMinMax(rowsWithDups, 3);
+      assert.ok(result.length <= 3, `Expected <= 3, got ${result.length}`);
+      assert.strictEqual(result.length, 3);
+      assert.deepStrictEqual(result.map(r => r.seq), [1, 2, 3], 'Duplicates must be removed');
+    });
+
+    test('HTTP API GET /v1/vehicles/:id/history accepts targetPoints query parameter and enforces limit', async () => {
+      const vid = `VG-ISSUE5-HTTP-${Date.now()}`;
+      db.prepare(`
+        INSERT INTO vehicles (vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at)
+        VALUES (?, '2026-11-20T10:50:00Z', 50, 70, 30, 20, 13.08, 80.27, 10, 0, 'online', 1, 50, 50, datetime('now'))
+      `).run(vid);
+
+      const insertStmt = db.prepare(`
+        INSERT INTO telemetry_history (vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, fault_codes, received_at)
+        VALUES (?, ?, ?, 80, 25, 0, 13.08, 80.27, 10, 0, '[]', datetime('now'))
+      `);
+
+      const baseTime = Date.parse('2026-11-20T10:00:00.000Z');
+      for (let i = 1; i <= 30; i++) {
+        insertStmt.run(vid, i, new Date(baseTime + (i * 1000)).toISOString());
+      }
+
+      // Query with targetPoints=3
+      const res3 = await fetch(`${baseUrl}/v1/vehicles/${vid}/history?targetPoints=3`);
+      assert.strictEqual(res3.status, 200);
+      const data3 = await res3.json();
+      assert.ok(data3.returned_count <= 3, `Expected <= 3, got ${data3.returned_count}`);
+      assert.ok(data3.points.length <= 3);
+
+      // Query with points=4
+      const res4 = await fetch(`${baseUrl}/v1/vehicles/${vid}/history?points=4`);
+      assert.strictEqual(res4.status, 200);
+      const data4 = await res4.json();
+      assert.ok(data4.returned_count <= 4, `Expected <= 4, got ${data4.returned_count}`);
+      assert.ok(data4.points.length <= 4);
     });
   });
 });
