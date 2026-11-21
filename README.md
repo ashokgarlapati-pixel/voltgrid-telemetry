@@ -229,8 +229,34 @@ Signatures are validated using constant-time comparison (`crypto.timingSafeEqual
 * Default configuration: Burst Capacity = 40 tokens, Refill Rate = 20 tokens/sec.
 * Rate-limited requests return `HTTP 429 Too Many Requests` with a calculated `Retry-After: <seconds>` header. Requests rejected with `HTTP 429` do NOT consume tokens.
 
-### 5. Two-Instance Multi-Process Architecture
-Both `api` and `api2` containers share the exact same SQLite database file through a shared mounted Docker volume (`sqlite_data:/data`). SQLite's `BEGIN IMMEDIATE` write transactions and file-locking primitives guarantee that atomic token subtractions and signature recordings remain fully serialized across both processes with zero race conditions, lost updates, or over-consumption.
+### 5. Multi-Instance Architecture & Production Boundaries
+
+#### Same-Host Multi-Process Model (Current Implementation)
+In `docker-compose.yml`, both `api` (port 3000) and `api2` (port 3001) containers mount the identical named volume (`sqlite_data:/data`) sharing `/data/voltgrid.db` on a single host:
+* **WAL Mode & POSIX File Locking**: SQLite write-ahead logging (`PRAGMA journal_mode = WAL`) coordinates multiple local OS processes via kernel-level shared memory (`.shm` file via `mmap`) and POSIX byte-range file locks (`fcntl`/`flock`).
+* **Serialized Atomic Transactions**: All rate-limit token updates, cryptographic nonce insertions, and batch ingestions execute inside `BEGIN IMMEDIATE` transactions backed by `busy_timeout = 5000ms`. SQLite's write lock guarantees that operations across both API instances serialize cleanly with zero race conditions, lost token decrements, or duplicate insertions.
+* **Verified Shared State**: Integration tests (`backend/tests/security.two_instance.test.js`) empirically verify shared token bucket rate limiting, token replenishment over time, cryptographic replay rejection across instances, and cross-instance telemetry deduplication idempotency (`PRIMARY KEY (vehicle_id, seq)`).
+
+#### Multi-Host Limitation: Why Network Filesystems Break SQLite
+SQLite with a shared database file is **strictly a same-host multi-process architecture**, not a distributed database:
+* **Shared Memory (`.shm`) Requirement**: SQLite WAL mode coordinates index access and transaction states using a memory-mapped shared file (`-shm`). Shared memory mappings cannot span physical host boundaries or separate operating system kernels.
+* **Network Filesystem Locking Flaws**: Network filesystems (NFS, SMB/CIFS, AWS EFS, GlusterFS) have notoriously unreliable or broken lock daemons (`lockd`/`fcntl`). Network latency spikes, network partitions, and aggressive client-side caching cause stale reader views, broken write exclusivity, and silent database corruption.
+* **Not a Client-Server Database**: SQLite is an embedded library linked into each Node process. It does not speak a network wire protocol, cannot elect a distributed leader, and cannot maintain consensus across separate machines.
+
+#### Production Migration Path for True Distributed Horizontal Scaling
+To scale horizontally across multiple physical or virtual machines, replace the embedded storage layer with dedicated distributed infrastructure:
+1. **Relational & Operational Core (PostgreSQL / Amazon Aurora)**:
+   * Migrate vehicles, alerts, API keys, and migrations to PostgreSQL with connection pooling (PgBouncer).
+   * ACID transactions, row-level locking (`SELECT ... FOR UPDATE`), and read replicas handle operational concurrency safely.
+2. **Distributed Coordination & Caching (Redis Cluster)**:
+   * **Atomic Rate Limiting**: Implement the token bucket in Redis using atomic Lua scripts (`EVALSHA`) or the Redis Cell module.
+   * **Replay Protection**: Store HMAC signatures in Redis with a 5-minute TTL (`SET nonce 1 EX 300 NX`), eliminating database bloat and disk I/O.
+   * **Multi-Instance SSE Pub/Sub**: Deploy Redis Pub/Sub, Redis Streams, or NATS as an event bus. When any API instance commits an alert or vehicle update, it publishes to the message bus; all API instances subscribe and broadcast to their respective local SSE connections (`connectedClients`).
+3. **High-Throughput Time-Series Telemetry (Apache Kafka + ClickHouse / TimescaleDB)**:
+   * Decouple HTTP ingestion from database writes via an Apache Kafka buffer.
+   * Ingest batched telemetry into ClickHouse partitioned by day for sub-second analytical aggregations and cold Parquet export to S3.
+4. **Worker Coordination & Leader Election**:
+   * Coordinate background sweeps (`offlineWorker`) and retention pruning using distributed leader election (Kubernetes Leases, etcd, or Redis Redlock) so only a single active leader executes background tasks.
 
 ---
 

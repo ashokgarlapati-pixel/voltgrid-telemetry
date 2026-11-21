@@ -3,14 +3,14 @@
 ## 1. Scale: Scaling to 200,000 Vehicles (~40,000 readings/sec)
 
 ### The First Failure Point
-The single-writer bottleneck in SQLite's WAL mode breaks first. While WAL allows concurrent readers, write transactions (`BEGIN IMMEDIATE`) are strictly serialized. At our current 2,000-vehicle fleet (~400 readings/sec in batches), lock hold times average 5–15 ms, easily staying within `busy_timeout = 5000`. At 40,000 readings/sec (~400 batches/sec), writes queue up faster than SQLite can commit them to disk, triggering `SQLITE_BUSY: database is locked`.
+The single-writer bottleneck in SQLite's WAL mode breaks first. While WAL allows concurrent readers, write transactions (`BEGIN IMMEDIATE`) are strictly serialized. At our current 2,000-vehicle fleet (~400 readings/sec in batches), lock hold times average 5–15 ms (well within `busy_timeout = 5000ms`). At 40,000 readings/sec (~400 batches/sec), writes queue up faster than SQLite can commit them to disk, triggering `SQLITE_BUSY: database is locked`. Furthermore, SQLite is strictly single-host: its WAL coordination relies on kernel shared memory (`.shm`), precluding multi-host scale-out over network filesystems (NFS/EFS).
 
 ### Subsequent Bottlenecks & Fixes
-1. **Node.js Event Loop Saturation**: Parsing ~20 MB/sec of JSON and computing 400 HMAC-SHA256 hashes per second will peg a single core at 100% CPU.
-   * *Fix*: Put stateless Node instances behind an ALB/Nginx using Node cluster mode, and offload HMAC verification to an API Gateway.
-2. **Disk I/O Write Amplification**: Ingesting ~3.45 billion rows/day across composite indexes `(vehicle_id, seq)` and `(vehicle_id, ts)` will exhaust NVMe write endurance.
-   * *Fix*: Stream telemetry into Apache Kafka, then batch-load into a columnar time-series database (ClickHouse) partitioned daily by date.
-3. **In-Memory SSE Fan-out & Heartbeat Scans**: Scanning 200k vehicles every 10s takes ~100 ms, while pushing 40k events/sec to thousands of browser clients will choke Node memory.
+1. **Node.js Event Loop Saturation**: Parsing ~20 MB/s of JSON and computing 400 HMAC-SHA256 hashes/s saturates a single CPU core.
+   * *Fix*: Offload HMAC verification to an API Gateway and deploy stateless Node instances in cluster mode behind an ALB/Nginx.
+2. **Disk I/O Write Amplification**: Ingesting ~3.45 billion rows/day across composite indexes `(vehicle_id, seq)` and `(vehicle_id, ts)` exhausts NVMe write endurance.
+   * *Fix*: Stream telemetry into Apache Kafka, then batch-load into a columnar time-series database (ClickHouse) partitioned daily.
+3. **In-Memory SSE Fan-out & Heartbeat Scans**: Scanning 200k vehicles every 10s takes ~100 ms; pushing 40k events/s exhausts Node heap memory.
    * *Fix*: Use a Redis Sorted Set (`ZREVRANGEBYSCORE`) for $O(\log N)$ offline sweeps, and fan out SSE via Redis Pub/Sub.
 
 ---
@@ -18,13 +18,13 @@ The single-writer bottleneck in SQLite's WAL mode breaks first. While WAL allows
 ## 2. Ingestion Delivery & Idempotency
 
 We use an **at-least-once delivery model with idempotent writes** to achieve effectively-once state:
-1. `telemetry_history` has a compound primary key: `PRIMARY KEY (vehicle_id, seq)`.
-2. In `ingestion.js`, batches run inside an immediate transaction using `INSERT OR IGNORE`. If a reading already exists, SQLite ignores it (`changes === 0`), increments our duplicate counter, and skips updating the vehicle's live state.
-3. Our 20-client concurrency test proves this: sending the same 50-item batch simultaneously across 20 connections results in exactly 50 accepted rows, 950 duplicate drops, and zero data corruption.
+1. `telemetry_history` enforces database-level idempotency via compound `PRIMARY KEY (vehicle_id, seq)`.
+2. In `ingestion.js`, batches execute inside an immediate transaction using `INSERT OR IGNORE`. Existing readings are dropped (`changes === 0`), duplicate counters increment, and vehicle state upserts are safely bypassed.
+3. Our 20-client concurrency test validates this: submitting the same 50-item batch across 20 parallel connections yields exactly 50 accepted rows, 950 duplicate drops, and zero data corruption.
 
-### Where Edge Cases Still Bite
-* **Firmware Sequence Reset**: If an IoT device resets its hardware `seq` to 0 after a firmware flash, `INSERT OR IGNORE` will drop legitimate readings until `seq` exceeds the vehicle's historical maximum.
-* **Network Partition on Commit**: If SQLite commits a batch but the cellular connection drops before the HTTP 200 response reaches the vehicle, the vehicle retries. The retry is safely deduplicated, but client confirmation is delayed.
+### Edge Failure Modes
+* **Firmware Sequence Reset**: If an IoT device resets hardware `seq` to 0 post-flash, `INSERT OR IGNORE` drops legitimate readings until `seq` exceeds the historical maximum.
+* **Network Partition on Commit**: If SQLite commits a batch but cellular connection drops before HTTP 200 reaches the vehicle, the client retries. Deduplication prevents duplicates, but client confirmation is delayed.
 
 ---
 
@@ -33,24 +33,24 @@ We use an **at-least-once delivery model with idempotent writes** to achieve eff
 ### What We Trust
 * **Device Time (`ts`)**: Trusted for telemetry history, downsampling, and alert evaluations. In `ingestion.js`, we update the `vehicles` state table using:
   `last_ts = CASE WHEN excluded.last_ts > vehicles.last_ts OR (excluded.last_ts = vehicles.last_ts AND excluded.last_seq > vehicles.last_seq) THEN excluded.last_ts ELSE vehicles.last_ts END`
-  This guarantees that delayed readings coming out of cell tunnels never overwrite newer state.
-* **Server Time (`updated_at` / `received_at`)**: Trusted for offline detection sweeps (`offlineWorker.js`) and HMAC replay window checks (`security.js`). A disconnected vehicle cannot report its own death; silence must be measured by the server's clock.
+  This guarantees that delayed readings emerging from cellular dead-zones never overwrite newer state.
+* **Server Time (`updated_at` / `received_at`)**: Trusted for offline detection sweeps (`offlineWorker.js`) and HMAC replay window checks (`security.js`). A disconnected vehicle cannot report its own death; silence must be measured by the server clock.
 
-### Separation of Timestamps & Tolerance Windows
-We enforce two completely decoupled timestamp validations operating at different lifecycle layers:
+### Decoupled Timestamp Validations
+We enforce two completely independent timestamp validations operating at different lifecycle layers:
 1. **HTTP Transport Authentication (`X-Timestamp`)**: Evaluated in `security.js` against a $\pm 5$-minute tolerance window ($|T_{\text{server}} - T_{\text{req}}| \le 300\text{s}$) to prevent replay attacks. Expired or future-skewed timestamps halt processing at the auth boundary, returning **`HTTP 401 Unauthorized`**.
 2. **Telemetry Reading Timestamp (`reading.ts`)**: Evaluated per reading inside the ingestion pipeline (`ingestion.js`) against $[T_{\text{server}} - 10\text{m}, T_{\text{server}} + 30\text{s}]$. Stale readings (>10 min lateness) or future-skewed readings (>30s clock drift) are individually rejected, returning **`HTTP 207 Multi-Status`** with `status: 'rejected'` (never HTTP 401).
 
-*The "1-Day Clock Error" Distinction*: If a vehicle with a valid HMAC signature and fresh `X-Timestamp` submits a reading dated 1 day in the past or future, transport authentication succeeds and hands off to ingestion (`next()`). The ingestion engine then rejects the stale reading, returning `HTTP 207 Multi-Status`—**never** `HTTP 401`.
+*The "1-Day Clock Error" Distinction*: If a vehicle with a valid HMAC signature and fresh `X-Timestamp` submits a reading dated 1 day in the past or future, transport authentication succeeds and hands off to ingestion (`next()`). The ingestion engine then rejects the stale reading with `HTTP 207 Multi-Status`—**never** `HTTP 401`.
 
 ---
 
 ## 4. Alert Engine & Order Independence
 
 ### Rule Logic
-* **Overheat**: Triggers after 3 consecutive readings `> 55.0°C`. Resolves after 3 consecutive readings `<= 50.0°C` (hysteresis prevents flapping).
-* **Rapid Discharge**: Triggers if SOC drops $> 8.0\%$ across non-charging readings within a rolling 5-minute device-time window. Resolves when charging starts, discharge slows, or the 5m window expires.
-* **Geofence Breach**: Ray-casting algorithm checks coordinates against the Chennai operating polygon. Re-entering clears the alert.
+* **Overheat**: Triggers after 3 consecutive readings `> 55.0°C`. Resolves after 3 consecutive readings `<= 50.0°C` (50–55°C hysteresis prevents flapping).
+* **Rapid Discharge**: Triggers if SOC drops $> 8.0\%$ across non-charging readings within a rolling 5-minute window. Resolves when charging starts, discharge slows, or the 5m window expires.
+* **Geofence Breach**: Ray-casting point-in-polygon algorithm checks coordinates against the Chennai operating perimeter. Re-entry clears the alert.
 * **Offline Detection**: A background worker checks online vehicles whose server `updated_at` is older than 90s. When new telemetry arrives, the vehicle resets to `online` and resolves the offline alert in the same database transaction.
 
 ### Replay & Order Independence
@@ -71,7 +71,7 @@ The prototype stores all telemetry as raw records in SQLite `telemetry_history`.
 * **Theoretical Sizing (~220 B/row)**: ~120 B payload + ~100 B index overhead across `PRIMARY KEY (vehicle_id, seq)` and `(vehicle_id, ts)`.
   * *Daily*: $34.56\text{M} \times 220\text{ B} \approx 7.60\text{ GB/day}$ ($7.08\text{ GiB}$; rounded 35M: $7.70\text{ GB/day}$).
   * *7-Day Hot Tier*: $7 \times 7.60\text{ GB} \approx 53.22\text{ GB}$ ($49.57\text{ GiB}$; rounded 35M: $53.90\text{ GB} \approx \mathbf{54\text{ GB}}$).
-* **Empirical Measurement (~273 B/reading)**: The dedicated 5M benchmark database is exactly $1{,}365{,}295{,}104\text{ bytes}$ ($1{,}302.05\text{ MiB}$ binary / $1{,}365.30\text{ MB}$ decimal), yielding $273.06\text{ bytes/reading}$ across the full database file (`telemetry_history`, `vehicles`, `alerts`, indexes, and B-tree page headers).
+* **Empirical Measurement (~273 B/reading)**: The dedicated 5M benchmark database is exactly $1{,}365{,}295{,}104\text{ bytes}$ ($1{,}302.05\text{ MiB}$ binary / $1{,}365.30\text{ MB}$ decimal), yielding $273.06\text{ bytes/reading}$ across the full database file (`telemetry_history`, `vehicles`, `alerts`, indexes, and B-tree page allocations).
   * *Daily*: $34.56\text{M} \times 273.06\text{ B} \approx 9.44\text{ GB/day}$ ($8.79\text{ GiB}$; rounded 35M: $9.56\text{ GB/day}$).
   * *7-Day Hot Tier*: $7 \times 9.44\text{ GB} \approx 66.06\text{ GB}$ ($61.52\text{ GiB}$; rounded 35M: $66.90\text{ GB} \approx \mathbf{67\text{ GB}}$).
 * **Storage Realities**: Actual SQLite page overhead depends on schema, page size (4KB), index count, and insertion patterns (empirical measurement, not a universal B-tree fill-factor guarantee). SQLite `-wal` size is workload- and checkpoint-dependent temporary disk usage.
@@ -89,7 +89,7 @@ The prototype stores all telemetry as raw records in SQLite `telemetry_history`.
 * **Request Tampering**: All batch ingestion requires `X-API-Key`, `X-Timestamp`, and `X-Signature`. We verify HMAC-SHA256 signatures over `${timestamp}.${rawBody}` using `crypto.timingSafeEqual`.
 * **Replay Attacks**: Signatures are cached in `used_nonces` table with a 5-minute expiry. Duplicate signatures fail immediately. Expired nonces are purged via throttled cleanups.
 * **Distributed DoS / Spam**: We maintain an atomic token-bucket rate limiter in SQLite (`rate_limits` table: capacity 40, refill 20 req/s). Exceeded quotas return `HTTP 429` with `Retry-After`.
-* **Multi-Instance Coordination**: When two Docker containers share the same SQLite file, `BEGIN IMMEDIATE` transactions rely on OS file locking in WAL mode to serialize token consumption without Redis.
+* **Multi-Instance Coordination & Boundaries**: On a single host, two Docker containers share the local SQLite file; `BEGIN IMMEDIATE` utilizes OS file locks and WAL shared memory (`.shm`) to serialize token buckets, nonces, and ingestion idempotency without Redis. Crucially, this is strictly a single-host scale-up mechanism—SQLite WAL cannot operate over network filesystems (NFS/EFS) due to lack of cross-host POSIX shared memory and unreliable distributed file locks. Production multi-host scaling requires PostgreSQL for relational data, Redis for distributed token buckets, nonces, and SSE pub/sub, and Kafka/ClickHouse for raw telemetry.
 
 ---
 

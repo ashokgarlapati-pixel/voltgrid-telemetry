@@ -919,6 +919,37 @@ When a request arrives:
 
 ---
 
+## 19.1 Multi-Instance Architecture & Production Boundaries
+
+### Same-Host Multi-Process Model (Current Implementation)
+In `docker-compose.yml`, both `api` (port 3000) and `api2` (port 3001) containers mount the shared volume `sqlite_data:/data` accessing `/data/voltgrid.db`:
+* **WAL Mode & POSIX File Locking**: SQLite WAL mode coordinates multiple local processes via OS-level shared memory (`.shm` file via `mmap`) and POSIX byte-range file locks (`fcntl`/`flock`).
+* **Serialized Atomic Transactions**: Token updates, cryptographic nonce insertions, and batch ingestions execute in `BEGIN IMMEDIATE` transactions with `busy_timeout = 5000ms`, guaranteeing serial execution without lost updates or race conditions.
+* **Verified Shared State**: Integration tests (`backend/tests/security.two_instance.test.js`) empirically verify shared rate limiting, token replenishment, replay attack rejection, and telemetry ingestion deduplication across instances.
+
+### Multi-Host Limitation (Why Network Filesystems Break SQLite)
+SQLite with a shared database file is strictly a same-host multi-process architecture:
+* **Shared Memory (`.shm`) Requirement**: SQLite WAL mode coordinates index access and transaction states using a memory-mapped shared file (`-shm`). Shared memory mappings cannot span physical host boundaries or separate operating system kernels.
+* **Network Filesystem Locking Flaws**: Network filesystems (NFS, SMB/CIFS, AWS EFS, GlusterFS) have notoriously unreliable or broken lock daemons (`lockd`/`fcntl`). Network latency spikes, network partitions, and client-side caching cause stale reader views, broken write exclusivity, and silent database corruption.
+* **Not a Client-Server Database**: SQLite is an embedded library linked into each Node process. It does not speak a network wire protocol, cannot elect a distributed leader, and cannot maintain consensus across separate machines.
+
+### Production Migration Path for True Distributed Horizontal Scaling
+To scale horizontally across multiple physical or virtual machines:
+1. **Relational & Operational Core (PostgreSQL / Amazon Aurora)**:
+   * Migrate vehicles, alerts, API keys, and migrations to PostgreSQL with connection pooling (PgBouncer).
+   * ACID transactions, row-level locking (`SELECT ... FOR UPDATE`), and read replicas handle operational concurrency safely.
+2. **Distributed Coordination & Caching (Redis Cluster)**:
+   * **Atomic Rate Limiting**: Implement the token bucket in Redis using atomic Lua scripts (`EVALSHA`) or the Redis Cell module.
+   * **Replay Protection**: Store HMAC signatures in Redis with a 5-minute TTL (`SET nonce 1 EX 300 NX`), eliminating database bloat and disk I/O.
+   * **Multi-Instance SSE Pub/Sub**: Deploy Redis Pub/Sub, Redis Streams, or NATS as an event bus. When any API instance commits an alert or vehicle update, it publishes to the message bus; all API instances subscribe and broadcast to their respective local SSE connections (`connectedClients`).
+3. **High-Throughput Time-Series Telemetry (Apache Kafka + ClickHouse / TimescaleDB)**:
+   * Decouple HTTP ingestion from database writes via an Apache Kafka buffer.
+   * Ingest batched telemetry into ClickHouse partitioned by day for sub-second analytical aggregations and cold Parquet export to S3.
+4. **Worker Coordination & Leader Election**:
+   * Coordinate background sweeps (`offlineWorker`) and retention pruning using distributed leader election (Kubernetes Leases, etcd, or Redis Redlock) so only a single active leader executes background tasks.
+
+---
+
 ## 20. Live SSE Streaming Engine (Part A5)
 
 ### 1. Monotonic Event IDs & Last-Event-ID Resume
@@ -947,7 +978,7 @@ At full scale, 2,000 vehicles transmitting every 5 seconds produce **400 reading
 
 ### Q1: "How does your rate limiter stay correct if two instances of your API run behind a load balancer?"
 > **Answer**:
-> *"Instead of keeping in-memory counters per process, rate limit tokens are stored in the shared `rate_limits` table (`tokens REAL`, `last_refill_ms INTEGER`). Every rate limit check runs inside a `BEGIN IMMEDIATE` transaction in `security.js`. SQLite's write lock serializes the check across both API instances, calculating token refills and decrements atomically. Neither instance can over-allocate tokens or overwrite the other's refills."*
+> *"On a single host, both API instances share the same local SQLite database file in WAL mode. Rate limit tokens are stored in the shared `rate_limits` table (`tokens REAL`, `last_refill_ms INTEGER`). Every rate limit check runs inside a `BEGIN IMMEDIATE` transaction in `security.js`. SQLite's write lock serializes the check across both API instances via OS kernel file locks, calculating token refills and decrements atomically. Neither instance can over-allocate tokens or overwrite the other's refills. For multi-host deployments across separate physical or virtual machines, SQLite cannot safely span network filesystems (NFS/EFS); in production, rate limiting is migrated to Redis Cluster using atomic Lua token-bucket scripts (`EVALSHA`)."*
 
 ### Q2: "A client reconnects to the SSE stream. How do you know it has not missed or doubled an event?"
 > **Answer**:
@@ -955,10 +986,9 @@ At full scale, 2,000 vehicles transmitting every 5 seconds produce **400 reading
 
 ### Q3: "What happens if a vehicle clock drifts by 25 seconds? What if it's wrong by a day?"
 > **Answer**:
-> *"1. If a clock drifts by 25 seconds, it falls well within our 5-minute validity window ($\pm 300$s). The HMAC timestamp check succeeds, and `ingestion.js` uses device timestamp `ts` for vehicle state ordering while recording current server time in `received_at`.
-> 2. If a vehicle clock is wrong by a day, the request timestamp fails the 5-minute window check:
-> `Math.abs(Date.now() - reqTimeMs) > 300000`
-> The request is rejected with `HTTP 401 Unauthorized` ('Request timestamp is outside the allowed 5-minute window'), protecting against replayed stale packets."*
+> *"We enforce two independent timestamp validations operating at different lifecycle layers:
+> 1. Transport Authentication Window (`X-Timestamp`): Checked in `security.js` against $|T_{\text{server}} - T_{\text{req}}| \le 300\text{s}$ (5 minutes). If the request header timestamp is wrong by a day, it fails transport authentication immediately with `HTTP 401 Unauthorized` (replay defense).
+> 2. Telemetry Reading Window (`reading.ts`): If transport authentication succeeds with a fresh request timestamp, but an individual reading has a timestamp 25 seconds off, it is accepted if within $[T_{\text{server}} - 10\text{m}, T_{\text{server}} + 30\text{s}]$ (25 seconds drift is well within tolerance). If a reading has a 1-day device clock error, transport auth succeeds and hands off to ingestion, where the reading is rejected with `HTTP 207 Multi-Status` (`status: 'rejected'`), never HTTP 401."*
 
 ### Q4: "How does your system prevent 400 readings/sec from freezing connected browser dashboards?"
 > **Answer**:

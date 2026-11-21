@@ -325,4 +325,78 @@ describe('Part A2: Two-Instance Shared SQLite Integration Tests', () => {
     assert.strictEqual(resMalformed.status, 401);
     assert.strictEqual(resMalformed.body.error, 'Invalid HMAC signature');
   });
+
+  test('TEST 6: Telemetry Ingestion Idempotency across 2 instances', async () => {
+    const vehicleId = `VG-TWO-DUP-${Date.now()}`;
+    const reading = {
+      vehicle_id: vehicleId,
+      seq: 10,
+      ts: new Date().toISOString(),
+      soc_pct: 75.5,
+      battery_temp_c: 32.0,
+      speed_kmh: 45.0,
+      lat: 13.0827,
+      lng: 80.2707,
+      odometer_km: 120.5,
+      charging: false,
+      fault_codes: []
+    };
+
+    // 1. Post original reading to Instance 1 -> accepted: 1, duplicates: 0
+    const res1 = await postSigned(baseUrl1, [reading]);
+    assert.strictEqual(res1.status, 200, 'Original batch to Instance 1 must return HTTP 200');
+    assert.strictEqual(res1.body.summary.accepted, 1, 'Instance 1 must accept the fresh reading');
+    assert.strictEqual(res1.body.summary.duplicates, 0, 'Instance 1 duplicate count must be 0');
+
+    // 2. Post identical reading (same vehicle_id and seq) to Instance 2 with fresh timestamp/signature -> accepted: 0, duplicates: 1
+    const res2 = await postSigned(baseUrl2, [reading]);
+    assert.strictEqual(res2.status, 200, 'Duplicate batch to Instance 2 must return HTTP 200');
+    assert.strictEqual(res2.body.summary.accepted, 0, 'Instance 2 must not accept duplicate reading');
+    assert.strictEqual(res2.body.summary.duplicates, 1, 'Instance 2 must report duplicate count of 1');
+
+    // 3. Direct SQLite verification: exactly 1 row persisted in telemetry_history
+    let rowCount = 0;
+    if (typeof testDb.prepare === 'function') {
+      const row = testDb.prepare('SELECT COUNT(*) as count FROM telemetry_history WHERE vehicle_id = ? AND seq = ?').get(vehicleId, 10);
+      rowCount = Number(row.count);
+    }
+    assert.strictEqual(rowCount, 1, 'Shared database must contain exactly 1 row in telemetry_history for (vehicle_id, seq)');
+
+    // 4. Concurrent duplicate submission: fire identical reading simultaneously to both instances
+    const concVehicle = `VG-CONC-DUP-${Date.now()}`;
+    const concReading = {
+      vehicle_id: concVehicle,
+      seq: 1,
+      ts: new Date().toISOString(),
+      soc_pct: 82.0,
+      battery_temp_c: 28.5,
+      speed_kmh: 15.0,
+      lat: 13.0820,
+      lng: 80.2700,
+      odometer_km: 50.0,
+      charging: false,
+      fault_codes: []
+    };
+
+    const [concRes1, concRes2] = await Promise.all([
+      postSigned(baseUrl1, [concReading]),
+      postSigned(baseUrl2, [concReading])
+    ]);
+
+    assert.strictEqual(concRes1.status, 200);
+    assert.strictEqual(concRes2.status, 200);
+
+    const totalAccepted = concRes1.body.summary.accepted + concRes2.body.summary.accepted;
+    const totalDuplicates = concRes1.body.summary.duplicates + concRes2.body.summary.duplicates;
+
+    assert.strictEqual(totalAccepted, 1, 'Exactly one concurrent request must be accepted');
+    assert.strictEqual(totalDuplicates, 1, 'Exactly one concurrent request must be marked duplicate');
+
+    let concDbCount = 0;
+    if (typeof testDb.prepare === 'function') {
+      const row = testDb.prepare('SELECT COUNT(*) as count FROM telemetry_history WHERE vehicle_id = ? AND seq = ?').get(concVehicle, 1);
+      concDbCount = Number(row.count);
+    }
+    assert.strictEqual(concDbCount, 1, 'Shared database must contain exactly 1 row for concurrent duplicate');
+  });
 });
