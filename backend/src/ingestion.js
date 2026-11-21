@@ -20,7 +20,10 @@ const { trackTelemetryBatch } = require('./observability');
  * Validates a single telemetry reading individually.
  * Returns null if valid, or an error message string if invalid.
  */
-function validateReading(reading) {
+const TEN_MINUTES_MS = 10 * 60 * 1000;
+const THIRTY_SECONDS_MS = 30 * 1000;
+
+function validateReading(reading, serverNowMs = Date.now()) {
   if (!reading || typeof reading !== 'object' || Array.isArray(reading)) {
     return 'Reading must be a non-null object';
   }
@@ -32,6 +35,13 @@ function validateReading(reading) {
   }
   if (typeof reading.ts !== 'string' || reading.ts.trim().length === 0 || isNaN(Date.parse(reading.ts)) || isNaN(new Date(reading.ts).getTime())) {
     return 'ts must be a valid ISO timestamp string';
+  }
+  const readingTimeMs = Date.parse(reading.ts);
+  if (readingTimeMs < serverNowMs - TEN_MINUTES_MS) {
+    return 'ts cannot be older than 10 minutes';
+  }
+  if (readingTimeMs > serverNowMs + THIRTY_SECONDS_MS) {
+    return 'ts cannot be more than 30 seconds in the future';
   }
   if (!Number.isFinite(reading.soc_pct) || reading.soc_pct < 0 || reading.soc_pct > 100) {
     return 'soc_pct must be a finite number between 0 and 100';
@@ -225,8 +235,8 @@ const executeBatchTransaction = db.transaction((validItems, nowIso) => {
  * Validates each reading individually, handles idempotency and timestamp ordering,
  * tracks sequence gaps, and triggers order-independent alert evaluations.
  */
-function ingestBatch(readings) {
-  const nowIso = new Date().toISOString();
+function ingestBatch(readings, nowIso = new Date().toISOString()) {
+  const serverNowMs = Date.parse(nowIso);
   const validItems = [];
   const results = new Array(readings.length);
   let rejected = 0;
@@ -234,7 +244,7 @@ function ingestBatch(readings) {
   // Step 1: Individual validation (partial success guarantee)
   for (let i = 0; i < readings.length; i++) {
     const reading = readings[i];
-    const validationError = validateReading(reading);
+    const validationError = validateReading(reading, serverNowMs);
 
     if (validationError) {
       rejected++;

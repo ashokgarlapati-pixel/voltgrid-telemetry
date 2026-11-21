@@ -127,7 +127,7 @@ All requests to `POST /v1/telemetry/batch` must include HMAC-SHA256 authenticati
 Every reading in `POST /v1/telemetry/batch` is individually validated using `Number.isFinite()` and strict bounds:
 * `vehicle_id`: Non-empty string (`trimmed length >= 1`).
 * `seq`: Non-negative integer (`Number.isInteger(seq) && seq >= 0`).
-* `ts`: Valid ISO-8601 timestamp string (`!isNaN(Date.parse(ts))`).
+* `ts`: Valid ISO-8601 timestamp string (`!isNaN(Date.parse(ts))`) within $[T_{\text{server}} - 10\text{m}, T_{\text{server}} + 30\text{s}]$. Readings older than 10 minutes or more than 30 seconds ahead of server clock are rejected to prevent future timestamp state corruption.
 * `soc_pct`: Finite percentage `[0.0, 100.0]`.
 * `battery_temp_c`: Finite temperature `[-40.0°C, 120.0°C]` (automotive thermal envelope).
 * `speed_kmh`: Finite speed `[0.0, 200.0] km/h`.

@@ -504,7 +504,7 @@ describe('Part A5: Live Stream (SSE) Integration & Performance Tests', () => {
       await new Promise(r => setTimeout(r, 60));
 
       const TOTAL_READINGS = 400;
-      const baseTime = Date.parse('2026-11-20T12:00:00.000Z');
+      const baseTime = Date.now() - 60000;
       const readings = [];
 
       // Generate 400 readings across 20 vehicles (20 readings each)

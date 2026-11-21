@@ -63,11 +63,12 @@ describe('A1 Comprehensive Telemetry Ingestion Tests', () => {
     return { status: res.status, headers: res.headers, body };
   }
 
-  function createValidReading(vehicleId, seq = 1, ts = '2026-11-20T10:00:00.000Z') {
+  function createValidReading(vehicleId, seq = 1, ts = null) {
+    const defaultTs = new Date().toISOString();
     return {
       vehicle_id: vehicleId,
       seq,
-      ts,
+      ts: ts || defaultTs,
       soc_pct: 85.0,
       battery_temp_c: 30.0,
       speed_kmh: 35.0,
@@ -242,8 +243,9 @@ describe('A1 Comprehensive Telemetry Ingestion Tests', () => {
 
   test('Duplicate readings within same batch: accepts first, marks second duplicate', async () => {
     const vid = `VG-IN-BATCH-DUP-${Date.now()}`;
-    const r1 = createValidReading(vid, 1, '2026-11-20T10:00:00Z');
-    const r2 = { ...createValidReading(vid, 1, '2026-11-20T10:00:00Z'), soc_pct: 82.0 }; // duplicate seq 1
+    const now = Date.now();
+    const r1 = createValidReading(vid, 1, new Date(now - 5000).toISOString());
+    const r2 = { ...createValidReading(vid, 1, new Date(now - 5000).toISOString()), soc_pct: 82.0 }; // duplicate seq 1
 
     const res = await postSignedBatch([r1, r2]);
     assert.strictEqual(res.status, 200);
@@ -262,10 +264,11 @@ describe('A1 Comprehensive Telemetry Ingestion Tests', () => {
 
   test('Repeated requests with same readings: database idempotency', async () => {
     const vid = `VG-REPEATED-${Date.now()}`;
+    const now = Date.now();
     const batch = [
-      createValidReading(vid, 1, '2026-11-20T10:00:00Z'),
-      createValidReading(vid, 2, '2026-11-20T10:00:05Z'),
-      createValidReading(vid, 3, '2026-11-20T10:00:10Z')
+      createValidReading(vid, 1, new Date(now - 5000).toISOString()),
+      createValidReading(vid, 2, new Date(now - 4000).toISOString()),
+      createValidReading(vid, 3, new Date(now - 3000).toISOString())
     ];
 
     // First call: all 3 accepted
@@ -290,9 +293,10 @@ describe('A1 Comprehensive Telemetry Ingestion Tests', () => {
 
   test('Out-of-order telemetry: sequences arriving [3, 1, 2] are all stored and min/max seq correct', async () => {
     const vid = `VG-OOO-SEQ-${Date.now()}`;
-    const r3 = createValidReading(vid, 3, '2026-11-20T10:00:10Z');
-    const r1 = createValidReading(vid, 1, '2026-11-20T10:00:00Z');
-    const r2 = createValidReading(vid, 2, '2026-11-20T10:00:05Z');
+    const now = Date.now();
+    const r3 = createValidReading(vid, 3, new Date(now - 3000).toISOString());
+    const r1 = createValidReading(vid, 1, new Date(now - 5000).toISOString());
+    const r2 = createValidReading(vid, 2, new Date(now - 4000).toISOString());
 
     await postSignedBatch([r3]);
     await postSignedBatch([r1]);
@@ -309,11 +313,14 @@ describe('A1 Comprehensive Telemetry Ingestion Tests', () => {
 
   test('Late-arriving reading: older timestamp never overwrites newer vehicle state', async () => {
     const vid = `VG-LATE-${Date.now()}`;
-    const newer = createValidReading(vid, 10, '2026-11-20T10:05:00.000Z');
+    const now = Date.now();
+    const newerTs = new Date(now - 1000).toISOString();
+    const olderTs = new Date(now - 10000).toISOString();
+    const newer = createValidReading(vid, 10, newerTs);
     newer.soc_pct = 70.0;
     newer.speed_kmh = 45.0;
 
-    const older = createValidReading(vid, 8, '2026-11-20T10:01:00.000Z');
+    const older = createValidReading(vid, 8, olderTs);
     older.soc_pct = 95.0;
     older.speed_kmh = 10.0;
 
@@ -323,7 +330,94 @@ describe('A1 Comprehensive Telemetry Ingestion Tests', () => {
     const vRow = db.prepare('SELECT soc_pct, speed_kmh, last_ts, last_seq FROM vehicles WHERE vehicle_id = ?').get(vid);
     assert.strictEqual(vRow.soc_pct, 70.0, 'Live state must not be overwritten by older reading');
     assert.strictEqual(vRow.speed_kmh, 45.0);
-    assert.strictEqual(vRow.last_ts, '2026-11-20T10:05:00.000Z');
+    assert.strictEqual(vRow.last_ts, newerTs);
     assert.strictEqual(vRow.last_seq, 10);
+  });
+
+  describe('Issue 1: Telemetry Timestamp Window Validation [T - 10m, T + 30s]', () => {
+    test('A reading with a current timestamp is accepted', async () => {
+      const vid = `VG-TS-CUR-${Date.now()}`;
+      const r = createValidReading(vid, 1, new Date().toISOString());
+      const res = await postSignedBatch([r]);
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual(res.body.accepted, 1);
+      assert.strictEqual(res.body.rejected, 0);
+    });
+
+    test('A reading up to 10 minutes old is accepted', async () => {
+      const vid = `VG-TS-10M-${Date.now()}`;
+      const r = createValidReading(vid, 1, new Date(Date.now() - 10 * 60 * 1000 + 2000).toISOString());
+      const res = await postSignedBatch([r]);
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual(res.body.accepted, 1);
+      assert.strictEqual(res.body.rejected, 0);
+    });
+
+    test('A reading more than 10 minutes old (e.g. 11 minutes) is rejected', async () => {
+      const vid = `VG-TS-11M-${Date.now()}`;
+      const r = createValidReading(vid, 1, new Date(Date.now() - 11 * 60 * 1000).toISOString());
+      const res = await postSignedBatch([r]);
+      assert.strictEqual(res.status, 207);
+      assert.strictEqual(res.body.accepted, 0);
+      assert.strictEqual(res.body.rejected, 1);
+      assert.strictEqual(res.body.results[0].status, 'rejected');
+      assert.strictEqual(res.body.results[0].error, 'ts cannot be older than 10 minutes');
+    });
+
+    test('A reading up to 30 seconds in the future is accepted', async () => {
+      const vid = `VG-TS-30S-${Date.now()}`;
+      const r = createValidReading(vid, 1, new Date(Date.now() + 20 * 1000).toISOString());
+      const res = await postSignedBatch([r]);
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual(res.body.accepted, 1);
+      assert.strictEqual(res.body.rejected, 0);
+    });
+
+    test('A reading more than 30 seconds in the future (e.g. 31 seconds) is rejected', async () => {
+      const vid = `VG-TS-31S-${Date.now()}`;
+      const r = createValidReading(vid, 1, new Date(Date.now() + 35 * 1000).toISOString());
+      const res = await postSignedBatch([r]);
+      assert.strictEqual(res.status, 207);
+      assert.strictEqual(res.body.accepted, 0);
+      assert.strictEqual(res.body.rejected, 1);
+      assert.strictEqual(res.body.results[0].status, 'rejected');
+      assert.strictEqual(res.body.results[0].error, 'ts cannot be more than 30 seconds in the future');
+    });
+
+    test('An invalid timestamp string is rejected', async () => {
+      const vid = `VG-TS-INV-${Date.now()}`;
+      const r = createValidReading(vid, 1, 'not-a-valid-date-string');
+      const res = await postSignedBatch([r]);
+      assert.strictEqual(res.status, 207);
+      assert.strictEqual(res.body.accepted, 0);
+      assert.strictEqual(res.body.rejected, 1);
+      assert.strictEqual(res.body.results[0].status, 'rejected');
+      assert.strictEqual(res.body.results[0].error, 'ts must be a valid ISO timestamp string');
+    });
+
+    test('A reading with a future timestamp (e.g. 5 hours ahead) is rejected and does not corrupt vehicle state', async () => {
+      const vid = `VG-TS-CORRUPT-${Date.now()}`;
+      const futureReading = createValidReading(vid, 1, new Date(Date.now() + 5 * 3600 * 1000).toISOString());
+      futureReading.soc_pct = 40.0;
+      const res1 = await postSignedBatch([futureReading]);
+      assert.strictEqual(res1.status, 207);
+      assert.strictEqual(res1.body.rejected, 1);
+      assert.strictEqual(res1.body.results[0].error, 'ts cannot be more than 30 seconds in the future');
+
+      const vBefore = db.prepare('SELECT * FROM vehicles WHERE vehicle_id = ?').get(vid);
+      assert.strictEqual(vBefore, undefined, 'Vehicle state must not be created from rejected future reading');
+
+      const legitimateTs = new Date().toISOString();
+      const legitimateReading = createValidReading(vid, 2, legitimateTs);
+      legitimateReading.soc_pct = 85.0;
+      const res2 = await postSignedBatch([legitimateReading]);
+      assert.strictEqual(res2.status, 200);
+      assert.strictEqual(res2.body.accepted, 1);
+
+      const vAfter = db.prepare('SELECT * FROM vehicles WHERE vehicle_id = ?').get(vid);
+      assert.ok(vAfter, 'Vehicle state should be created by legitimate reading');
+      assert.strictEqual(vAfter.last_ts, legitimateTs);
+      assert.strictEqual(vAfter.soc_pct, 85.0);
+    });
   });
 });

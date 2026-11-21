@@ -145,7 +145,7 @@ describe('Part A2: Two-Instance Shared SQLite Integration Tests', () => {
     `);
 
     const payload = [
-      { vehicle_id: 'VG-RATE-001', seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }
+      { vehicle_id: 'VG-RATE-001', seq: 1, ts: new Date().toISOString(), soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }
     ];
 
     // Fire 100 simultaneous requests: 50 sent to Instance 1, 50 sent to Instance 2
@@ -186,7 +186,7 @@ describe('Part A2: Two-Instance Shared SQLite Integration Tests', () => {
 
   test('TEST 2: Shared Replay Protection across 2 instances', async () => {
     const payload = [
-      { vehicle_id: `VG-REPLAY-${Date.now()}`, seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }
+      { vehicle_id: `VG-REPLAY-${Date.now()}`, seq: 1, ts: new Date().toISOString(), soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }
     ];
     const timestamp = Date.now().toString();
     const rawBody = JSON.stringify(payload);
@@ -202,7 +202,7 @@ describe('Part A2: Two-Instance Shared SQLite Integration Tests', () => {
     assert.strictEqual(res2.body.error, 'Replayed request signature');
 
     // 3. Simultaneous replay attack against both instances with an identical signature
-    const simPayload = [{ vehicle_id: `VG-SIM-REPLAY-${Date.now()}`, seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }];
+    const simPayload = [{ vehicle_id: `VG-SIM-REPLAY-${Date.now()}`, seq: 1, ts: new Date().toISOString(), soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }];
     const simTimestamp = (Date.now() + 1000).toString();
     const simSig = crypto.createHmac('sha256', API_SECRET).update(`${simTimestamp}.${JSON.stringify(simPayload)}`).digest('hex');
 
@@ -231,7 +231,7 @@ describe('Part A2: Two-Instance Shared SQLite Integration Tests', () => {
       VALUES ('${testKey}', '${testSecret}', 10, 2)
     `);
 
-    const payload = [{ vehicle_id: 'VG-REFILL', seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }];
+    const payload = [{ vehicle_id: 'VG-REFILL', seq: 1, ts: new Date().toISOString(), soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }];
 
     // Consume both tokens
     const r1 = await postSigned(baseUrl1, payload, { apiKey: testKey, secret: testSecret });
@@ -261,7 +261,7 @@ describe('Part A2: Two-Instance Shared SQLite Integration Tests', () => {
       VALUES ('${testKey}', '${testSecret}', 0, 25)
     `);
 
-    const payload = [{ vehicle_id: 'VG-CONC-RATE', seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }];
+    const payload = [{ vehicle_id: 'VG-CONC-RATE', seq: 1, ts: new Date().toISOString(), soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }];
 
     // Send 60 concurrent requests across both instances (30 to Instance 1, 30 to Instance 2)
     const promises = [];
@@ -288,7 +288,7 @@ describe('Part A2: Two-Instance Shared SQLite Integration Tests', () => {
   });
 
   test('TEST 5: Authentication failure modes and invalid credentials', async () => {
-    const payload = [{ vehicle_id: 'VG-AUTH-TEST', seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }];
+    const payload = [{ vehicle_id: 'VG-AUTH-TEST', seq: 1, ts: new Date().toISOString(), soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }];
 
     // 1. Unknown API key
     const resUnknown = await postSigned(baseUrl1, payload, { apiKey: 'unknown-key' });

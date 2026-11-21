@@ -74,7 +74,7 @@ describe('A2 Comprehensive Authentication and Abuse Protection Tests', () => {
   const sampleReading = [{
     vehicle_id: 'VG-SEC-01',
     seq: 1,
-    ts: '2026-11-20T10:00:00Z',
+    ts: new Date().toISOString(),
     soc_pct: 80,
     battery_temp_c: 25,
     speed_kmh: 0,

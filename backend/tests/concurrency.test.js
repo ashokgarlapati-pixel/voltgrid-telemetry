@@ -65,7 +65,7 @@ describe('Part A1 Concurrency & Idempotency Tests (20 Concurrent Clients)', () =
     const sharedBatch = Array.from({ length: 50 }, (_, i) => ({
       vehicle_id: `${prefix}-V${String(i + 1).padStart(3, '0')}`,
       seq: 1,
-      ts: '2026-11-20T12:00:00.000Z',
+      ts: new Date().toISOString(),
       soc_pct: 75.0,
       battery_temp_c: 32.0,
       speed_kmh: 40.0,
@@ -109,7 +109,7 @@ describe('Part A1 Concurrency & Idempotency Tests (20 Concurrent Clients)', () =
     const sharedReadings = Array.from({ length: 10 }, (_, i) => ({
       vehicle_id: `${prefix}-SHARED-${String(i + 1).padStart(3, '0')}`,
       seq: 1,
-      ts: '2026-11-20T12:00:00.000Z',
+      ts: new Date().toISOString(),
       soc_pct: 80.0,
       battery_temp_c: 30.0,
       speed_kmh: 25.0,
@@ -125,7 +125,7 @@ describe('Part A1 Concurrency & Idempotency Tests (20 Concurrent Clients)', () =
       const uniqueReadings = Array.from({ length: 10 }, (_, i) => ({
         vehicle_id: `${prefix}-CLIENT${clientIdx}-V${String(i + 1).padStart(3, '0')}`,
         seq: 1,
-        ts: '2026-11-20T12:00:00.000Z',
+        ts: new Date().toISOString(),
         soc_pct: 80.0,
         battery_temp_c: 30.0,
         speed_kmh: 25.0,
@@ -164,7 +164,7 @@ describe('Part A1 Concurrency & Idempotency Tests (20 Concurrent Clients)', () =
 
   test('Concurrent out-of-order batches: final state strictly reflects highest device timestamp', async () => {
     const vid = `CONC-OOO-${Date.now()}`;
-    const baseTime = Date.parse('2026-11-20T12:00:00.000Z');
+    const baseTime = Date.now() - 60000;
 
     // 5 readings with different timestamps and different battery SoCs
     const r1 = { vehicle_id: vid, seq: 1, ts: new Date(baseTime).toISOString(), soc_pct: 95.0, battery_temp_c: 30, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] };

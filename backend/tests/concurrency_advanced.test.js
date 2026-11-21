@@ -64,7 +64,7 @@ describe('Advanced Concurrency and Cross-Functional Integration Tests', () => {
 
   test('Concurrent writes to the same vehicle by multiple clients: zero deadlocks and correct timestamp resolution', async () => {
     const vid = `VG-SAME-VEHICLE-${Date.now()}`;
-    const baseTime = Date.parse('2026-11-20T10:00:00.000Z');
+    const baseTime = Date.now() - 60000;
 
     // 10 concurrent requests each writing a distinct sequence and timestamp for the same vehicle
     const promises = Array.from({ length: 10 }, (_, i) => {
@@ -112,7 +112,7 @@ describe('Advanced Concurrency and Cross-Functional Integration Tests', () => {
       const readings = Array.from({ length: 10 }, (_, i) => ({
         vehicle_id: `${prefix}-B${batchIdx}-V${i}`,
         seq: 1,
-        ts: '2026-11-20T10:00:00Z',
+        ts: new Date(Date.now() - 30000).toISOString(),
         soc_pct: 80,
         battery_temp_c: 30,
         speed_kmh: 20,
@@ -155,9 +155,9 @@ describe('Advanced Concurrency and Cross-Functional Integration Tests', () => {
     const alertBatches = Array.from({ length: 5 }, (_, vIdx) => {
       const vid = `${prefix}-V${vIdx}`;
       return postSignedBatch([
-        { vehicle_id: vid, seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
-        { vehicle_id: vid, seq: 2, ts: '2026-11-20T10:00:05Z', soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
-        { vehicle_id: vid, seq: 3, ts: '2026-11-20T10:00:10Z', soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 1, ts: new Date(Date.now() - 30000).toISOString(), soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: new Date(Date.now() - 25000).toISOString(), soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: new Date(Date.now() - 20000).toISOString(), soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] }
       ]);
     });
 

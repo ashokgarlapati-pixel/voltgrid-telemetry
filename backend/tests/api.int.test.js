@@ -16,6 +16,8 @@ const { stopOfflineWorker } = require('../src/offlineWorker');
 
 const API_KEY = 'voltgrid-dev-key';
 const API_SECRET = 'voltgrid-dev-secret';
+const testStartMs = Date.now() - 60000;
+function makeTestTs(offsetSec = 0) { return new Date(testStartMs + (offsetSec * 1000)).toISOString(); }
 
 describe('Part A1, A4, A6 Integration Tests (Real Temp SQLite DB)', () => {
   let baseUrl;
@@ -64,9 +66,9 @@ describe('Part A1, A4, A6 Integration Tests (Real Temp SQLite DB)', () => {
     test('Partial success (HTTP 207): Batch with 2 valid + 1 malformed saves 2 and rejects 1', async () => {
       const vid = `VG-PARTIAL-${Date.now()}`;
       const batch = [
-        { vehicle_id: vid, seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 75.0, battery_temp_c: 30.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
-        { vehicle_id: vid, seq: 2, ts: '2026-11-20T10:00:05Z', soc_pct: 140.0, battery_temp_c: 30.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] }, // BAD: soc > 100
-        { vehicle_id: vid, seq: 3, ts: '2026-11-20T10:00:10Z', soc_pct: 74.0, battery_temp_c: 30.0, speed_kmh: 22, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 1, ts: makeTestTs(0), soc_pct: 75.0, battery_temp_c: 30.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: makeTestTs(5), soc_pct: 140.0, battery_temp_c: 30.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] }, // BAD: soc > 100
+        { vehicle_id: vid, seq: 3, ts: makeTestTs(10), soc_pct: 74.0, battery_temp_c: 30.0, speed_kmh: 22, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] }
       ];
 
       const res = await postSignedBatch(batch);
@@ -85,20 +87,20 @@ describe('Part A1, A4, A6 Integration Tests (Real Temp SQLite DB)', () => {
       const vid = `VG-TIME-${Date.now()}`;
       // Newer reading arriving first (ts: T+60s, soc_pct: 80)
       const newer = [
-        { vehicle_id: vid, seq: 10, ts: '2026-11-20T10:01:00Z', soc_pct: 80.0, battery_temp_c: 32.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 15, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 10, ts: makeTestTs(60), soc_pct: 80.0, battery_temp_c: 32.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 15, charging: false, fault_codes: [] }
       ];
       await postSignedBatch(newer);
 
       // Late reading arriving second (ts: T, soc_pct: 95)
       const late = [
-        { vehicle_id: vid, seq: 9, ts: '2026-11-20T10:00:00Z', soc_pct: 95.0, battery_temp_c: 30.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 14, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 9, ts: makeTestTs(0), soc_pct: 95.0, battery_temp_c: 30.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 14, charging: false, fault_codes: [] }
       ];
       await postSignedBatch(late);
 
       // Verify live vehicle state retains newer reading (soc: 80, ts: 10:01:00Z)
       const vehicle = db.prepare('SELECT soc_pct, last_ts FROM vehicles WHERE vehicle_id = ?').get(vid);
       assert.strictEqual(vehicle.soc_pct, 80.0, 'Live state must not be overwritten by older reading');
-      assert.strictEqual(vehicle.last_ts, '2026-11-20T10:01:00.000Z');
+      assert.strictEqual(vehicle.last_ts, makeTestTs(60));
 
       // Verify telemetry_history stores both rows
       const history = db.prepare('SELECT COUNT(*) AS total FROM telemetry_history WHERE vehicle_id = ?').get(vid);
@@ -108,9 +110,9 @@ describe('Part A1, A4, A6 Integration Tests (Real Temp SQLite DB)', () => {
     test('Sequence gap & completeness: detects missing seq (1, 2, 4 -> 75% completeness)', async () => {
       const vid = `VG-GAP-${Date.now()}`;
       const batchWithGap = [
-        { vehicle_id: vid, seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 90, battery_temp_c: 28, speed_kmh: 10, lat: 13.08, lng: 80.27, odometer_km: 5, charging: false, fault_codes: [] },
-        { vehicle_id: vid, seq: 2, ts: '2026-11-20T10:00:05Z', soc_pct: 89, battery_temp_c: 28, speed_kmh: 10, lat: 13.08, lng: 80.27, odometer_km: 5.1, charging: false, fault_codes: [] },
-        { vehicle_id: vid, seq: 4, ts: '2026-11-20T10:00:15Z', soc_pct: 88, battery_temp_c: 28, speed_kmh: 10, lat: 13.08, lng: 80.27, odometer_km: 5.3, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 1, ts: makeTestTs(0), soc_pct: 90, battery_temp_c: 28, speed_kmh: 10, lat: 13.08, lng: 80.27, odometer_km: 5, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: makeTestTs(5), soc_pct: 89, battery_temp_c: 28, speed_kmh: 10, lat: 13.08, lng: 80.27, odometer_km: 5.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 4, ts: makeTestTs(15), soc_pct: 88, battery_temp_c: 28, speed_kmh: 10, lat: 13.08, lng: 80.27, odometer_km: 5.3, charging: false, fault_codes: [] }
       ];
       await postSignedBatch(batchWithGap);
 
@@ -139,7 +141,7 @@ describe('Part A1, A4, A6 Integration Tests (Real Temp SQLite DB)', () => {
 
     test('Deterministic tie-breaking: identical timestamp resolves by higher seq regardless of arrival order', async () => {
       const vid = `VG-TIE-${Date.now()}`;
-      const sharedTs = '2026-11-20T10:00:00.000Z';
+      const sharedTs = makeTestTs(0);
 
       // Reading with lower seq (seq: 5, soc: 90)
       const rLowerSeq = { vehicle_id: vid, seq: 5, ts: sharedTs, soc_pct: 90.0, battery_temp_c: 30, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] };
@@ -179,7 +181,7 @@ describe('Part A1, A4, A6 Integration Tests (Real Temp SQLite DB)', () => {
       // Single reading batch -> 200
       const singleVid = `VG-SINGLE-${Date.now()}`;
       const singleRes = await postSignedBatch([
-        { vehicle_id: singleVid, seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }
+        { vehicle_id: singleVid, seq: 1, ts: makeTestTs(0), soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }
       ]);
       assert.strictEqual(singleRes.status, 200, 'Batch of 1 reading must return HTTP 200');
       assert.strictEqual(singleRes.body.accepted, 1);
@@ -189,7 +191,7 @@ describe('Part A1, A4, A6 Integration Tests (Real Temp SQLite DB)', () => {
       const batch500 = Array.from({ length: 500 }, (_, i) => ({
         vehicle_id: `${prefix500}-${i}`,
         seq: 1,
-        ts: '2026-11-20T10:00:00Z',
+        ts: makeTestTs(0),
         soc_pct: 80,
         battery_temp_c: 25,
         speed_kmh: 0,
@@ -207,7 +209,7 @@ describe('Part A1, A4, A6 Integration Tests (Real Temp SQLite DB)', () => {
       const batch501 = Array.from({ length: 501 }, (_, i) => ({
         vehicle_id: `VG-501-${i}`,
         seq: 1,
-        ts: '2026-11-20T10:00:00Z',
+        ts: makeTestTs(0),
         soc_pct: 80,
         battery_temp_c: 25,
         speed_kmh: 0,
@@ -226,23 +228,23 @@ describe('Part A1, A4, A6 Integration Tests (Real Temp SQLite DB)', () => {
       const vid = `VG-EDGE-${Date.now()}`;
       const mixedBatch = [
         // 0: Valid reading
-        { vehicle_id: vid, seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 90.0, battery_temp_c: 28.0, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 1, ts: makeTestTs(0), soc_pct: 90.0, battery_temp_c: 28.0, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
         // 1: Null item
         null,
         // 2: Missing vehicle_id
-        { seq: 2, ts: '2026-11-20T10:00:05Z', soc_pct: 90.0, battery_temp_c: 28.0, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { seq: 2, ts: makeTestTs(5), soc_pct: 90.0, battery_temp_c: 28.0, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
         // 3: Invalid timestamp
         { vehicle_id: vid, seq: 3, ts: 'not-a-timestamp', soc_pct: 90.0, battery_temp_c: 28.0, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
         // 4: soc_pct is Infinity
-        { vehicle_id: vid, seq: 4, ts: '2026-11-20T10:00:10Z', soc_pct: Infinity, battery_temp_c: 28.0, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 4, ts: makeTestTs(10), soc_pct: Infinity, battery_temp_c: 28.0, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
         // 5: Latitude out of range (> 90)
-        { vehicle_id: vid, seq: 5, ts: '2026-11-20T10:00:15Z', soc_pct: 90.0, battery_temp_c: 28.0, speed_kmh: 15, lat: 95.0, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 5, ts: makeTestTs(15), soc_pct: 90.0, battery_temp_c: 28.0, speed_kmh: 15, lat: 95.0, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
         // 6: Negative odometer
-        { vehicle_id: vid, seq: 6, ts: '2026-11-20T10:00:20Z', soc_pct: 90.0, battery_temp_c: 28.0, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: -5, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 6, ts: makeTestTs(20), soc_pct: 90.0, battery_temp_c: 28.0, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: -5, charging: false, fault_codes: [] },
         // 7: fault_codes contains non-string elements
-        { vehicle_id: vid, seq: 7, ts: '2026-11-20T10:00:25Z', soc_pct: 90.0, battery_temp_c: 28.0, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [123, null] },
+        { vehicle_id: vid, seq: 7, ts: makeTestTs(25), soc_pct: 90.0, battery_temp_c: 28.0, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [123, null] },
         // 8: Valid reading
-        { vehicle_id: vid, seq: 8, ts: '2026-11-20T10:00:30Z', soc_pct: 88.0, battery_temp_c: 29.0, speed_kmh: 18, lat: 13.09, lng: 80.28, odometer_km: 10.5, charging: false, fault_codes: ['P0A80'] }
+        { vehicle_id: vid, seq: 8, ts: makeTestTs(30), soc_pct: 88.0, battery_temp_c: 29.0, speed_kmh: 18, lat: 13.09, lng: 80.28, odometer_km: 10.5, charging: false, fault_codes: ['P0A80'] }
       ];
 
       const res = await postSignedBatch(mixedBatch);
@@ -273,7 +275,7 @@ describe('Part A1, A4, A6 Integration Tests (Real Temp SQLite DB)', () => {
       const seedBatch = Array.from({ length: 6 }, (_, i) => ({
         vehicle_id: `VG-PAGE-A${i + 1}`,
         seq: 1,
-        ts: '2026-11-20T10:00:00Z',
+        ts: makeTestTs(0),
         soc_pct: 70 + i,
         battery_temp_c: 30,
         speed_kmh: 20,
@@ -402,7 +404,7 @@ describe('Part A1, A4, A6 Integration Tests (Real Temp SQLite DB)', () => {
     });
 
     test('Replaying the exact same signed request returns 401', async () => {
-      const payload = [{ vehicle_id: 'VG-REPLAY', seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }];
+      const payload = [{ vehicle_id: 'VG-REPLAY', seq: 1, ts: makeTestTs(0), soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }];
       const rTs = Date.now().toString();
       const rRaw = JSON.stringify(payload);
       const rSig = crypto.createHmac('sha256', API_SECRET).update(`${rTs}.${rRaw}`).digest('hex');
@@ -422,7 +424,7 @@ describe('Part A1, A4, A6 Integration Tests (Real Temp SQLite DB)', () => {
 
     test('Exceeding burst capacity returns 429 with Retry-After header', async () => {
       // Send 50 rapid requests against key with burst capacity 40
-      const testItem = [{ vehicle_id: 'VG-BURST', seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }];
+      const testItem = [{ vehicle_id: 'VG-BURST', seq: 1, ts: makeTestTs(0), soc_pct: 80, battery_temp_c: 25, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 1, charging: false, fault_codes: [] }];
       const burstCalls = Array.from({ length: 45 }, () => postSignedBatch(testItem));
       const results = await Promise.all(burstCalls);
 

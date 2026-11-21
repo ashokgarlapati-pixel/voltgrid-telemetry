@@ -36,9 +36,11 @@ We use an **at-least-once delivery model with idempotent writes** to achieve eff
   This guarantees that delayed readings coming out of cell tunnels never overwrite newer state.
 * **Server Time (`updated_at`)**: We trust server time for offline detection (`offlineWorker.js`) and HMAC replay window checks (`security.js`). A disconnected vehicle cannot report its own death; silence must be measured by the server's clock.
 
-### Handling Out-of-Spec Clocks
-* **25 Seconds Fast**: Accepted. It falls inside our 5-minute HMAC clock skew window ($|T_{\text{server}} - T_{\text{req}}| \le 300\text{s}$) and is ordered cleanly by `ts`.
-* **1 Day Off**: Rejected with `HTTP 401 Unauthorized`. Letting a device submit data dated 1 day in the future would poison `vehicles.last_ts`, causing all subsequent legitimate readings to be ignored.
+### Separation of Timestamps & Tolerance Windows
+* **Transport Request Timestamp (`X-Timestamp`)**: Checked against server clock ($|T_{\text{server}} - T_{\text{req}}| \le 300\text{s}$, $\pm 5$ minutes). Rejects expired or replayed requests with `HTTP 401 Unauthorized`.
+* **Telemetry Reading Timestamp (`reading.ts`)**: Checked against server clock window $[T_{\text{server}} - 10\text{ minutes}, T_{\text{server}} + 30\text{ seconds}]$.
+  - **Lateness (Up to 10 minutes)**: Accepted (handles cellular queuing and tunnel delays). Older than 10 minutes: Rejected (`HTTP 207/400`, `"ts cannot be older than 10 minutes"`).
+  - **Drift (Up to 30 seconds fast)**: Accepted (handles vehicle RTC clock drift). More than 30 seconds fast: Rejected (`"ts cannot be more than 30 seconds in the future"`), preventing poison readings from locking `vehicles.last_ts` and permanently corrupting live state updates.
 
 ---
 

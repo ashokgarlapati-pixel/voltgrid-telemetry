@@ -16,6 +16,8 @@ const { runOfflineCheck, stopOfflineWorker } = require('../src/offlineWorker');
 
 const API_KEY = 'voltgrid-dev-key';
 const API_SECRET = 'voltgrid-dev-secret';
+const alertTestStartMs = Date.now() - 500000;
+function makeAlertTestTs(offsetSec = 0) { return new Date(alertTestStartMs + (offsetSec * 1000)).toISOString(); }
 
 describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
   let baseUrl;
@@ -74,12 +76,12 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
 
       // Sequence: 3 hot readings (trigger overheat) followed by 3 cool readings (resolve overheat)
       const baseReadings = [
-        { seq: 1, ts: '2026-11-20T10:00:00.000Z', soc_pct: 80, battery_temp_c: 56.5, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 100, charging: false, fault_codes: [] },
-        { seq: 2, ts: '2026-11-20T10:00:05.000Z', soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 100.1, charging: false, fault_codes: [] },
-        { seq: 3, ts: '2026-11-20T10:00:10.000Z', soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 100.2, charging: false, fault_codes: [] },
-        { seq: 4, ts: '2026-11-20T10:00:15.000Z', soc_pct: 80, battery_temp_c: 49.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 100.3, charging: false, fault_codes: [] },
-        { seq: 5, ts: '2026-11-20T10:00:20.000Z', soc_pct: 80, battery_temp_c: 48.5, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 100.4, charging: false, fault_codes: [] },
-        { seq: 6, ts: '2026-11-20T10:00:25.000Z', soc_pct: 80, battery_temp_c: 47.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 100.5, charging: false, fault_codes: [] }
+        { seq: 1, ts: makeAlertTestTs(0), soc_pct: 80, battery_temp_c: 56.5, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 100, charging: false, fault_codes: [] },
+        { seq: 2, ts: makeAlertTestTs(5), soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 100.1, charging: false, fault_codes: [] },
+        { seq: 3, ts: makeAlertTestTs(10), soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 100.2, charging: false, fault_codes: [] },
+        { seq: 4, ts: makeAlertTestTs(15), soc_pct: 80, battery_temp_c: 49.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 100.3, charging: false, fault_codes: [] },
+        { seq: 5, ts: makeAlertTestTs(20), soc_pct: 80, battery_temp_c: 48.5, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 100.4, charging: false, fault_codes: [] },
+        { seq: 6, ts: makeAlertTestTs(25), soc_pct: 80, battery_temp_c: 47.0, speed_kmh: 30, lat: 13.08, lng: 80.27, odometer_km: 100.5, charging: false, fault_codes: [] }
       ];
 
       // 1. Chronological Ingestion
@@ -134,7 +136,7 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
 
       // Vehicle is healthy inside operating polygon
       await postBatch([
-        { vehicle_id: vid, seq: 10, ts: '2026-11-20T12:00:00.000Z', soc_pct: 80, battery_temp_c: 40, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 50, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 10, ts: makeAlertTestTs(100), soc_pct: 80, battery_temp_c: 40, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 50, charging: false, fault_codes: [] }
       ]);
 
       let alerts = db.prepare('SELECT * FROM alerts WHERE vehicle_id = ?').all(vid);
@@ -142,7 +144,7 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
 
       // Now a late reading arrives from 2 hours ago where vehicle was outside geofence
       await postBatch([
-        { vehicle_id: vid, seq: 2, ts: '2026-11-20T10:00:00.000Z', soc_pct: 85, battery_temp_c: 42, speed_kmh: 0, lat: 15.00, lng: 81.00, odometer_km: 10, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 2, ts: makeAlertTestTs(0), soc_pct: 85, battery_temp_c: 42, speed_kmh: 0, lat: 15.00, lng: 81.00, odometer_km: 10, charging: false, fault_codes: [] }
       ]);
 
       // Latest known state is still seq 10 inside geofence -> active geofence alert must NOT be opened!
@@ -153,9 +155,9 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
     test('Duplicate arrival is safely ignored and never duplicates alerts', async () => {
       const vid = `VG-DUP-${Date.now()}`;
       const hotBatch = [
-        { vehicle_id: vid, seq: 1, ts: '2026-11-20T10:00:00.000Z', soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
-        { vehicle_id: vid, seq: 2, ts: '2026-11-20T10:00:05.000Z', soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] },
-        { vehicle_id: vid, seq: 3, ts: '2026-11-20T10:00:10.000Z', soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.2, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 1, ts: makeAlertTestTs(0), soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: makeAlertTestTs(5), soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: makeAlertTestTs(10), soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.2, charging: false, fault_codes: [] }
       ];
 
       // First post triggers overheat alert
@@ -182,15 +184,15 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
 
       // Batch 1: seq 1, 2 (both hot)
       await postBatch([
-        { vehicle_id: vid, seq: 1, ts: '2026-11-20T10:00:00.000Z', soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
-        { vehicle_id: vid, seq: 2, ts: '2026-11-20T10:00:05.000Z', soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 1, ts: makeAlertTestTs(0), soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: makeAlertTestTs(5), soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] }
       ]);
       assert.strictEqual(db.prepare('SELECT COUNT(*) AS c FROM alerts WHERE vehicle_id = ?').get(vid).c, 0, '2 readings must not trigger');
 
       // Batch 2: seq 2 (duplicate), seq 3 (hot - completes 3 streak)
       const resOverlap = await postBatch([
-        { vehicle_id: vid, seq: 2, ts: '2026-11-20T10:00:05.000Z', soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] },
-        { vehicle_id: vid, seq: 3, ts: '2026-11-20T10:00:10.000Z', soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.2, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 2, ts: makeAlertTestTs(5), soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: makeAlertTestTs(10), soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.2, charging: false, fault_codes: [] }
       ]);
       assert.strictEqual(resOverlap.body.duplicates, 1);
       assert.strictEqual(resOverlap.body.accepted, 1);
@@ -202,7 +204,7 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
 
     test('Identical timestamps with different sequence numbers breaks ties deterministically', async () => {
       const vid = `VG-TIE-${Date.now()}`;
-      const sharedTs = '2026-11-20T10:00:00.000Z';
+      const sharedTs = makeAlertTestTs(0);
 
       // Readings with same timestamp but increasing seq numbers
       await postBatch([
@@ -227,7 +229,7 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
 
       // Insert 115 normal readings (temp 40°C)
       const normalReadings = [];
-      const baseTime = Date.parse('2026-11-20T08:00:00.000Z');
+      const baseTime = Date.now() - 250000;
       for (let i = 1; i <= 115; i++) {
         normalReadings.push({
           vehicle_id: vid,
@@ -267,7 +269,7 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
 
     test('Active alert survives 100+ subsequent readings in hysteresis zone (52°C)', async () => {
       const vid = `VG-HYST-100-${Date.now()}`;
-      const baseTime = Date.parse('2026-11-20T08:00:00.000Z');
+      const baseTime = Date.now() - 250000;
 
       // 1. Open alert with 3 hot readings
       await postBatch([
@@ -357,9 +359,9 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
       const allOfflineAlerts = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").all(vid);
       assert.strictEqual(allOfflineAlerts.length, 1, 'Offline alert must never be duplicated');
 
-      // Step 5: Vehicle resumes reporting at T0 + 150s
+      // Step 5: Vehicle resumes reporting with current timestamp
       await postBatch([
-        { vehicle_id: vid, seq: 2, ts: new Date(now + 150000).toISOString(), soc_pct: 79, battery_temp_c: 41, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: 11, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 2, ts: new Date().toISOString(), soc_pct: 79, battery_temp_c: 41, speed_kmh: 15, lat: 13.08, lng: 80.27, odometer_km: 11, charging: false, fault_codes: [] }
       ]);
 
       // Verify vehicle status immediately restored to 'online'
@@ -384,9 +386,9 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
 
       // 1. Trigger overheat alert
       await postBatch([
-        { vehicle_id: vid, seq: 1, ts: '2026-11-20T10:00:00.000Z', soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
-        { vehicle_id: vid, seq: 2, ts: '2026-11-20T10:00:05.000Z', soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] },
-        { vehicle_id: vid, seq: 3, ts: '2026-11-20T10:00:10.000Z', soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.2, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 1, ts: makeAlertTestTs(0), soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: makeAlertTestTs(5), soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: makeAlertTestTs(10), soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.2, charging: false, fault_codes: [] }
       ]);
 
       const alertOpen = db.prepare('SELECT * FROM alerts WHERE vehicle_id = ?').get(vid);
@@ -414,9 +416,9 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
 
       // 4. Cool readings resolve the acknowledged alert -> status becomes 'resolved', version: 3
       await postBatch([
-        { vehicle_id: vid, seq: 4, ts: '2026-11-20T10:00:15.000Z', soc_pct: 80, battery_temp_c: 49.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.3, charging: false, fault_codes: [] },
-        { vehicle_id: vid, seq: 5, ts: '2026-11-20T10:00:20.000Z', soc_pct: 80, battery_temp_c: 48.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.4, charging: false, fault_codes: [] },
-        { vehicle_id: vid, seq: 6, ts: '2026-11-20T10:00:25.000Z', soc_pct: 80, battery_temp_c: 47.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.5, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 4, ts: makeAlertTestTs(15), soc_pct: 80, battery_temp_c: 49.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.3, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 5, ts: makeAlertTestTs(20), soc_pct: 80, battery_temp_c: 48.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.4, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 6, ts: makeAlertTestTs(25), soc_pct: 80, battery_temp_c: 47.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 10.5, charging: false, fault_codes: [] }
       ]);
 
       const alertResolved = db.prepare('SELECT * FROM alerts WHERE id = ?').get(alertOpen.id);
@@ -426,9 +428,9 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
 
       // 5. Subsequent overheat triggers a brand NEW alert with version 1
       await postBatch([
-        { vehicle_id: vid, seq: 7, ts: '2026-11-20T10:01:00.000Z', soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 11, charging: false, fault_codes: [] },
-        { vehicle_id: vid, seq: 8, ts: '2026-11-20T10:01:05.000Z', soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 11.1, charging: false, fault_codes: [] },
-        { vehicle_id: vid, seq: 9, ts: '2026-11-20T10:01:10.000Z', soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 11.2, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 7, ts: makeAlertTestTs(60), soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 11, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 8, ts: makeAlertTestTs(65), soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 11.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 9, ts: makeAlertTestTs(70), soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 20, lat: 13.08, lng: 80.27, odometer_km: 11.2, charging: false, fault_codes: [] }
       ]);
 
       const allAlerts = db.prepare('SELECT id, status, version FROM alerts WHERE vehicle_id = ? ORDER BY id ASC').all(vid);
@@ -449,8 +451,8 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
 
       // Ingest drop of 10 points in 2 minutes while not charging
       await postBatch([
-        { vehicle_id: vid, seq: 1, ts: '2026-11-20T10:00:00.000Z', soc_pct: 85.0, battery_temp_c: 35, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
-        { vehicle_id: vid, seq: 2, ts: '2026-11-20T10:02:00.000Z', soc_pct: 74.0, battery_temp_c: 36, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 11, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 1, ts: makeAlertTestTs(0), soc_pct: 85.0, battery_temp_c: 35, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: makeAlertTestTs(120), soc_pct: 74.0, battery_temp_c: 36, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 11, charging: false, fault_codes: [] }
       ]);
 
       const alertOpen = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'rapid_discharge'").get(vid);
@@ -459,7 +461,7 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
 
       // Vehicle starts charging -> alert must immediately resolve
       await postBatch([
-        { vehicle_id: vid, seq: 3, ts: '2026-11-20T10:03:00.000Z', soc_pct: 75.0, battery_temp_c: 37, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 11, charging: true, fault_codes: [] }
+        { vehicle_id: vid, seq: 3, ts: makeAlertTestTs(180), soc_pct: 75.0, battery_temp_c: 37, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 11, charging: true, fault_codes: [] }
       ]);
 
       const alertResolved = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'rapid_discharge'").get(vid);
@@ -471,15 +473,15 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
 
       // Trigger rapid discharge: 85% to 75% in 2 minutes
       await postBatch([
-        { vehicle_id: vid, seq: 1, ts: '2026-11-20T10:00:00.000Z', soc_pct: 85.0, battery_temp_c: 35, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
-        { vehicle_id: vid, seq: 2, ts: '2026-11-20T10:02:00.000Z', soc_pct: 75.0, battery_temp_c: 36, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 11, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 1, ts: makeAlertTestTs(0), soc_pct: 85.0, battery_temp_c: 35, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: makeAlertTestTs(120), soc_pct: 75.0, battery_temp_c: 36, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 11, charging: false, fault_codes: [] }
       ]);
       assert.strictEqual(db.prepare("SELECT status FROM alerts WHERE vehicle_id = ? AND rule = 'rapid_discharge'").get(vid).status, 'open');
 
       // 8 minutes later, vehicle reports a reading (SoC: 74.5% - minimal drop)
       // The previous drop occurred >5 minutes ago, so the 5-minute window has expired
       await postBatch([
-        { vehicle_id: vid, seq: 3, ts: '2026-11-20T10:10:00.000Z', soc_pct: 74.5, battery_temp_c: 35, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 11, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 3, ts: makeAlertTestTs(450), soc_pct: 74.5, battery_temp_c: 35, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 11, charging: false, fault_codes: [] }
       ]);
 
       const alertResolved = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'rapid_discharge'").get(vid);
@@ -497,7 +499,7 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
 
       // Step 1: Outside polygon (lat 14.50, lng 81.00)
       const res1 = await postBatch([
-        { vehicle_id: vid, seq: 1, ts: '2026-11-20T10:00:00.000Z', soc_pct: 80, battery_temp_c: 35, speed_kmh: 50, lat: 14.5000, lng: 81.0000, odometer_km: 100, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 1, ts: makeAlertTestTs(0), soc_pct: 80, battery_temp_c: 35, speed_kmh: 50, lat: 14.5000, lng: 81.0000, odometer_km: 100, charging: false, fault_codes: [] }
       ]);
       assert.strictEqual(res1.status, 200);
 
@@ -507,7 +509,7 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
 
       // Step 2: Repeated outside reading does not duplicate alert
       const res2 = await postBatch([
-        { vehicle_id: vid, seq: 2, ts: '2026-11-20T10:01:00.000Z', soc_pct: 80, battery_temp_c: 35, speed_kmh: 50, lat: 14.5500, lng: 81.0500, odometer_km: 101, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 2, ts: makeAlertTestTs(60), soc_pct: 80, battery_temp_c: 35, speed_kmh: 50, lat: 14.5500, lng: 81.0500, odometer_km: 101, charging: false, fault_codes: [] }
       ]);
       assert.strictEqual(res2.status, 200);
 
@@ -516,7 +518,7 @@ describe('Part A3 Alert Engine Integration & Out-of-Order Tests', () => {
 
       // Step 3: Re-enter polygon (Chennai center: lat 13.0827, lng 80.2707)
       const res3 = await postBatch([
-        { vehicle_id: vid, seq: 3, ts: '2026-11-20T10:05:00.000Z', soc_pct: 79, battery_temp_c: 35, speed_kmh: 20, lat: 13.0827, lng: 80.2707, odometer_km: 105, charging: false, fault_codes: [] }
+        { vehicle_id: vid, seq: 3, ts: makeAlertTestTs(300), soc_pct: 79, battery_temp_c: 35, speed_kmh: 20, lat: 13.0827, lng: 80.2707, odometer_km: 105, charging: false, fault_codes: [] }
       ]);
       assert.strictEqual(res3.status, 200);
 
