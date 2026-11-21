@@ -6,6 +6,9 @@
   "scripts": {
     "start": "node src/server.js",
     "test": "node --test tests/*.test.js",
+    "test:coverage": "node --experimental-test-coverage --test tests/*.test.js",
+    "test:unit": "node --test tests/alerts.unit.test.js",
+    "test:concurrency": "node --test tests/concurrency*.test.js",
     "simulate": "node ../simulator/simulator.js",
     "loadtest": "node ../scripts/loadtest.js"
   },

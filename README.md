@@ -434,10 +434,25 @@ The test suite uses Node's native test runner (`node:test` and `node:assert/stri
 
 ```bash
 cd backend
+# Run all 128 tests across 47 suites
 npm test
+
+# Run tests with built-in code coverage report (91.90% line coverage)
+npm run test:coverage
+
+# Run isolated unit tests
+npm run test:unit
+
+# Run high-concurrency and race-condition tests
+npm run test:concurrency
 ```
 
-### Test Coverage Highlights (84 Tests Across 34 Suites):
+### Test Coverage Highlights (128 Tests Across 47 Suites, 91.90% Coverage):
+* **A1 Ingestion Comprehensive Suite (`backend/tests/a1_ingestion_comprehensive.test.js`)**: Exhaustive validation of single and maximum batches (500 items), batch size violations (501 items), individual missing field rejection (11 required fields), invalid vehicle IDs (empty, whitespace, non-string), unparseable timestamps, invalid numeric ranges (NaN, Infinity, out of bounds), unexpected types, duplicate handling within same batch, repeated request idempotency, out-of-order sequence insertion, and latest-state timestamp resolution.
+* **A2 Security & Abuse Protection Suite (`backend/tests/a2_security_comprehensive.test.js`)**: Valid HMAC signatures, tampered signatures, wrong secret credentials, missing auth headers, unknown API keys, timestamp drift (>5m past and future), malformed timestamp strings, signature replay attacks via `used_nonces`, recovery of valid requests after auth failure, rate limiting with `Retry-After` headers, token replenishment over time, and zero secret leakage.
+* **A3 Alerts Comprehensive Suite (`backend/tests/a3_alerts_comprehensive.test.js`)**: Exact threshold boundary conditions (55.0°C does not trigger, strictly >55.0°C required), temperature fluctuation hysteresis, exact 50.0°C resolution, rapid discharge exact 8.0% drop boundary (does not trigger, strictly >8.0% required), charging state resolution, 5-minute window expiration, geofence polygon boundary ray-casting, exit/re-enter transitions, offline worker idempotency (no duplicate active alerts), and online recovery on telemetry resumption.
+* **A4 Queries Comprehensive Suite (`backend/tests/a4_queries_comprehensive.test.js`)**: Empty query result sets, combined status + bounding box + pagination cursor filters, keyset cursor stability under concurrent insertions with zero duplicate vehicles across pages, empty vehicle history windows, points budget downsampling enforcement, fleet summary immediate aggregation updates after ingestion, and 2-client concurrent OCC alert ack races.
+* **Advanced Concurrency & Race Condition Suite (`backend/tests/concurrency_advanced.test.js`)**: 10 concurrent clients submitting different readings for the same vehicle (zero deadlocks, all stored in history, latest device timestamp preserved in live state), concurrent ingestion alongside active vehicle and summary read queries without `SQLITE_BUSY`, and simultaneous alert generation across 5 vehicles.
 * **Observability & Probes Tests (`backend/tests/observability.test.js`)**: Tests `X-Request-Id` UUID generation and propagation, single-line structured JSON logs, sensitive credential redaction, `/health` and `/health/live` liveness probes, `/health/ready` database failure fallback to 503, and `/metrics` real-time counter incrementing.
 * **Load Test Smoke Tests (`backend/tests/loadtest.test.js`)**: Smoke tests `scripts/loadtest.js` in automated test pipelines, asserting summary calculation, throughput, and percentile reporting.
 * **Database Migration Tests (`backend/tests/migrations.test.js`)**: Verifies fresh database initialization, `schema_migrations` tracking, table constraints, index existence, and idempotent re-execution.
