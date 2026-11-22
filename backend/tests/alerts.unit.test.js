@@ -964,7 +964,7 @@ describe('Part A3 Alert Engine Unit Tests', () => {
       assert.strictEqual(allAlerts[0].version, 1);
     });
 
-    test('Test D: Immediate startup recovery and worker lifecycle (isWorkerRunning, repeated start no-op, stop, and restart)', () => {
+    test('Test D: Immediate startup recovery (calling startOfflineWorker() runs the check immediately without waiting for the interval to elapse)', () => {
       const vidOnline = `VG-TEST-D-ON-${Date.now()}-${Math.random().toString(36).substring(7)}`;
       const vidOffline = `VG-TEST-D-OFF-${Date.now()}-${Math.random().toString(36).substring(7)}`;
       const vidLateStale = `VG-TEST-D-LATE-${Date.now()}-${Math.random().toString(36).substring(7)}`;
@@ -1018,19 +1018,73 @@ describe('Part A3 Alert Engine Unit Tests', () => {
         assert.strictEqual(isWorkerRunning(), true, 'Worker must continue running');
         const vLateCheck = db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vidLateStale);
         assert.strictEqual(vLateCheck.status, 'online', 'Repeated start must NOT re-run recovery check on already-running worker');
-
-        // Clean shutdown
-        stopOfflineWorker();
-        assert.strictEqual(isWorkerRunning(), false, 'isWorkerRunning must be false after stopOfflineWorker');
-
-        // Restart worker after stopping: must successfully start and run recovery check
-        startOfflineWorker(60000, 90, t0);
-        assert.strictEqual(isWorkerRunning(), true, 'isWorkerRunning must be true after restarting');
-        const vLateAfterRestart = db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vidLateStale);
-        assert.strictEqual(vLateAfterRestart.status, 'offline', 'Restarted worker must execute immediate startup recovery');
       } finally {
         stopOfflineWorker();
         assert.strictEqual(isWorkerRunning(), false, 'Offline worker must stop cleanly');
+      }
+    });
+
+    test('Test: Dedicated worker restart after stopping (stop, restart, immediate recovery, and duplicate prevention)', () => {
+      const vidInitial = `VG-RESTART-INIT-${Date.now()}`;
+      const vidSecond = `VG-RESTART-SEC-${Date.now()}`;
+      const t0 = Date.now();
+      const staleIso = new Date(t0 - 100000).toISOString();
+
+      // Ensure worker is initially stopped
+      assert.strictEqual(isWorkerRunning(), false, 'isWorkerRunning must be false before start');
+
+      // Seed 1st stale vehicle
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES (?, ?, 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'online', 1, 1, 1, ?)
+      `).run(vidInitial, staleIso, staleIso);
+
+      // 1. Start the worker
+      startOfflineWorker(60000, 90, t0);
+      try {
+        // Verify isWorkerRunning() is true
+        assert.strictEqual(isWorkerRunning(), true, 'isWorkerRunning() must be true after start');
+        assert.strictEqual(db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vidInitial).status, 'offline');
+        const alert1 = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vidInitial);
+        assert.ok(alert1, 'Alert 1 must be created on initial startup recovery');
+
+        // 2. Stop the worker
+        stopOfflineWorker();
+        // Verify isWorkerRunning() is false
+        assert.strictEqual(isWorkerRunning(), false, 'isWorkerRunning() must be false after stopOfflineWorker()');
+
+        // Seed 2nd stale vehicle while worker is stopped
+        db.prepare(`
+          INSERT INTO vehicles (
+            vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+            lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+          ) VALUES (?, ?, 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'online', 1, 1, 1, ?)
+        `).run(vidSecond, staleIso, staleIso);
+
+        // 3. Start it again (restart)
+        startOfflineWorker(60000, 90, t0);
+
+        // Verify it becomes active and performs immediate recovery
+        assert.strictEqual(isWorkerRunning(), true, 'isWorkerRunning() must be true after restart');
+        assert.strictEqual(db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vidSecond).status, 'offline', '2nd vehicle must be recovered on restart');
+        const alert2 = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vidSecond);
+        assert.ok(alert2, 'Alert 2 must be created upon restart immediate recovery');
+
+        // Verify no duplicate intervals or duplicate active alerts are created
+        const allAlerts1 = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").all(vidInitial);
+        const allAlerts2 = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").all(vidSecond);
+        assert.strictEqual(allAlerts1.length, 1, 'vidInitial must strictly have 1 alert');
+        assert.strictEqual(allAlerts2.length, 1, 'vidSecond must strictly have 1 alert');
+
+        // Call start again while active: must be safe no-op
+        startOfflineWorker(60000, 90, t0);
+        assert.strictEqual(isWorkerRunning(), true);
+        assert.strictEqual(db.prepare("SELECT COUNT(*) AS c FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vidInitial).c, 1);
+      } finally {
+        stopOfflineWorker();
+        assert.strictEqual(isWorkerRunning(), false);
       }
     });
 
@@ -1253,12 +1307,12 @@ describe('Part A3 Alert Engine Unit Tests', () => {
       assert.strictEqual(db.prepare("SELECT status FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vStale).status, 'resolved');
     });
 
-    test('Test H: Custom threshold parameter is recorded in alert details (e.g. 120s non-default threshold)', () => {
+    test('Test H: Custom threshold parameter is recorded in alert details and default threshold is preserved', () => {
       const vidStale120 = `VG-CUSTOM-THRESH-120-${Date.now()}`;
       const vidFresh100 = `VG-CUSTOM-THRESH-100-${Date.now()}`;
-      const t0 = Date.now();
-      const t130sAgo = new Date(t0 - 130000).toISOString(); // 130s ago (> 120s threshold)
-      const t100sAgo = new Date(t0 - 100000).toISOString(); // 100s ago (< 120s threshold, though > 90s)
+      const controlledNow = Date.now();
+      const t130sAgo = new Date(controlledNow - 130000).toISOString(); // 130s ago (> 120s threshold)
+      const t100sAgo = new Date(controlledNow - 100000).toISOString(); // 100s ago (< 120s threshold, though > 90s)
 
       db.prepare(`
         INSERT INTO vehicles (
@@ -1269,8 +1323,8 @@ describe('Part A3 Alert Engine Unit Tests', () => {
           (?, ?, 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'online', 1, 1, 1, ?)
       `).run(vidStale120, t130sAgo, t130sAgo, vidFresh100, t100sAgo, t100sAgo);
 
-      // Run offline check with non-default threshold of 120 seconds
-      const res = runOfflineCheck(120, t0);
+      // 1. Run offline check with non-default threshold of 120 seconds
+      const res = runOfflineCheck(120, controlledNow);
       assert.strictEqual(res.newlyOfflineCount, 1, 'Only vehicle silent >= 120s must become offline');
 
       // Vehicle silent for 100s should still be online because threshold is 120s
@@ -1288,6 +1342,27 @@ describe('Part A3 Alert Engine Unit Tests', () => {
       const details = JSON.parse(alert.details);
       assert.strictEqual(details.threshold_seconds, 120, 'Alert details must record the exact supplied threshold (120s)');
       assert.ok(details.silence_seconds >= 130, 'Alert details must record silence_seconds >= 130');
+
+      // 2. Verify default threshold behaviour remains unchanged (default 90s):
+      const vidDefault = `VG-DEFAULT-THRESH-${Date.now()}`;
+      const t95sAgo = new Date(controlledNow - 95000).toISOString(); // 95s ago (> default 90s threshold)
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES (?, ?, 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'online', 1, 1, 1, ?)
+      `).run(vidDefault, t95sAgo, t95sAgo);
+
+      // Call runOfflineCheck() with default threshold (no threshold argument)
+      const resDef = runOfflineCheck(undefined, controlledNow);
+      assert.ok(resDef.newlyOfflineCount >= 1);
+
+      const alertDef = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vidDefault);
+      assert.ok(alertDef, 'Alert must exist for default threshold');
+      assert.strictEqual(alertDef.status, 'open');
+      const defDetails = JSON.parse(alertDef.details);
+      assert.strictEqual(defDetails.threshold_seconds, 90, 'Default alert details must contain threshold_seconds: 90');
+      assert.ok(defDetails.silence_seconds >= 95);
     });
   });
 });

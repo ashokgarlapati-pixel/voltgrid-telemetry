@@ -49,7 +49,7 @@ const insertOfflineAlertStmt = db.prepare(`
  * Wrapped in an immediate transaction for atomicity.
  * Defers event publishing until after commit.
  */
-const checkOfflineVehicles = db.transaction((cutoffIso, nowIso, thresholdSec) => {
+const checkOfflineVehicles = db.transaction((cutoffIso, nowIso, thresholdSec = OFFLINE_THRESHOLD_SEC) => {
   const staleVehicles = findStaleVehiclesStmt.all(cutoffIso);
   let newlyOfflineCount = 0;
   const alertsToPublish = [];
