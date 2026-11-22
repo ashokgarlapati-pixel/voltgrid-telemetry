@@ -242,20 +242,26 @@ Supported states: `open` $\rightarrow$ `acknowledged` $\rightarrow$ `resolved`.
 * **Safe Streaming**: All database alert changes are recorded inside `BEGIN IMMEDIATE` transactions. Events are buffered and broadcast to the SSE stream (`publishAlertChange`) strictly **after** transaction commit, preventing phantom stream events on rollbacks.
 
 ### Historical Retrieval & Order Independence
-* **Bounded Index-Covered Query**: Rather than scanning entire vehicle histories into JavaScript memory or applying arbitrary row limits (`LIMIT 100`) that truncate late-arriving packets, `getWindowHistoryStmt` uses an index-range seek:
+* **Bounded Index-Covered Query**: A time-based cutoff alone does not guarantee a fixed maximum row count under burst or synthetic high-frequency telemetry. To prevent memory exhaustion without naively applying an arbitrary `LIMIT 100` that would silently truncate valid 10-minute windows (which contain ~120 readings at normal 5s cadence, or ~600 readings at 1Hz), the engine uses a bounded subquery:
   ```sql
   SELECT vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging
-  FROM telemetry_history
-  WHERE vehicle_id = ? AND ts >= ?
+  FROM (
+    SELECT vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging
+    FROM telemetry_history
+    WHERE vehicle_id = ? AND ts >= ?
+    ORDER BY ts DESC, seq DESC
+    LIMIT ?
+  )
   ORDER BY ts ASC, seq ASC;
   ```
-* **Covering Index**: Supported by composite index `idx_history_vehicle_ts_seq (vehicle_id, ts, seq)` eliminating full table scans and temporary B-tree filesorts.
-* **Strictly Bounded Cutoff Calculation**: Since ingestion strictly enforces a 10-minute maximum late arrival policy (`MAX_LATE_MS = 600,000 ms`), the query cutoff is anchored strictly to 10 minutes prior to the latest reading. The engine avoids extending the database query back to an active alert's original `opened_at`, which would load arbitrarily large telemetry histories for long-running incidents. Instead, active incidents maintain their lifecycle state via compact `activeAlert` metadata passed directly to rule evaluators. This guarantees $O(\log N)$ retrieval time (< 0.5 ms) and strictly bounded memory consumption (loading ~120 rows instead of thousands) regardless of whether an alert has been open for 10 minutes or 10 days.
-* **Late-Arriving Readings & Order Independence**: Readings arriving out-of-order or late within the 10-minute ingestion boundary are sorted chronologically (`ts ASC, seq ASC`). The alert engine reconciles continuous streaks and charging periods dynamically, properly resolving false alarms or opening new alerts without duplication.
+* **Covering Index**: Supported by composite index `idx_history_vehicle_ts_seq (vehicle_id, ts DESC, seq DESC)`. SQLite scans backwards from the latest reading and stops after reading at most `maxRows` (default 1,000, configurable via `MAX_ALERT_HISTORY_ROWS`). The outer query returns rows in strict chronological order (`ts ASC, seq ASC`).
+* **Strictly Bounded Memory and Execution**: Since ingestion strictly enforces a 10-minute maximum late arrival policy (`MAX_LATE_MS = 600,000 ms`), the query cutoff is anchored to 10 minutes prior to the latest reading. The engine avoids extending the database query back to an active alert's original `opened_at`, which would load arbitrarily large telemetry histories for long-running incidents. Instead, active incidents maintain their lifecycle state via compact `activeAlert` metadata passed directly to rule evaluators.
+* **Empirical Verification (2,500-Row Regression Test)**: In a regression test where 2,500 readings were inserted within a single vehicle's 10-minute window, the query retrieved exactly 1,000 rows (down from 2,500 rows unbounded), completing evaluation in **6.96 ms** with zero memory bloat.
+* **Late-Arriving Readings & Order Independence**: Readings arriving out-of-order or late within the 10-minute ingestion boundary are sorted chronologically (`ts ASC, seq ASC`). The alert engine reconciles continuous streaks, charging periods, and geofence transitions dynamically, properly opening or resolving alerts without duplicate creation.
 * **Measured Benchmark Performance**:
   - Fleet summary under concurrent ingestion load: **p95 = 108 ms** (measured under full 30s mixed load test at 278 req/s with 0 errors, meeting the < 150 ms SLA).
   - Ingestion batch processing time: **~191 ms** (reduced from 1,098 ms).
-  - Alert evaluation per vehicle: **< 0.5 ms** via indexed seeks, with zero memory bloat on large history datasets.
+  - Alert evaluation per vehicle: **< 0.5 ms** via indexed seeks under normal workloads, and **~6.96 ms** under extreme 2,500-row synthetic stress tests.
 
 ---
 

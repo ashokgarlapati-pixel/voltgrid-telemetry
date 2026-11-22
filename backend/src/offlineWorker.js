@@ -8,11 +8,13 @@ const OFFLINE_THRESHOLD_SEC = parseInt(process.env.OFFLINE_THRESHOLD_SEC || '90'
 
 // Prepared statements for offline detection
 const findStaleVehiclesStmt = db.prepare(`
-  SELECT vehicle_id, updated_at
+  SELECT vehicle_id, updated_at, status
   FROM vehicles
   WHERE updated_at <= ? AND (
     status = 'online' OR 
-    vehicle_id NOT IN (SELECT vehicle_id FROM alerts WHERE rule = 'offline' AND status != 'resolved')
+    (status = 'offline' AND vehicle_id NOT IN (
+      SELECT vehicle_id FROM alerts WHERE rule = 'offline' AND status != 'resolved'
+    ))
   )
 `);
 
@@ -47,8 +49,10 @@ const checkOfflineVehicles = db.transaction((cutoffIso, nowIso) => {
   const alertsToPublish = [];
 
   for (const v of staleVehicles) {
-    // Transition vehicle status to offline
-    setVehicleOfflineStmt.run(v.vehicle_id);
+    // Transition vehicle status to offline if not already offline
+    if (v.status !== 'offline') {
+      setVehicleOfflineStmt.run(v.vehicle_id);
+    }
 
     // Open de-duplicated offline alert if none exists
     const activeAlert = getActiveOfflineAlertStmt.get(v.vehicle_id);

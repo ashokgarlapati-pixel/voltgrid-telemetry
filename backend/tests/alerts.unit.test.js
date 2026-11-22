@@ -13,10 +13,14 @@ process.env.DB_PATH = testDbPath;
 const db = require('../src/db');
 const {
   isPointInPolygon,
+  isPointOnSegment,
   evaluateOverheat,
   evaluateRapidDischarge,
   evaluateGeofenceBreach,
   evaluateVehicleAlerts,
+  getVehicleHistoryForEvaluation,
+  getWindowHistoryStmt,
+  DEFAULT_MAX_HISTORY_ROWS,
   CHENNAI_OPERATING_POLYGON
 } = require('../src/alertEngine');
 const { runOfflineCheck } = require('../src/offlineWorker');
@@ -343,6 +347,52 @@ describe('Part A3 Alert Engine Unit Tests', () => {
       assert.strictEqual(isPointInPolygon(13.0000, 80.3200), true, 'Bottom-right corner must be inside');
     });
 
+    test('Explicit isPointOnSegment tests for horizontal, vertical, and corner boundary segments', () => {
+      const p1 = { lat: 13.0000, lng: 80.1800 }; // Bottom-left
+      const p2 = { lat: 13.1800, lng: 80.1800 }; // Top-left
+      const p3 = { lat: 13.1800, lng: 80.3200 }; // Top-right
+      const p4 = { lat: 13.0000, lng: 80.3200 }; // Bottom-right
+
+      // Vertical left edge
+      assert.strictEqual(isPointOnSegment(13.0900, 80.1800, p1, p2), true, 'Midpoint on vertical left edge');
+      // Horizontal top edge
+      assert.strictEqual(isPointOnSegment(13.1800, 80.2500, p2, p3), true, 'Midpoint on horizontal top edge');
+      // Vertical right edge
+      assert.strictEqual(isPointOnSegment(13.0900, 80.3200, p3, p4), true, 'Midpoint on vertical right edge');
+      // Horizontal bottom edge
+      assert.strictEqual(isPointOnSegment(13.0000, 80.2500, p4, p1), true, 'Midpoint on horizontal bottom edge');
+
+      // Corner vertices
+      assert.strictEqual(isPointOnSegment(13.0000, 80.1800, p1, p2), true, 'Endpoint p1 on vertical left edge');
+      assert.strictEqual(isPointOnSegment(13.1800, 80.1800, p2, p3), true, 'Endpoint p2 on horizontal top edge');
+    });
+
+    test('Floating-point precision edge cases evaluate as inside without moving effective boundary', () => {
+      // 1e-9 precision jitter on boundary
+      assert.strictEqual(isPointInPolygon(13.000000001, 80.2500), true, 'Sub-nanometer jitter on bottom edge');
+      assert.strictEqual(isPointInPolygon(13.1800, 80.250000001), true, 'Sub-nanometer jitter on top edge');
+      assert.strictEqual(isPointInPolygon(13.0900, 80.180000001), true, 'Sub-nanometer jitter on left edge');
+      assert.strictEqual(isPointInPolygon(13.0900, 80.319999999), true, 'Sub-nanometer jitter on right edge');
+    });
+
+    test('Points slightly outside in all four cardinal directions evaluate as outside (breach)', () => {
+      // North of top edge (lat 13.1801 > 13.1800)
+      assert.strictEqual(isPointInPolygon(13.1801, 80.2500), false, 'Point north of top edge must be outside');
+      // South of bottom edge (lat 12.9999 < 13.0000)
+      assert.strictEqual(isPointInPolygon(12.9999, 80.2500), false, 'Point south of bottom edge must be outside');
+      // West of left edge (lng 80.1799 < 80.1800)
+      assert.strictEqual(isPointInPolygon(13.0900, 80.1799), false, 'Point west of left edge must be outside');
+      // East of right edge (lng 80.3201 > 80.3200)
+      assert.strictEqual(isPointInPolygon(13.0900, 80.3201), false, 'Point east of right edge must be outside');
+    });
+
+    test('Interior and exterior points far from boundary preserve existing behavior', () => {
+      // Well inside operating area
+      assert.strictEqual(isPointInPolygon(13.0900, 80.2500), true, 'Interior point must be inside');
+      // Far outside operating area
+      assert.strictEqual(isPointInPolygon(14.0000, 81.0000), false, 'Far exterior point must be outside');
+    });
+
     test('Point just inside boundary evaluates as inside', () => {
       // Just inside bottom-left
       assert.strictEqual(isPointInPolygon(13.0001, 80.1801), true, 'Point just inside boundary must evaluate as inside');
@@ -552,6 +602,99 @@ describe('Part A3 Alert Engine Unit Tests', () => {
       assert.strictEqual(r1.newlyOfflineCount + r2.newlyOfflineCount + r3.newlyOfflineCount, 1);
       assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid).total, 1);
     });
+
+    test('Offline vehicle with an existing active alert remains unchanged (no duplicate)', () => {
+      const vid = `VG-EXISTING-OFF-${Date.now()}`;
+      const t0 = Date.now();
+      const t0Iso = new Date(t0 - 100000).toISOString();
+
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES (?, ?, 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'offline', 1, 1, 1, ?)
+      `).run(vid, t0Iso, t0Iso);
+
+      // Pre-existing active offline alert
+      db.prepare(`
+        INSERT INTO alerts (vehicle_id, rule, status, version, details, opened_at, updated_at)
+        VALUES (?, 'offline', 'open', 1, '{"silence_seconds": 100}', ?, ?)
+      `).run(vid, t0Iso, t0Iso);
+
+      const beforeAlert = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid);
+
+      // Run offline check
+      const res = runOfflineCheck(90, t0);
+      assert.strictEqual(res.newlyOfflineCount, 0, 'Must not create a new alert for vehicle that already has an active alert');
+
+      const afterAlert = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid);
+      assert.strictEqual(afterAlert.id, beforeAlert.id);
+      assert.strictEqual(afterAlert.version, beforeAlert.version);
+      assert.strictEqual(afterAlert.status, 'open');
+    });
+
+    test('New valid telemetry after restart restores vehicle to online and resolves offline alert', () => {
+      const vid = `VG-RESTORE-OFF-${Date.now()}`;
+      const t0 = Date.now();
+      const t0Iso = new Date(t0 - 120000).toISOString();
+
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES (?, ?, 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'offline', 1, 1, 1, ?)
+      `).run(vid, t0Iso, t0Iso);
+
+      db.prepare(`
+        INSERT INTO alerts (vehicle_id, rule, status, version, details, opened_at, updated_at)
+        VALUES (?, 'offline', 'open', 1, '{"silence_seconds": 120}', ?, ?)
+      `).run(vid, t0Iso, t0Iso);
+
+      // New fresh telemetry arrives
+      const freshTs = new Date(t0).toISOString();
+      db.prepare(`
+        INSERT INTO telemetry_history (vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, fault_codes)
+        VALUES (?, 2, ?, 80, 30, 0, 13.08, 80.27, 10.1, 0, '[]')
+      `).run(vid, freshTs);
+
+      db.prepare(`
+        UPDATE vehicles
+        SET status = 'online', last_ts = ?, last_seq = 2, updated_at = ?
+        WHERE vehicle_id = ?
+      `).run(freshTs, freshTs, vid);
+
+      evaluateVehicleAlerts(vid, freshTs);
+
+      const resolvedAlert = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid);
+      assert.strictEqual(resolvedAlert.status, 'resolved', 'Fresh telemetry must resolve the offline alert');
+      assert.strictEqual(resolvedAlert.version, 2);
+    });
+
+    test('Duplicate and older telemetry do NOT mark vehicle online or resolve offline alert', () => {
+      const vid = `VG-NO-REVIVE-${Date.now()}`;
+      const t0 = Date.now();
+      const t0Iso = new Date(t0 - 150000).toISOString();
+
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES (?, ?, 10, 80, 30, 0, 13.08, 80.27, 10, 0, 'offline', 1, 10, 10, ?)
+      `).run(vid, t0Iso, t0Iso);
+
+      db.prepare(`
+        INSERT INTO alerts (vehicle_id, rule, status, version, details, opened_at, updated_at)
+        VALUES (?, 'offline', 'open', 1, '{"silence_seconds": 150}', ?, ?)
+      `).run(vid, t0Iso, t0Iso);
+
+      evaluateVehicleAlerts(vid, t0Iso);
+
+      const vStatus = db.prepare("SELECT status FROM vehicles WHERE vehicle_id = ?").get(vid).status;
+      const alertStatus = db.prepare("SELECT status FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid).status;
+
+      assert.strictEqual(vStatus, 'offline', 'Vehicle must remain offline');
+      assert.strictEqual(alertStatus, 'open', 'Offline alert must remain open');
+    });
   });
 
   describe('Order-Independence Verification', () => {
@@ -611,6 +754,103 @@ describe('Part A3 Alert Engine Unit Tests', () => {
 
       assert.deepStrictEqual(resChron, resRev, 'Chronological and reverse arrival must produce identical geofence outcome');
       assert.deepStrictEqual(resChron, resRand, 'Chronological and randomized arrival must produce identical geofence outcome');
+    });
+  });
+
+  describe('Overheat Late-Arrival Verification', () => {
+    test('Inserting a late-arriving reading into historical sequence triggers alert correctly without duplicates', () => {
+      const vid = `VG-HEAT-LATE-${Date.now()}`;
+      const t0 = Date.now();
+      const t1 = new Date(t0).toISOString();
+      const t2 = new Date(t0 + 5000).toISOString(); // Will be inserted late
+      const t3 = new Date(t0 + 10000).toISOString();
+
+      // Step 1: Initial readings: T1 (56°C) and T3 (57°C) -> Only 2 readings, so streak = 2, NO alert
+      db.prepare(`
+        INSERT INTO telemetry_history (vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, fault_codes)
+        VALUES (?, 1, ?, 80, 56.0, 40, 13.08, 80.27, 10, 0, '[]'),
+               (? , 3, ?, 80, 57.0, 40, 13.08, 80.27, 10.2, 0, '[]')
+      `).run(vid, t1, vid, t3);
+
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES (?, ?, 3, 80, 57.0, 40, 13.08, 80.27, 10.2, 0, 'online', 1, 3, 2, ?)
+      `).run(vid, t3, t3);
+
+      evaluateVehicleAlerts(vid, t3);
+
+      const countBefore = db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").get(vid).total;
+      assert.strictEqual(countBefore, 0, 'No alert before 3 consecutive hot readings');
+
+      // Step 2: Late-arriving reading T2 (56.5°C) arrives with seq = 2
+      db.prepare(`
+        INSERT INTO telemetry_history (vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, fault_codes)
+        VALUES (?, 2, ?, 80, 56.5, 40, 13.08, 80.27, 10.1, 0, '[]')
+      `).run(vid, t2);
+
+      // Step 3: Re-evaluate the vehicle
+      evaluateVehicleAlerts(vid, t3);
+
+      // Step 4: Final alert state must now be triggered (open, version = 1)
+      const alertAfter = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").get(vid);
+      assert.ok(alertAfter, 'Alert must be opened once late reading completes 3 consecutive hot readings');
+      assert.strictEqual(alertAfter.status, 'open');
+      assert.strictEqual(alertAfter.version, 1);
+
+      // Step 5: Re-evaluate again: confirm NO duplicate alert is created
+      evaluateVehicleAlerts(vid, t3);
+      const totalAlerts = db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").get(vid).total;
+      assert.strictEqual(totalAlerts, 1, 'Must never create duplicate alert on repeated evaluation');
+    });
+  });
+
+  describe('History Retrieval Scalability & Bounded Memory', () => {
+    test('2,500 telemetry rows in window are bounded to maxRows without excessive memory or latency', () => {
+      const vid = `VG-SCALE-2500-${Date.now()}`;
+      const t0 = Date.now();
+      const insertStmt = db.prepare(`
+        INSERT INTO telemetry_history (vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, fault_codes)
+        VALUES (?, ?, ?, 80, 40.0, 30, 13.08, 80.27, 10, 0, '[]')
+      `);
+
+      // Insert 2,500 historical readings spanning the 10-minute window (every 240ms)
+      const insertMany = db.transaction(() => {
+        for (let i = 1; i <= 2500; i++) {
+          const ts = new Date(t0 - 600000 + (i * 240)).toISOString();
+          insertStmt.run(vid, i, ts);
+        }
+      });
+      insertMany();
+
+      const latestTs = new Date(t0).toISOString();
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES (?, ?, 2500, 80, 40.0, 30, 13.08, 80.27, 10, 0, 'online', 1, 2500, 2500, ?)
+      `).run(vid, latestTs, latestTs);
+
+      // Measure rows retrieved by getWindowHistoryStmt
+      const cutoffIso = new Date(t0 - 600000).toISOString();
+      const rows = getWindowHistoryStmt.all(vid, cutoffIso);
+
+      assert.ok(rows.length <= DEFAULT_MAX_HISTORY_ROWS, `Retrieved rows (${rows.length}) must not exceed limit (${DEFAULT_MAX_HISTORY_ROWS})`);
+      assert.strictEqual(rows.length, 1000, 'Must retrieve exactly bounded 1,000 rows out of 2,500');
+
+      // Verify chronological ordering
+      assert.ok(Date.parse(rows[0].ts) <= Date.parse(rows[rows.length - 1].ts), 'Rows must be sorted chronologically');
+      assert.strictEqual(rows[rows.length - 1].seq, 2500, 'Newest reading (seq 2500) must be included');
+
+      // Measure evaluation duration
+      const startTime = performance.now();
+      const changed = evaluateVehicleAlerts(vid, latestTs);
+      const durationMs = performance.now() - startTime;
+
+      console.log(`[Scalability Measurement] Evaluated vehicle with 2,500 history rows in ${durationMs.toFixed(2)}ms (retrieved ${rows.length} rows)`);
+      assert.ok(durationMs < 50, `Alert evaluation duration (${durationMs.toFixed(2)}ms) must remain well under 50ms`);
+      assert.strictEqual(Array.isArray(changed), true);
     });
   });
 });

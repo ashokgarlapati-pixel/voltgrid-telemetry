@@ -15,6 +15,8 @@ const CHENNAI_OPERATING_POLYGON = [
 
 /**
  * Tests whether a point (lat, lng) lies on a polygon boundary segment.
+ * Uses normalized perpendicular distance and bounding box containment
+ * to reliably handle horizontal, vertical, and slanted edges with float precision tolerance.
  * @param {number} lat 
  * @param {number} lng 
  * @param {{lat: number, lng: number}} p1 
@@ -22,7 +24,7 @@ const CHENNAI_OPERATING_POLYGON = [
  * @param {number} epsilon 
  * @returns {boolean}
  */
-function isPointOnSegment(lat, lng, p1, p2, epsilon = 1e-9) {
+function isPointOnSegment(lat, lng, p1, p2, epsilon = 1e-7) {
   const minLat = Math.min(p1.lat, p2.lat) - epsilon;
   const maxLat = Math.max(p1.lat, p2.lat) + epsilon;
   const minLng = Math.min(p1.lng, p2.lng) - epsilon;
@@ -32,11 +34,20 @@ function isPointOnSegment(lat, lng, p1, p2, epsilon = 1e-9) {
     return false;
   }
 
-  const crossProduct = Math.abs(
-    (lng - p1.lng) * (p2.lat - p1.lat) - (lat - p1.lat) * (p2.lng - p1.lng)
-  );
+  const dLat = p2.lat - p1.lat;
+  const dLng = p2.lng - p1.lng;
+  const segLength = Math.hypot(dLat, dLng);
 
-  return crossProduct <= epsilon;
+  if (segLength <= epsilon) {
+    return Math.hypot(lat - p1.lat, lng - p1.lng) <= epsilon;
+  }
+
+  const crossProduct = Math.abs(
+    (lng - p1.lng) * dLat - (lat - p1.lat) * dLng
+  );
+  const distance = crossProduct / segLength;
+
+  return distance <= epsilon;
 }
 
 /**
@@ -439,23 +450,47 @@ function evaluateGeofenceBreach(readings, activeAlert = null) {
   };
 }
 
+const DEFAULT_MAX_HISTORY_ROWS = parseInt(process.env.MAX_ALERT_HISTORY_ROWS || '1000', 10);
+
 const TELEMETRY_RULES = [
-  { name: 'overheat', evaluate: evaluateOverheat },
-  { name: 'rapid_discharge', evaluate: evaluateRapidDischarge },
-  { name: 'geofence_breach', evaluate: evaluateGeofenceBreach }
+  { name: 'overheat', evaluate: evaluateOverheat, windowMs: 10 * 60 * 1000, maxRows: 1000 },
+  { name: 'rapid_discharge', evaluate: evaluateRapidDischarge, windowMs: 5 * 60 * 1000, maxRows: 600 },
+  { name: 'geofence_breach', evaluate: evaluateGeofenceBreach, windowMs: 10 * 60 * 1000, maxRows: 1000 }
 ];
 
-// Index-covered time-bounded query for vehicle telemetry history.
-// Ingestion validation strictly rejects telemetry older than 10 minutes.
-// Querying with ts >= MIN(now - 10m, activeAlert.opened_at) seeks directly
-// via idx_history_vehicle_ts in O(log N) time (< 0.5ms) without scanning
-// historical rows from hours, days, or weeks ago.
-const getWindowHistoryStmt = db.prepare(`
+// Bounded index-covered query for vehicle telemetry history.
+// Uses composite index idx_history_vehicle_ts_seq (vehicle_id, ts DESC, seq DESC)
+// to scan backwards from the latest reading, bounded to maxRows (default 1,000).
+// Outer query orders chronologically (ts ASC, seq ASC) for deterministic rule evaluation.
+const getBoundedWindowHistoryStmt = db.prepare(`
   SELECT vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging
-  FROM telemetry_history
-  WHERE vehicle_id = ? AND ts >= ?
+  FROM (
+    SELECT vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging
+    FROM telemetry_history
+    WHERE vehicle_id = ? AND ts >= ?
+    ORDER BY ts DESC, seq DESC
+    LIMIT ?
+  )
   ORDER BY ts ASC, seq ASC
 `);
+
+/**
+ * Retrieves bounded telemetry history for alert rule evaluation.
+ * @param {string} vehicleId 
+ * @param {string} cutoffIso 
+ * @param {number} maxRows 
+ * @returns {Array<object>} Chronologically sorted readings
+ */
+function getVehicleHistoryForEvaluation(vehicleId, cutoffIso, maxRows = DEFAULT_MAX_HISTORY_ROWS) {
+  return getBoundedWindowHistoryStmt.all(vehicleId, cutoffIso, maxRows);
+}
+
+// Bounded statement wrapper preserving backward-compatible .all() API
+const getWindowHistoryStmt = {
+  all(vehicleId, cutoffIso, maxRows = DEFAULT_MAX_HISTORY_ROWS) {
+    return getBoundedWindowHistoryStmt.all(vehicleId, cutoffIso, maxRows);
+  }
+};
 
 const getLatestReadingTsStmt = db.prepare(`
   SELECT ts FROM telemetry_history
@@ -757,11 +792,15 @@ function evaluateAlertsForVehicles(vehicleIds, nowIso = new Date().toISOString()
 
 module.exports = {
   isPointInPolygon,
+  isPointOnSegment,
   evaluateOverheat,
   evaluateRapidDischarge,
   evaluateGeofenceBreach,
   evaluateVehicleAlerts,
   evaluateAlertsForVehicles,
+  getVehicleHistoryForEvaluation,
+  getWindowHistoryStmt,
+  DEFAULT_MAX_HISTORY_ROWS,
   TELEMETRY_RULES,
   CHENNAI_OPERATING_POLYGON
 };
