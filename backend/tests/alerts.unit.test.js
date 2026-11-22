@@ -1,4 +1,4 @@
-const { test, describe, before, after } = require('node:test');
+const { test, describe, before, after, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
 const os = require('node:os');
@@ -23,12 +23,19 @@ const {
   DEFAULT_MAX_HISTORY_ROWS,
   CHENNAI_OPERATING_POLYGON
 } = require('../src/alertEngine');
-const { runOfflineCheck } = require('../src/offlineWorker');
+const {
+  runOfflineCheck,
+  startOfflineWorker,
+  stopOfflineWorker,
+  isWorkerRunning
+} = require('../src/offlineWorker');
+const { ingestBatch } = require('../src/ingestion');
 
 describe('Part A3 Alert Engine Unit Tests', () => {
 
   after(() => {
     try {
+      stopOfflineWorker();
       db.close();
       if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
       if (fs.existsSync(`${testDbPath}-wal`)) fs.unlinkSync(`${testDbPath}-wal`);
@@ -851,6 +858,374 @@ describe('Part A3 Alert Engine Unit Tests', () => {
       console.log(`[Scalability Measurement] Evaluated vehicle with 2,500 history rows in ${durationMs.toFixed(2)}ms (retrieved ${rows.length} rows)`);
       assert.ok(durationMs < 50, `Alert evaluation duration (${durationMs.toFixed(2)}ms) must remain well under 50ms`);
       assert.strictEqual(Array.isArray(changed), true);
+    });
+  });
+
+  describe('Offline Restart Recovery Comprehensive Suite (Tests A - G)', () => {
+    beforeEach(() => {
+      stopOfflineWorker();
+      db.exec('DELETE FROM alerts; DELETE FROM telemetry_history; DELETE FROM vehicles; DELETE FROM alert_outbox;');
+    });
+
+    afterEach(() => {
+      stopOfflineWorker();
+    });
+
+    test('Test A: Normal offline detection (online vehicle becomes offline when silent past threshold)', () => {
+      const vid = `VG-TEST-A-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const t0 = Date.now();
+      const t0Iso = new Date(t0).toISOString();
+
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES (?, ?, 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'online', 1, 1, 1, ?)
+      `).run(vid, t0Iso, t0Iso);
+
+      // Within silence threshold (< 90s, e.g. at 30s): remains online, 0 alerts
+      const res30 = runOfflineCheck(90, t0 + 30000);
+      assert.strictEqual(res30.newlyOfflineCount, 0);
+      const v30 = db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vid);
+      assert.strictEqual(v30.status, 'online');
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS c FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid).c, 0);
+
+      // Past silence threshold (>= 90s, e.g. at 95s): transitions to offline, alert opened
+      const res95 = runOfflineCheck(90, t0 + 95000);
+      assert.strictEqual(res95.newlyOfflineCount, 1);
+      const v95 = db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vid);
+      assert.strictEqual(v95.status, 'offline');
+      const alert = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid);
+      assert.ok(alert);
+      assert.strictEqual(alert.status, 'open');
+      assert.strictEqual(alert.version, 1);
+    });
+
+    test('Test B: Missing alert recovery (backend restart: offline vehicle without an active offline alert gets an offline alert created upon startup)', () => {
+      const vid = `VG-TEST-B-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const t0 = Date.now();
+      const staleIso = new Date(t0 - 150000).toISOString(); // 150 seconds ago
+
+      // Vehicle was already marked 'offline' before crash/restart, but has NO active offline alert
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES (?, ?, 1, 75, 29, 0, 13.08, 80.27, 12, 0, 'offline', 1, 1, 1, ?)
+      `).run(vid, staleIso, staleIso);
+
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS c FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid).c, 0);
+
+      // On startup check: must identify this vehicle and create its missing offline alert
+      const res = runOfflineCheck(90, t0);
+      assert.ok(res.newlyOfflineCount >= 1, 'Must detect and create alert for already-offline vehicle lacking alert');
+
+      const vAfter = db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vid);
+      assert.strictEqual(vAfter.status, 'offline', 'Status must remain offline');
+
+      const alert = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid);
+      assert.ok(alert, 'Offline alert must be created');
+      assert.strictEqual(alert.status, 'open');
+      assert.strictEqual(alert.version, 1);
+      const details = JSON.parse(alert.details);
+      assert.ok(details.silence_seconds >= 150);
+    });
+
+    test('Test C: Duplicate prevention (subsequent checks or startup do not create duplicate active offline alerts)', () => {
+      const vid = `VG-TEST-C-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const t0 = Date.now();
+      const staleIso = new Date(t0 - 120000).toISOString();
+
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES (?, ?, 1, 75, 29, 0, 13.08, 80.27, 12, 0, 'online', 1, 1, 1, ?)
+      `).run(vid, staleIso, staleIso);
+
+      // 1st run triggers initial offline alert
+      const res1 = runOfflineCheck(90, t0);
+      assert.strictEqual(res1.newlyOfflineCount, 1);
+      const initialAlert = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid);
+      assert.ok(initialAlert);
+
+      // 2nd, 3rd, and 4th subsequent checks at later times
+      const res2 = runOfflineCheck(90, t0 + 10000);
+      const res3 = runOfflineCheck(90, t0 + 20000);
+      const res4 = runOfflineCheck(90, t0 + 30000);
+
+      assert.strictEqual(res2.newlyOfflineCount, 0);
+      assert.strictEqual(res3.newlyOfflineCount, 0);
+      assert.strictEqual(res4.newlyOfflineCount, 0);
+
+      const allAlerts = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").all(vid);
+      assert.strictEqual(allAlerts.length, 1, 'Must strictly have exactly 1 offline alert');
+      assert.strictEqual(allAlerts[0].id, initialAlert.id);
+      assert.strictEqual(allAlerts[0].version, 1);
+    });
+
+    test('Test D: Immediate startup recovery (calling startOfflineWorker() runs the check immediately without waiting for the interval to elapse)', () => {
+      const vidOnline = `VG-TEST-D-ON-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const vidOffline = `VG-TEST-D-OFF-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const t0 = Date.now();
+      const staleIso = new Date(t0 - 110000).toISOString();
+
+      // Seed 1 online stale vehicle and 1 offline vehicle without alert
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES 
+          (?, ?, 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'online', 1, 1, 1, ?),
+          (?, ?, 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'offline', 1, 1, 1, ?)
+      `).run(vidOnline, staleIso, staleIso, vidOffline, staleIso, staleIso);
+
+      // Start worker with a huge interval (60 seconds) so the timer won't fire during this test
+      startOfflineWorker(60000, 90, t0);
+
+      try {
+        // Assert worker is running
+        assert.strictEqual(isWorkerRunning(), true, 'Offline worker must report running');
+
+        // Immediately (synchronously upon return), the startup recovery check must have executed!
+        const vOn = db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vidOnline);
+        const vOff = db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vidOffline);
+        assert.strictEqual(vOn.status, 'offline', 'Online stale vehicle must immediately become offline');
+        assert.strictEqual(vOff.status, 'offline', 'Already offline vehicle must remain offline');
+
+        const alertOn = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vidOnline);
+        const alertOff = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vidOffline);
+        assert.ok(alertOn, 'Alert for vidOnline must be created immediately on startup');
+        assert.strictEqual(alertOn.status, 'open');
+        assert.ok(alertOff, 'Alert for vidOffline must be created immediately on startup');
+        assert.strictEqual(alertOff.status, 'open');
+
+        // Re-invoking startOfflineWorker while running should be a safe no-op (no duplicate timers)
+        startOfflineWorker(60000, 90, t0);
+        assert.strictEqual(isWorkerRunning(), true);
+      } finally {
+        stopOfflineWorker();
+        assert.strictEqual(isWorkerRunning(), false, 'Offline worker must stop cleanly');
+      }
+    });
+
+    test('Test E: Fresh telemetry recovery (vehicle is offline with an active offline alert; new valid telemetry arrives via ingestBatch; status changes to online, alert is resolved)', () => {
+      const vid = `VG-TEST-E-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const t0 = Date.now();
+      const t0Iso = new Date(t0 - 150000).toISOString();
+
+      // Seed offline vehicle with an active offline alert
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES (?, ?, 10, 70, 30, 0, 13.08, 80.27, 20, 0, 'offline', 1, 10, 10, ?)
+      `).run(vid, t0Iso, t0Iso);
+
+      db.prepare(`
+        INSERT INTO alerts (vehicle_id, rule, status, version, details, opened_at, updated_at)
+        VALUES (?, 'offline', 'open', 1, '{"silence_seconds": 150}', ?, ?)
+      `).run(vid, t0Iso, t0Iso);
+
+      const alertBefore = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid);
+      assert.strictEqual(alertBefore.status, 'open');
+      assert.strictEqual(alertBefore.version, 1);
+
+      // Fresh valid advancing telemetry arrives via ingestBatch
+      const freshTs = new Date(t0).toISOString();
+      const batchRes = ingestBatch([{
+        vehicle_id: vid,
+        seq: 11,
+        ts: freshTs,
+        soc_pct: 69.5,
+        battery_temp_c: 32.0,
+        speed_kmh: 25.0,
+        lat: 13.0827,
+        lng: 80.2707,
+        odometer_km: 20.5,
+        charging: false,
+        fault_codes: []
+      }]);
+
+      assert.strictEqual(batchRes.accepted, 1);
+
+      // Status must change to online
+      const vAfter = db.prepare('SELECT status, last_seq, last_ts FROM vehicles WHERE vehicle_id = ?').get(vid);
+      assert.strictEqual(vAfter.status, 'online', 'Vehicle status must be restored to online');
+      assert.strictEqual(vAfter.last_seq, 11);
+
+      // Alert must be resolved
+      const alertAfter = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid);
+      assert.strictEqual(alertAfter.status, 'resolved', 'Offline alert must transition to resolved');
+      assert.strictEqual(alertAfter.version, 2, 'Alert version must increment upon resolution');
+      assert.ok(alertAfter.resolved_at, 'resolved_at timestamp must be set');
+    });
+
+    test('Test F: Duplicate and older telemetry (vehicle is offline with active offline alert; duplicate or older telemetry is ingested via ingestBatch; alert remains active and status remains offline)', () => {
+      const vid = `VG-TEST-F-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const t0 = Date.now();
+      const t0Iso = new Date(t0 - 150000).toISOString();
+
+      // Seed vehicle offline with seq 20
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES (?, ?, 20, 70, 30, 0, 13.08, 80.27, 20, 0, 'offline', 1, 20, 20, ?)
+      `).run(vid, t0Iso, t0Iso);
+
+      // Existing telemetry row at seq 20
+      db.prepare(`
+        INSERT INTO telemetry_history (vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, fault_codes)
+        VALUES (?, 20, ?, 70, 30, 0, 13.08, 80.27, 20, 0, '[]')
+      `).run(vid, t0Iso);
+
+      // Active offline alert
+      db.prepare(`
+        INSERT INTO alerts (vehicle_id, rule, status, version, details, opened_at, updated_at)
+        VALUES (?, 'offline', 'open', 1, '{"silence_seconds": 150}', ?, ?)
+      `).run(vid, t0Iso, t0Iso);
+
+      // 1. Ingest duplicate reading (seq 20, same ts)
+      const dupRes = ingestBatch([{
+        vehicle_id: vid,
+        seq: 20,
+        ts: t0Iso,
+        soc_pct: 70,
+        battery_temp_c: 30,
+        speed_kmh: 0,
+        lat: 13.08,
+        lng: 80.27,
+        odometer_km: 20,
+        charging: false,
+        fault_codes: []
+      }]);
+
+      assert.strictEqual(dupRes.duplicates, 1, 'Must be marked duplicate');
+      assert.strictEqual(dupRes.accepted, 0);
+
+      // Vehicle must remain offline and alert open
+      let vCheck = db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vid);
+      assert.strictEqual(vCheck.status, 'offline', 'Duplicate telemetry must NOT restore online status');
+      let aCheck = db.prepare("SELECT status, version FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid);
+      assert.strictEqual(aCheck.status, 'open', 'Duplicate telemetry must NOT resolve offline alert');
+      assert.strictEqual(aCheck.version, 1);
+
+      // 2. Ingest older telemetry (seq 15, earlier ts)
+      const olderTs = new Date(t0 - 200000).toISOString();
+      const oldRes = ingestBatch([{
+        vehicle_id: vid,
+        seq: 15,
+        ts: olderTs,
+        soc_pct: 71,
+        battery_temp_c: 29,
+        speed_kmh: 10,
+        lat: 13.08,
+        lng: 80.27,
+        odometer_km: 19.5,
+        charging: false,
+        fault_codes: []
+      }]);
+
+      assert.strictEqual(oldRes.accepted, 1, 'Older telemetry accepted into historical log');
+
+      // Vehicle must STILL remain offline and alert open because reading did not advance latest state
+      vCheck = db.prepare('SELECT status, last_seq FROM vehicles WHERE vehicle_id = ?').get(vid);
+      assert.strictEqual(vCheck.status, 'offline', 'Older telemetry must NOT restore online status');
+      assert.strictEqual(vCheck.last_seq, 20, 'last_seq must not regress');
+      aCheck = db.prepare("SELECT status, version FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid);
+      assert.strictEqual(aCheck.status, 'open', 'Older telemetry must NOT resolve offline alert');
+      assert.strictEqual(aCheck.version, 1);
+    });
+
+    test('Test G: Multiple vehicles (batch of vehicles with mixed states: online, offline with alert, offline without alert, and fresh; verify correct state transitions for all)', () => {
+      const t0 = Date.now();
+      const vFresh = `VG-TEST-G-FRESH-${Date.now()}`;
+      const vStale = `VG-TEST-G-STALE-${Date.now()}`;
+      const vWithAlert = `VG-TEST-G-WITHALERT-${Date.now()}`;
+      const vNoAlert = `VG-TEST-G-NOALERT-${Date.now()}`;
+      const vMaint = `VG-TEST-G-MAINT-${Date.now()}`;
+
+      const t20sAgo = new Date(t0 - 20000).toISOString();
+      const t120sAgo = new Date(t0 - 120000).toISOString();
+      const t130sAgo = new Date(t0 - 130000).toISOString();
+      const t140sAgo = new Date(t0 - 140000).toISOString();
+      const t200sAgo = new Date(t0 - 200000).toISOString();
+
+      // Seed the 5 vehicles
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES 
+          (?, ?, 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'online', 1, 1, 1, ?),
+          (?, ?, 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'online', 1, 1, 1, ?),
+          (?, ?, 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'offline', 1, 1, 1, ?),
+          (?, ?, 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'offline', 1, 1, 1, ?),
+          (?, ?, 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'maintenance', 1, 1, 1, ?)
+      `).run(
+        vFresh, t20sAgo, t20sAgo,
+        vStale, t120sAgo, t120sAgo,
+        vWithAlert, t130sAgo, t130sAgo,
+        vNoAlert, t140sAgo, t140sAgo,
+        vMaint, t200sAgo, t200sAgo
+      );
+
+      // Seed existing alert for vWithAlert
+      db.prepare(`
+        INSERT INTO alerts (vehicle_id, rule, status, version, details, opened_at, updated_at)
+        VALUES (?, 'offline', 'open', 1, '{"silence_seconds": 130}', ?, ?)
+      `).run(vWithAlert, t130sAgo, t130sAgo);
+      const existingAlertId = db.prepare("SELECT id FROM alerts WHERE vehicle_id = ?").get(vWithAlert).id;
+
+      // Execute offline check at t0
+      const res = runOfflineCheck(90, t0);
+
+      // Verify transitions:
+      // vFresh: remains online, no alert
+      assert.strictEqual(db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vFresh).status, 'online');
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS c FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vFresh).c, 0);
+
+      // vStale: becomes offline, alert created
+      assert.strictEqual(db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vStale).status, 'offline');
+      const alertStale = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vStale);
+      assert.ok(alertStale);
+      assert.strictEqual(alertStale.status, 'open');
+
+      // vWithAlert: remains offline, alert preserved without duplication
+      assert.strictEqual(db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vWithAlert).status, 'offline');
+      const alertsWithAlert = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").all(vWithAlert);
+      assert.strictEqual(alertsWithAlert.length, 1);
+      assert.strictEqual(alertsWithAlert[0].id, existingAlertId);
+
+      // vNoAlert: remains offline, missing alert recovered
+      assert.strictEqual(db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vNoAlert).status, 'offline');
+      const alertNoAlert = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vNoAlert);
+      assert.ok(alertNoAlert, 'Missing offline alert must be recovered');
+      assert.strictEqual(alertNoAlert.status, 'open');
+
+      // vMaint: remains maintenance, no alert created
+      assert.strictEqual(db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vMaint).status, 'maintenance');
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS c FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vMaint).c, 0);
+
+      // Recovery via fresh telemetry for vStale:
+      const freshTs = new Date(t0 + 5000).toISOString();
+      const ingestRes = ingestBatch([{
+        vehicle_id: vStale,
+        seq: 2,
+        ts: freshTs,
+        soc_pct: 79,
+        battery_temp_c: 31,
+        speed_kmh: 15,
+        lat: 13.0827,
+        lng: 80.2707,
+        odometer_km: 11,
+        charging: false,
+        fault_codes: []
+      }]);
+      assert.strictEqual(ingestRes.accepted, 1);
+      assert.strictEqual(db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vStale).status, 'online');
+      assert.strictEqual(db.prepare("SELECT status FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vStale).status, 'resolved');
     });
   });
 });
