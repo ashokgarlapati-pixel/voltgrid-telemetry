@@ -43,6 +43,8 @@ const insertOfflineAlertStmt = db.prepare(`
   )
 `);
 
+const getAlertByIdStmt = db.prepare('SELECT * FROM alerts WHERE id = ?');
+
 /**
  * Checks for online vehicles that have not reported within the threshold window,
  * and recovers missing offline alerts for already-offline vehicles after restart.
@@ -73,7 +75,7 @@ const checkOfflineVehicles = db.transaction((cutoffIso, nowIso, thresholdSec = O
         }),
         now: nowIso
       });
-      const newAlert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(insertInfo.lastInsertRowid);
+      const newAlert = getAlertByIdStmt.get(insertInfo.lastInsertRowid);
       if (newAlert) {
         alertsToPublish.push(newAlert);
       }
@@ -97,11 +99,15 @@ function runOfflineCheck(thresholdSec = OFFLINE_THRESHOLD_SEC, nowMs = Date.now(
   }
   isCheckInProgress = true;
   try {
-    const cutoffMs = nowMs - (thresholdSec * 1000);
+    const effectiveThreshold = (typeof thresholdSec === 'number' && !isNaN(thresholdSec) && thresholdSec > 0)
+      ? thresholdSec
+      : OFFLINE_THRESHOLD_SEC;
+    const effectiveNowMs = (typeof nowMs === 'number' && !isNaN(nowMs)) ? nowMs : Date.now();
+    const cutoffMs = effectiveNowMs - (effectiveThreshold * 1000);
     const cutoffIso = new Date(cutoffMs).toISOString();
-    const nowIso = new Date(nowMs).toISOString();
+    const nowIso = new Date(effectiveNowMs).toISOString();
 
-    const result = checkOfflineVehicles(cutoffIso, nowIso, thresholdSec);
+    const result = checkOfflineVehicles(cutoffIso, nowIso, effectiveThreshold);
     // Publish alert events strictly AFTER the transaction has committed!
     if (result.alertsToPublish && result.alertsToPublish.length > 0) {
       for (const alert of result.alertsToPublish) {

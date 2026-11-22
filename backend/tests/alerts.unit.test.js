@@ -1025,8 +1025,8 @@ describe('Part A3 Alert Engine Unit Tests', () => {
     });
 
     test('Test: Dedicated worker restart after stopping (stop, restart, immediate recovery, and duplicate prevention)', () => {
-      const vidInitial = `VG-RESTART-INIT-${Date.now()}`;
-      const vidSecond = `VG-RESTART-SEC-${Date.now()}`;
+      const vidInitial = `VG-RESTART-INIT-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const vidSecond = `VG-RESTART-SEC-${Date.now()}-${Math.random().toString(36).substring(7)}`;
       const t0 = Date.now();
       const staleIso = new Date(t0 - 100000).toISOString();
 
@@ -1308,8 +1308,8 @@ describe('Part A3 Alert Engine Unit Tests', () => {
     });
 
     test('Test H: Custom threshold parameter is recorded in alert details and default threshold is preserved', () => {
-      const vidStale120 = `VG-CUSTOM-THRESH-120-${Date.now()}`;
-      const vidFresh100 = `VG-CUSTOM-THRESH-100-${Date.now()}`;
+      const vidStale120 = `VG-CUSTOM-THRESH-120-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const vidFresh100 = `VG-CUSTOM-THRESH-100-${Date.now()}-${Math.random().toString(36).substring(7)}`;
       const controlledNow = Date.now();
       const t130sAgo = new Date(controlledNow - 130000).toISOString(); // 130s ago (> 120s threshold)
       const t100sAgo = new Date(controlledNow - 100000).toISOString(); // 100s ago (< 120s threshold, though > 90s)
@@ -1343,8 +1343,9 @@ describe('Part A3 Alert Engine Unit Tests', () => {
       assert.strictEqual(details.threshold_seconds, 120, 'Alert details must record the exact supplied threshold (120s)');
       assert.ok(details.silence_seconds >= 130, 'Alert details must record silence_seconds >= 130');
 
-      // 2. Verify default threshold behaviour remains unchanged (default 90s):
-      const vidDefault = `VG-DEFAULT-THRESH-${Date.now()}`;
+      // 2. Clean up test database and verify default threshold behaviour remains unchanged (default 90s):
+      db.exec('DELETE FROM alerts; DELETE FROM vehicles; DELETE FROM alert_outbox;');
+      const vidDefault = `VG-DEFAULT-THRESH-${Date.now()}-${Math.random().toString(36).substring(7)}`;
       const t95sAgo = new Date(controlledNow - 95000).toISOString(); // 95s ago (> default 90s threshold)
       db.prepare(`
         INSERT INTO vehicles (
@@ -1355,7 +1356,7 @@ describe('Part A3 Alert Engine Unit Tests', () => {
 
       // Call runOfflineCheck() with default threshold (no threshold argument)
       const resDef = runOfflineCheck(undefined, controlledNow);
-      assert.ok(resDef.newlyOfflineCount >= 1);
+      assert.strictEqual(resDef.newlyOfflineCount, 1, 'Exactly 1 vehicle silent >= 90s must become offline');
 
       const alertDef = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vidDefault);
       assert.ok(alertDef, 'Alert must exist for default threshold');
