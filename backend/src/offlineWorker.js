@@ -3,7 +3,6 @@ const { publishAlertChange } = require('./stream');
 
 let workerInterval = null;
 let isCheckInProgress = false;
-let isWorkerRunning = false;
 
 const OFFLINE_CHECK_INTERVAL_MS = parseInt(process.env.OFFLINE_CHECK_INTERVAL_MS || '10000', 10);
 const OFFLINE_THRESHOLD_SEC = parseInt(process.env.OFFLINE_THRESHOLD_SEC || '90', 10);
@@ -50,7 +49,7 @@ const insertOfflineAlertStmt = db.prepare(`
  * Wrapped in an immediate transaction for atomicity.
  * Defers event publishing until after commit.
  */
-const checkOfflineVehicles = db.transaction((cutoffIso, nowIso) => {
+const checkOfflineVehicles = db.transaction((cutoffIso, nowIso, thresholdSec) => {
   const staleVehicles = findStaleVehiclesStmt.all(cutoffIso);
   let newlyOfflineCount = 0;
   const alertsToPublish = [];
@@ -69,7 +68,7 @@ const checkOfflineVehicles = db.transaction((cutoffIso, nowIso) => {
         vehicle_id: v.vehicle_id,
         details: JSON.stringify({
           silence_seconds: silenceSec,
-          threshold_seconds: OFFLINE_THRESHOLD_SEC,
+          threshold_seconds: thresholdSec,
           last_seen: v.updated_at
         }),
         now: nowIso
@@ -102,7 +101,7 @@ function runOfflineCheck(thresholdSec = OFFLINE_THRESHOLD_SEC, nowMs = Date.now(
     const cutoffIso = new Date(cutoffMs).toISOString();
     const nowIso = new Date(nowMs).toISOString();
 
-    const result = checkOfflineVehicles(cutoffIso, nowIso);
+    const result = checkOfflineVehicles(cutoffIso, nowIso, thresholdSec);
     // Publish alert events strictly AFTER the transaction has committed!
     if (result.alertsToPublish && result.alertsToPublish.length > 0) {
       for (const alert of result.alertsToPublish) {
@@ -122,28 +121,30 @@ function runOfflineCheck(thresholdSec = OFFLINE_THRESHOLD_SEC, nowMs = Date.now(
 }
 
 /**
+ * Returns whether the background offline worker is currently running with an active interval.
+ * @returns {boolean}
+ */
+function isWorkerRunning() {
+  return workerInterval !== null;
+}
+
+/**
  * Starts the periodic background offline worker.
+ * - If worker is already running, safely no-ops without creating new timers or re-running startup recovery.
  * - Starts the first recovery check immediately upon worker startup.
  * - Continues periodic checks afterward.
- * - Prevents overlapping checks and duplicate worker timer loops.
+ * - Prevents overlapping checks.
  * - Handles errors gracefully without terminating future intervals.
  * @param {number} intervalMs 
  * @param {number} thresholdSec 
  * @param {number|null} startupNowMs Optional epoch ms for deterministic testing
  */
 function startOfflineWorker(intervalMs = OFFLINE_CHECK_INTERVAL_MS, thresholdSec = OFFLINE_THRESHOLD_SEC, startupNowMs = null) {
-  if (isWorkerRunning && workerInterval) {
-    // Already running; prevent creating duplicate intervals or concurrent loops
+  if (workerInterval !== null) {
+    // Already running; safe no-op. Do not create another interval, do not run startup recovery again.
     return;
   }
 
-  // Clear existing timer if any
-  if (workerInterval) {
-    clearInterval(workerInterval);
-    workerInterval = null;
-  }
-
-  isWorkerRunning = true;
   console.log(`[OfflineWorker] Started background monitor (interval: ${intervalMs}ms, threshold: ${thresholdSec}s)`);
 
   // 1. Immediate recovery check during worker startup
@@ -172,11 +173,10 @@ function startOfflineWorker(intervalMs = OFFLINE_CHECK_INTERVAL_MS, thresholdSec
  * Stops the background offline worker cleanly.
  */
 function stopOfflineWorker() {
-  if (workerInterval) {
+  if (workerInterval !== null) {
     clearInterval(workerInterval);
     workerInterval = null;
   }
-  isWorkerRunning = false;
   isCheckInProgress = false;
   console.log('[OfflineWorker] Background monitor stopped');
 }
@@ -185,7 +185,7 @@ module.exports = {
   runOfflineCheck,
   startOfflineWorker,
   stopOfflineWorker,
-  isWorkerRunning: () => isWorkerRunning,
+  isWorkerRunning,
   OFFLINE_CHECK_INTERVAL_MS,
   OFFLINE_THRESHOLD_SEC
 };
