@@ -14,13 +14,50 @@ const CHENNAI_OPERATING_POLYGON = [
 ];
 
 /**
- * Ray-casting algorithm to test whether a (lat, lng) point is inside a polygon.
+ * Tests whether a point (lat, lng) lies on a polygon boundary segment.
+ * @param {number} lat 
+ * @param {number} lng 
+ * @param {{lat: number, lng: number}} p1 
+ * @param {{lat: number, lng: number}} p2 
+ * @param {number} epsilon 
+ * @returns {boolean}
+ */
+function isPointOnSegment(lat, lng, p1, p2, epsilon = 1e-9) {
+  const minLat = Math.min(p1.lat, p2.lat) - epsilon;
+  const maxLat = Math.max(p1.lat, p2.lat) + epsilon;
+  const minLng = Math.min(p1.lng, p2.lng) - epsilon;
+  const maxLng = Math.max(p1.lng, p2.lng) + epsilon;
+
+  if (lat < minLat || lat > maxLat || lng < minLng || lng > maxLng) {
+    return false;
+  }
+
+  const crossProduct = Math.abs(
+    (lng - p1.lng) * (p2.lat - p1.lat) - (lat - p1.lat) * (p2.lng - p1.lng)
+  );
+
+  return crossProduct <= epsilon;
+}
+
+/**
+ * Tests whether a (lat, lng) point is inside or on the boundary of an operating polygon.
+ * Points exactly on polygon edges or corners are strictly treated as INSIDE (non-breaching).
  * @param {number} lat 
  * @param {number} lng 
  * @param {Array<{lat: number, lng: number}>} polygon 
  * @returns {boolean}
  */
 function isPointInPolygon(lat, lng, polygon = CHENNAI_OPERATING_POLYGON) {
+  if (!polygon || polygon.length < 3) return false;
+
+  // 1. Boundary & corner check: points exactly on an edge or vertex are treated as inside
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    if (isPointOnSegment(lat, lng, polygon[j], polygon[i])) {
+      return true;
+    }
+  }
+
+  // 2. Standard ray-casting algorithm for interior points
   let inside = false;
   for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
     const xi = polygon[i].lng, yi = polygon[i].lat;
@@ -518,9 +555,10 @@ function evaluateVehicleAlertsInternal(vehicleId, nowIso) {
 
   const changedAlerts = [];
 
-  // 1. If vehicle was offline and has an active offline alert, resolve it on new telemetry arrival
+  // 1. If vehicle was offline and has an active offline alert, resolve it on new online telemetry arrival
+  const vehicleState = db.prepare('SELECT status FROM vehicles WHERE vehicle_id = ?').get(vehicleId);
   const activeOffline = getActiveOfflineAlertStmt.get(vehicleId);
-  if (activeOffline) {
+  if (activeOffline && (!vehicleState || vehicleState.status === 'online')) {
     resolveAlertStmt.run({
       id: activeOffline.id,
       details: JSON.stringify({

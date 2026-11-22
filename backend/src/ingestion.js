@@ -126,11 +126,15 @@ const upsertVehicleStmt = db.prepare(`
     charging = CASE 
       WHEN excluded.last_ts > vehicles.last_ts OR (excluded.last_ts = vehicles.last_ts AND excluded.last_seq > vehicles.last_seq) 
       THEN excluded.charging ELSE vehicles.charging END,
-    status = 'online',
+    status = CASE 
+      WHEN excluded.last_ts > vehicles.last_ts OR (excluded.last_ts = vehicles.last_ts AND excluded.last_seq > vehicles.last_seq) 
+      THEN 'online' ELSE vehicles.status END,
     min_seq = MIN(vehicles.min_seq, excluded.min_seq),
     max_seq = MAX(vehicles.max_seq, excluded.max_seq),
     received_count = vehicles.received_count + 1,
-    updated_at = excluded.updated_at
+    updated_at = CASE 
+      WHEN excluded.last_ts > vehicles.last_ts OR (excluded.last_ts = vehicles.last_ts AND excluded.last_seq > vehicles.last_seq) 
+      THEN excluded.updated_at ELSE vehicles.updated_at END
 `);
 
 // Resolves any active offline alert when new data arrives
@@ -197,6 +201,13 @@ const executeBatchTransaction = db.transaction((validItems, nowIso) => {
     accepted++;
     acceptedVehicleIds.add(reading.vehicle_id);
 
+    // Check if incoming reading is advancing the vehicle's latest state (not stale)
+    const existingVehicle = getVehicleByIdStmt.get(reading.vehicle_id);
+    const isAdvancing = !existingVehicle || (
+      normalizedTs > existingVehicle.last_ts ||
+      (normalizedTs === existingVehicle.last_ts && reading.seq > existingVehicle.last_seq)
+    );
+
     upsertVehicleStmt.run({
       vehicle_id: reading.vehicle_id,
       last_ts: normalizedTs,
@@ -212,17 +223,19 @@ const executeBatchTransaction = db.transaction((validItems, nowIso) => {
       updated_at: nowIso
     });
 
-    // Resolve any active 'offline' alert as the vehicle is now actively reporting
-    const activeOffline = getActiveOfflineAlertStmt.get(reading.vehicle_id);
-    if (activeOffline) {
-      resolveOfflineAlertStmt.run({
-        vehicle_id: reading.vehicle_id,
-        now: nowIso
-      });
-      const resolvedAlert = getAlertByIdStmt.get(activeOffline.id);
-      if (resolvedAlert) {
-        // Collect resolved alerts to be broadcast strictly AFTER the transaction has successfully committed
-        alertsToPublish.push(resolvedAlert);
+    // Only resolve active 'offline' alert if valid telemetry advances state (not stale)
+    if (isAdvancing) {
+      const activeOffline = getActiveOfflineAlertStmt.get(reading.vehicle_id);
+      if (activeOffline) {
+        resolveOfflineAlertStmt.run({
+          vehicle_id: reading.vehicle_id,
+          now: nowIso
+        });
+        const resolvedAlert = getAlertByIdStmt.get(activeOffline.id);
+        if (resolvedAlert) {
+          // Collect resolved alerts to be broadcast strictly AFTER the transaction has successfully committed
+          alertsToPublish.push(resolvedAlert);
+        }
       }
     }
 

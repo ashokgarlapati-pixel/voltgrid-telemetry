@@ -21,6 +21,8 @@ Where it can still go wrong:
 - After a reflash a device may reset `seq`, and its new readings are labelled duplicates. A repeated `seq` with different values keeps the first payload. A boot or session ID should join the dedup key.
 - Alert evaluation crash safety: Telemetry ingestion and an `alert_outbox` job commit in the same atomic transaction. Under normal execution, alert evaluation runs inline immediately post-commit and completes the outbox record. If the process crashes between database commit and alert evaluation (or during background processing), the outbox worker reclaims the record upon restart or after a 30-second processing lease expires, guaranteeing evaluation without delaying until that vehicle's next reading.
 - Stream events are persisted before broadcasting, allowing recovery through `Last-Event-ID` within the 10,000-event retention limit. Cross-instance event ordering has limitations.
+- Long-running alert history retrieval: Alert rules formerly expanded the query cutoff back to an active alert's `opened_at`, which caused memory usage and query latency to scale linearly with incident duration. The alert engine now maintains strictly bounded index-covered evaluation windows (anchored to 10 minutes), tracking active alert state (e.g., existing overheat trigger, geofence breach) incrementally from compact metadata without scanning full historical incident spans into JavaScript memory.
+
 ## 3. Time
 
 Device `ts` orders a vehicle's observations, picks its current state (highest `ts` wins, `seq` breaks ties) and drives the alert rules. Server time covers what the device can't establish: `updated_at`, offline detection and the 5-minute HMAC window.
@@ -28,6 +30,13 @@ Device `ts` orders a vehicle's observations, picks its current state (highest `t
 **25 seconds fast:** accepted, since I allow `ts` up to 30 s ahead of the server. Its own readings stay consistently ordered, but comparisons with other vehicles are skewed by 25 s.
 
 **A day wrong:** every reading fails validation and is rejected individually. `updated_at` never advances, so the vehicle goes offline after 90 s, which at least flags the problem. The data is lost.
+
+**Offline detection and restart recovery:** Evaluated strictly against server receive time (`vehicles.updated_at`), not device `ts`. Ingestion updates `updated_at` only when fresh, advancing telemetry arrives (`excluded.last_ts > vehicles.last_ts OR (excluded.last_ts = vehicles.last_ts AND excluded.last_seq > vehicles.last_seq)`). Out-of-order, stale, or duplicate readings do not reset the 90-second offline countdown. The worker runs an immediate sweep upon server boot to detect vehicles that went offline before or during a restart, with idempotent alert generation across repeated scheduler ticks.
+
+**Alert invariants and boundary handling:**
+- **Overheat**: 3 consecutive readings > 55.0°C open an alert; 3 consecutive readings <= 50.0°C resolve it. Readings between 50.0°C and 55.0°C constitute a hysteresis band preserving current alert state. Normal readings reset the trigger streak, and cooldown resolves both open and acknowledged alerts.
+- **Geofence**: Points on any of the 4 polygon edges or 4 corner vertices evaluate strictly as inside (non-breaching) using collinear segment checks. Exit triggers a breach; re-entry resolves active alerts.
+- **Order independence**: Ingestion order (chronological, reverse, or randomized) evaluates to identical alert states.
 
 The 10-minute lateness cutoff is also too strict for the batching the brief describes. 500 readings at 5 s intervals span ~41 minutes, so legitimate catch-up data can be rejected. I would accept old readings into history, mark them late and never let them replace newer state. I would also estimate each vehicle's clock offset from a rolling median of `received_at - ts`, flag large or sudden changes, and never silently rewrite stored timestamps.
 

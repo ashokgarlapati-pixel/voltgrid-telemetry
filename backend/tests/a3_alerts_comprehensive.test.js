@@ -1036,5 +1036,164 @@ describe('A3 Comprehensive Alert Engine Edge Cases & Lifecycle Tests', () => {
       assert.strictEqual(allAlerts[1].version, 1);
       assert.ok(allAlerts[1].opened_at > fiveHoursAgo, 'New alert must have modern opened_at timestamp');
     });
+
+    test('Stale and duplicate telemetry does NOT update server receive time or resolve offline alert', async () => {
+      const vid = `VG-STALE-OFFLINE-${Date.now()}`;
+      const t0 = Date.now();
+      const t0Iso = new Date(t0 - 100000).toISOString(); // 100 seconds ago
+
+      // 1. Ingest an initial reading 100s ago
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 10, ts: t0Iso, soc_pct: 80, battery_temp_c: 30, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] }
+      ]);
+
+      // Manually set updated_at to 100s ago to simulate 100s of silence
+      db.prepare("UPDATE vehicles SET updated_at = ? WHERE vehicle_id = ?").run(t0Iso, vid);
+
+      // Trigger offline check at T0: vehicle has been silent for 100s -> flagged offline
+      const { runOfflineCheck } = require('../src/offlineWorker');
+      const resOff = runOfflineCheck(90, t0);
+      assert.ok(resOff.newlyOfflineCount >= 1);
+
+      const vOffline = db.prepare("SELECT status, updated_at FROM vehicles WHERE vehicle_id = ?").get(vid);
+      assert.strictEqual(vOffline.status, 'offline');
+      assert.strictEqual(vOffline.updated_at, t0Iso);
+
+      const alertOffline = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid);
+      assert.ok(alertOffline);
+      assert.strictEqual(alertOffline.status, 'open');
+
+      // 2. Ingest duplicate reading (same seq: 10)
+      const resDup = await postSignedBatch([
+        { vehicle_id: vid, seq: 10, ts: t0Iso, soc_pct: 80, battery_temp_c: 30, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] }
+      ]);
+      assert.strictEqual(resDup.body.duplicates, 1);
+
+      // Verify updated_at was NOT modified and vehicle is still offline
+      const vAfterDup = db.prepare("SELECT status, updated_at FROM vehicles WHERE vehicle_id = ?").get(vid);
+      assert.strictEqual(vAfterDup.status, 'offline', 'Duplicate telemetry must not set status to online');
+      assert.strictEqual(vAfterDup.updated_at, t0Iso, 'Duplicate telemetry must not update receive time');
+      assert.strictEqual(db.prepare("SELECT status FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid).status, 'open');
+
+      // 3. Ingest stale / late-arriving reading (seq: 5, older timestamp: 150s ago)
+      const olderTs = new Date(t0 - 150000).toISOString();
+      const resStale = await postSignedBatch([
+        { vehicle_id: vid, seq: 5, ts: olderTs, soc_pct: 80, battery_temp_c: 30, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 9, charging: false, fault_codes: [] }
+      ]);
+      assert.strictEqual(resStale.body.accepted, 1);
+
+      // Verify updated_at was NOT modified and offline alert was NOT resolved by stale data
+      const vAfterStale = db.prepare("SELECT status, updated_at FROM vehicles WHERE vehicle_id = ?").get(vid);
+      assert.strictEqual(vAfterStale.status, 'offline', 'Stale telemetry must not reset offline vehicle to online');
+      assert.strictEqual(vAfterStale.updated_at, t0Iso, 'Stale telemetry must not update server receive time');
+      assert.strictEqual(db.prepare("SELECT status FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid).status, 'open');
+
+      // 4. Ingest NEW valid reading (seq: 11, newer timestamp: now)
+      const newerTs = new Date().toISOString();
+      const resFresh = await postSignedBatch([
+        { vehicle_id: vid, seq: 11, ts: newerTs, soc_pct: 80, battery_temp_c: 30, speed_kmh: 0, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] }
+      ]);
+      assert.strictEqual(resFresh.body.accepted, 1);
+
+      // Verify vehicle returns to online and offline alert resolves cleanly
+      const vOnline = db.prepare("SELECT status FROM vehicles WHERE vehicle_id = ?").get(vid);
+      assert.strictEqual(vOnline.status, 'online', 'Fresh telemetry must restore vehicle to online');
+      const alertResolved = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid);
+      assert.strictEqual(alertResolved.status, 'resolved', 'Fresh telemetry must resolve offline alert');
+      assert.strictEqual(alertResolved.version, 2);
+    });
+
+    test('Geofence polygon boundary and corner coordinates via HTTP batch evaluate as inside (no breach)', async () => {
+      const vid = `VG-GEO-BOUNDS-${Date.now()}`;
+      const now = Date.now();
+
+      // Send 4 readings exactly on the 4 boundary edges and corners of the Chennai polygon
+      // Edge 1: Bottom edge (lat 13.0000, lng 80.2500)
+      // Edge 2: Top edge (lat 13.1800, lng 80.2500)
+      // Corner 1: Bottom-left (lat 13.0000, lng 80.1800)
+      // Corner 2: Top-right (lat 13.1800, lng 80.3200)
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 1, ts: new Date(now - 4000).toISOString(), soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 13.0000, lng: 80.2500, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 3000).toISOString(), soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 13.1800, lng: 80.2500, odometer_km: 10.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: new Date(now - 2000).toISOString(), soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 13.0000, lng: 80.1800, odometer_km: 10.2, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 4, ts: new Date(now - 1000).toISOString(), soc_pct: 80, battery_temp_c: 30, speed_kmh: 40, lat: 13.1800, lng: 80.3200, odometer_km: 10.3, charging: false, fault_codes: [] }
+      ]);
+
+      // Assert zero geofence alerts triggered
+      const totalAlerts = db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ? AND rule = 'geofence_breach'").get(vid).total;
+      assert.strictEqual(totalAlerts, 0, 'Readings on polygon boundary edges and corners must NOT trigger geofence breach');
+    });
+
+    test('Acknowledged overheat alert lifecycle: resolves correctly upon cooling readings', async () => {
+      const vid = `VG-ACK-RESOLVE-${Date.now()}`;
+      const now = Date.now();
+
+      // 1. Trigger overheat alert
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 1, ts: new Date(now - 15000).toISOString(), soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 10000).toISOString(), soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 10.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: new Date(now - 5000).toISOString(), soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 10.2, charging: false, fault_codes: [] }
+      ]);
+
+      const alertOpen = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").get(vid);
+      assert.ok(alertOpen);
+      assert.strictEqual(alertOpen.status, 'open');
+      assert.strictEqual(alertOpen.version, 1);
+
+      // 2. Acknowledge the alert via POST /v1/alerts/:id/ack
+      const ackRes = await fetch(`${baseUrl}/v1/alerts/${alertOpen.id}/ack`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': API_KEY
+        },
+        body: JSON.stringify({ version: 1 })
+      });
+      assert.strictEqual(ackRes.status, 200);
+      const ackBody = await ackRes.json();
+      assert.strictEqual(ackBody.alert.status, 'acknowledged');
+      assert.strictEqual(ackBody.alert.version, 2);
+
+      // 3. Send 3 cooling readings (<= 50°C) -> must transition from 'acknowledged' directly to 'resolved'
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 4, ts: new Date(now - 3000).toISOString(), soc_pct: 80, battery_temp_c: 49.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 10.3, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 5, ts: new Date(now - 2000).toISOString(), soc_pct: 80, battery_temp_c: 48.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 10.4, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 6, ts: new Date(now - 1000).toISOString(), soc_pct: 80, battery_temp_c: 47.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 10.5, charging: false, fault_codes: [] }
+      ]);
+
+      const alertResolved = db.prepare("SELECT * FROM alerts WHERE id = ?").get(alertOpen.id);
+      assert.strictEqual(alertResolved.status, 'resolved', 'Acknowledged alert must cleanly resolve upon cooldown');
+      assert.strictEqual(alertResolved.version, 3, 'Version must increment to 3 on resolution');
+      assert.strictEqual(alertResolved.opened_at, alertOpen.opened_at, 'Original opened_at must be preserved');
+    });
+
+    test('Multiple alert rules trigger and resolve independently on the same vehicle', async () => {
+      const vid = `VG-MULTI-RULES-${Date.now()}`;
+      const now = Date.now();
+
+      // Batch that simultaneously triggers overheat (> 55°C for 3) and geofence breach (outside polygon)
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 1, ts: new Date(now - 15000).toISOString(), soc_pct: 80, battery_temp_c: 56.0, speed_kmh: 40, lat: 14.50, lng: 81.00, odometer_km: 10, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 2, ts: new Date(now - 10000).toISOString(), soc_pct: 80, battery_temp_c: 57.0, speed_kmh: 40, lat: 14.50, lng: 81.00, odometer_km: 10.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3, ts: new Date(now - 5000).toISOString(), soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 40, lat: 14.50, lng: 81.00, odometer_km: 10.2, charging: false, fault_codes: [] }
+      ]);
+
+      const activeOverheat = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat' AND status = 'open'").get(vid);
+      const activeGeofence = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'geofence_breach' AND status = 'open'").get(vid);
+
+      assert.ok(activeOverheat, 'Overheat alert must be open');
+      assert.ok(activeGeofence, 'Geofence alert must be open');
+
+      // Now send batch where vehicle re-enters geofence, but remains hot (> 55°C)
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 4, ts: new Date(now - 2000).toISOString(), soc_pct: 80, battery_temp_c: 58.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 10.3, charging: false, fault_codes: [] }
+      ]);
+
+      const geoAfter = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'geofence_breach'").get(vid);
+      const heatAfter = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").get(vid);
+
+      assert.strictEqual(geoAfter.status, 'resolved', 'Geofence must resolve upon re-entry');
+      assert.strictEqual(heatAfter.status, 'open', 'Overheat must remain open while still hot');
+    });
   });
 });

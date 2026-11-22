@@ -105,6 +105,70 @@ describe('Part A3 Alert Engine Unit Tests', () => {
       assert.strictEqual(outcome.triggered, true);
       assert.strictEqual(outcome.resolved, false);
     });
+
+    test('Normal reading between hot readings breaks consecutive sequence (no alert)', () => {
+      // Streak interrupted: 56°C, 57°C, 45°C (normal breaks streak!), 56°C, 57°C -> never reaches 3 consecutive
+      const readings = [
+        { seq: 1, ts: '2026-11-20T10:00:00Z', battery_temp_c: 56.0 },
+        { seq: 2, ts: '2026-11-20T10:00:05Z', battery_temp_c: 57.0 },
+        { seq: 3, ts: '2026-11-20T10:00:10Z', battery_temp_c: 45.0 }, // Normal reading breaks streak!
+        { seq: 4, ts: '2026-11-20T10:00:15Z', battery_temp_c: 56.5 },
+        { seq: 5, ts: '2026-11-20T10:00:20Z', battery_temp_c: 57.0 }
+      ];
+      const outcome = evaluateOverheat(readings);
+      assert.strictEqual(outcome.triggered, false, 'Normal reading must reset hot streak counter');
+      assert.strictEqual(outcome.resolved, false);
+    });
+
+    test('Readings between 50°C and 55°C must NOT resolve an active alert (hysteresis)', () => {
+      const readings = [
+        // Already active alert triggered in past
+        { seq: 4, ts: '2026-11-20T10:00:15Z', battery_temp_c: 52.0 },
+        { seq: 5, ts: '2026-11-20T10:00:20Z', battery_temp_c: 51.5 },
+        { seq: 6, ts: '2026-11-20T10:00:25Z', battery_temp_c: 53.0 }
+      ];
+      const activeAlert = { id: 1, opened_at: '2026-11-20T10:00:00Z', status: 'open' };
+      const outcome = evaluateOverheat(readings, activeAlert);
+      assert.strictEqual(outcome.triggered, true, 'Alert must remain triggered in hysteresis band');
+      assert.strictEqual(outcome.resolved, false, 'Hysteresis temperatures must NOT resolve active alert');
+    });
+
+    test('New overheating episode after resolution creates a new distinct alert', () => {
+      const readings = [
+        // Incident 1: 3 hot -> triggers
+        { seq: 1, ts: '2026-11-20T10:00:00Z', battery_temp_c: 56.0 },
+        { seq: 2, ts: '2026-11-20T10:00:05Z', battery_temp_c: 57.0 },
+        { seq: 3, ts: '2026-11-20T10:00:10Z', battery_temp_c: 58.0 },
+        // Cooldown: 3 cool -> resolves
+        { seq: 4, ts: '2026-11-20T10:01:00Z', battery_temp_c: 49.0 },
+        { seq: 5, ts: '2026-11-20T10:01:05Z', battery_temp_c: 48.0 },
+        { seq: 6, ts: '2026-11-20T10:01:10Z', battery_temp_c: 47.0 },
+        // Incident 2: 3 hot -> new episode
+        { seq: 7, ts: '2026-11-20T10:05:00Z', battery_temp_c: 56.5 },
+        { seq: 8, ts: '2026-11-20T10:05:05Z', battery_temp_c: 57.5 },
+        { seq: 9, ts: '2026-11-20T10:05:10Z', battery_temp_c: 59.0 }
+      ];
+      const outcome = evaluateOverheat(readings);
+      assert.strictEqual(outcome.episodes.length, 2, 'Must record 2 discrete episodes');
+      assert.strictEqual(outcome.episodes[0].status, 'resolved');
+      assert.strictEqual(outcome.episodes[0].openedAt, '2026-11-20T10:00:10Z');
+      assert.strictEqual(outcome.episodes[0].resolvedAt, '2026-11-20T10:01:10Z');
+      assert.strictEqual(outcome.episodes[1].status, 'open');
+      assert.strictEqual(outcome.episodes[1].openedAt, '2026-11-20T10:05:10Z');
+    });
+
+    test('Acknowledged alerts retain correct lifecycle behavior during resolution', () => {
+      const readings = [
+        { seq: 1, ts: '2026-11-20T10:00:00Z', battery_temp_c: 49.0 },
+        { seq: 2, ts: '2026-11-20T10:00:05Z', battery_temp_c: 48.0 },
+        { seq: 3, ts: '2026-11-20T10:00:10Z', battery_temp_c: 47.0 }
+      ];
+      const acknowledgedAlert = { id: 42, status: 'acknowledged', opened_at: '2026-11-20T09:50:00Z' };
+      const outcome = evaluateOverheat(readings, acknowledgedAlert);
+      assert.strictEqual(outcome.resolved, true, 'Cool readings must resolve acknowledged alert');
+      assert.strictEqual(outcome.openedAt, '2026-11-20T09:50:00Z', 'Original opened_at must be preserved');
+      assert.strictEqual(outcome.resolvedAt, '2026-11-20T10:00:10Z');
+    });
   });
 
   describe('Rule 2: Rapid Discharge (>8% drop in 5 min while discharging)', () => {
@@ -256,6 +320,91 @@ describe('Part A3 Alert Engine Unit Tests', () => {
       assert.strictEqual(outcome.triggered, false);
       assert.strictEqual(outcome.resolved, true, 'Re-entering polygon must resolve breach');
     });
+
+    test('Each of the four polygon edges evaluates as inside (non-breaching)', () => {
+      // Bottom edge: lat 13.0000, lng 80.2500
+      assert.strictEqual(isPointInPolygon(13.0000, 80.2500), true, 'Bottom edge must be inside');
+      // Top edge: lat 13.1800, lng 80.2500
+      assert.strictEqual(isPointInPolygon(13.1800, 80.2500), true, 'Top edge must be inside');
+      // Left edge: lat 13.0900, lng 80.1800
+      assert.strictEqual(isPointInPolygon(13.0900, 80.1800), true, 'Left edge must be inside');
+      // Right edge: lat 13.0900, lng 80.3200
+      assert.strictEqual(isPointInPolygon(13.0900, 80.3200), true, 'Right edge must be inside');
+    });
+
+    test('All four polygon corners evaluate as inside (non-breaching)', () => {
+      // Bottom-left corner (13.0000, 80.1800)
+      assert.strictEqual(isPointInPolygon(13.0000, 80.1800), true, 'Bottom-left corner must be inside');
+      // Top-left corner (13.1800, 80.1800)
+      assert.strictEqual(isPointInPolygon(13.1800, 80.1800), true, 'Top-left corner must be inside');
+      // Top-right corner (13.1800, 80.3200)
+      assert.strictEqual(isPointInPolygon(13.1800, 80.3200), true, 'Top-right corner must be inside');
+      // Bottom-right corner (13.0000, 80.3200)
+      assert.strictEqual(isPointInPolygon(13.0000, 80.3200), true, 'Bottom-right corner must be inside');
+    });
+
+    test('Point just inside boundary evaluates as inside', () => {
+      // Just inside bottom-left
+      assert.strictEqual(isPointInPolygon(13.0001, 80.1801), true, 'Point just inside boundary must evaluate as inside');
+    });
+
+    test('Point just outside boundary triggers geofence breach', () => {
+      // Just outside bottom-left
+      assert.strictEqual(isPointInPolygon(12.9999, 80.1799), false, 'Point just outside boundary must evaluate as outside');
+      const readings = [
+        { seq: 1, ts: '2026-11-20T10:00:00Z', lat: 12.9999, lng: 80.1799 }
+      ];
+      const outcome = evaluateGeofenceBreach(readings);
+      assert.strictEqual(outcome.triggered, true, 'Point just outside boundary must trigger geofence breach');
+    });
+
+    test('Vehicle remaining outside across multiple readings maintains single open episode', () => {
+      const readings = [
+        { seq: 1, ts: '2026-11-20T10:00:00Z', lat: 14.5000, lng: 81.0000 },
+        { seq: 2, ts: '2026-11-20T10:01:00Z', lat: 14.5100, lng: 81.0100 },
+        { seq: 3, ts: '2026-11-20T10:02:00Z', lat: 14.5200, lng: 81.0200 }
+      ];
+      const outcome = evaluateGeofenceBreach(readings);
+      assert.strictEqual(outcome.triggered, true);
+      assert.strictEqual(outcome.episodes.length, 1, 'Continuous breach must produce exactly 1 episode');
+      assert.strictEqual(outcome.episodes[0].status, 'open');
+      assert.strictEqual(outcome.episodes[0].openedAt, '2026-11-20T10:00:00Z');
+    });
+
+    test('Multiple separate breach episodes tracked chronologically', () => {
+      const readings = [
+        // Breach 1: 10:00 -> 10:01
+        { seq: 1, ts: '2026-11-20T10:00:00Z', lat: 14.5000, lng: 81.0000 }, // outside
+        { seq: 2, ts: '2026-11-20T10:01:00Z', lat: 13.0900, lng: 80.2500 }, // inside (resolves 1)
+        // Breach 2: 10:05 -> 10:06
+        { seq: 3, ts: '2026-11-20T10:05:00Z', lat: 14.6000, lng: 81.1000 }, // outside (opens 2)
+        { seq: 4, ts: '2026-11-20T10:06:00Z', lat: 13.0900, lng: 80.2500 }  // inside (resolves 2)
+      ];
+      const outcome = evaluateGeofenceBreach(readings);
+      assert.strictEqual(outcome.episodes.length, 2, 'Must record 2 discrete resolved episodes');
+      assert.strictEqual(outcome.episodes[0].status, 'resolved');
+      assert.strictEqual(outcome.episodes[0].openedAt, '2026-11-20T10:00:00Z');
+      assert.strictEqual(outcome.episodes[0].resolvedAt, '2026-11-20T10:01:00Z');
+      assert.strictEqual(outcome.episodes[1].status, 'resolved');
+      assert.strictEqual(outcome.episodes[1].openedAt, '2026-11-20T10:05:00Z');
+      assert.strictEqual(outcome.episodes[1].resolvedAt, '2026-11-20T10:06:00Z');
+    });
+
+    test('Out-of-order and duplicate coordinates produce correct geofence state', () => {
+      const chronological = [
+        { seq: 1, ts: '2026-11-20T10:00:00Z', lat: 13.0900, lng: 80.2500 }, // inside
+        { seq: 2, ts: '2026-11-20T10:01:00Z', lat: 14.5000, lng: 81.0000 }, // outside (triggers)
+        { seq: 2, ts: '2026-11-20T10:01:00Z', lat: 14.5000, lng: 81.0000 }  // duplicate
+      ];
+      // Reverse arrival
+      const reversed = [...chronological].reverse();
+      const outChron = evaluateGeofenceBreach(chronological);
+      const outRev = evaluateGeofenceBreach(reversed);
+
+      assert.strictEqual(outChron.triggered, true);
+      assert.strictEqual(outRev.triggered, true);
+      assert.strictEqual(outChron.openedAt, outRev.openedAt);
+    });
   });
 
   describe('Rule 4: Offline Detection Logic (Clock Injection)', () => {
@@ -287,27 +436,181 @@ describe('Part A3 Alert Engine Unit Tests', () => {
       assert.ok(alert);
       assert.strictEqual(alert.status, 'open');
     });
+
+    test('No alert before 90 seconds, alert triggered at exact 90-second boundary', () => {
+      const vid = `VG-OFFLINE-BOUNDARY-${Date.now()}`;
+      const t0 = Date.now();
+      const t0Iso = new Date(t0).toISOString();
+
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES (?, ?, 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'online', 1, 1, 1, ?)
+      `).run(vid, t0Iso, t0Iso);
+
+      // At 89.9 seconds: silence < 90s -> no offline alert
+      const res89 = runOfflineCheck(90, t0 + 89900);
+      assert.strictEqual(res89.newlyOfflineCount, 0);
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid).total, 0);
+
+      // At 90.0 seconds: silence >= 90s -> triggers offline alert
+      const res90 = runOfflineCheck(90, t0 + 90000);
+      assert.strictEqual(res90.newlyOfflineCount, 1);
+      const alert = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid);
+      assert.ok(alert);
+      assert.strictEqual(alert.status, 'open');
+    });
+
+    test('Repeated scheduler execution does NOT duplicate active offline alerts', () => {
+      const vid = `VG-OFFLINE-REP-${Date.now()}`;
+      const t0 = Date.now();
+      const t0Iso = new Date(t0).toISOString();
+
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES (?, ?, 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'online', 1, 1, 1, ?)
+      `).run(vid, t0Iso, t0Iso);
+
+      // 1st run at 100s: triggers alert
+      runOfflineCheck(90, t0 + 100000);
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid).total, 1);
+
+      // 2nd, 3rd, 4th runs at 110s, 120s, 130s: must NOT create duplicate alerts
+      runOfflineCheck(90, t0 + 110000);
+      runOfflineCheck(90, t0 + 120000);
+      runOfflineCheck(90, t0 + 130000);
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid).total, 1);
+    });
+
+    test('Multiple vehicles becoming offline independently are handled concurrently', () => {
+      const v1 = `VG-MULTI-OFF-1-${Date.now()}`;
+      const v2 = `VG-MULTI-OFF-2-${Date.now()}`;
+      const t0 = Date.now();
+
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES 
+          (?, '2026-11-20T10:00:00Z', 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'online', 1, 1, 1, ?),
+          (?, '2026-11-20T10:00:00Z', 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'online', 1, 1, 1, ?)
+      `).run(v1, new Date(t0).toISOString(), v2, new Date(t0).toISOString());
+
+      const res = runOfflineCheck(90, t0 + 95000);
+      assert.strictEqual(res.newlyOfflineCount, 2, 'Both silent vehicles must transition to offline');
+
+      const a1 = db.prepare("SELECT status FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(v1);
+      const a2 = db.prepare("SELECT status FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(v2);
+      assert.strictEqual(a1.status, 'open');
+      assert.strictEqual(a2.status, 'open');
+    });
+
+    test('Server restart recovery: vehicles already offline without alert are detected and flagged', () => {
+      const vid = `VG-RESTART-OFF-${Date.now()}`;
+      const t0 = Date.now();
+
+      // Seed a vehicle that was marked offline before restart, but has no active alert
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES (?, '2026-11-20T10:00:00Z', 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'offline', 1, 1, 1, ?)
+      `).run(vid, new Date(t0 - 120000).toISOString());
+
+      // On startup / check: vehicle without active alert must be detected and alert opened
+      const res = runOfflineCheck(90, t0);
+      assert.ok(res.newlyOfflineCount >= 1);
+      const alert = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid);
+      assert.ok(alert, 'Alert must be opened for offline vehicle missing alert after restart');
+      assert.strictEqual(alert.status, 'open');
+
+      // Subsequent check must not duplicate it
+      const res2 = runOfflineCheck(90, t0 + 10000);
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid).total, 1);
+    });
+
+    test('Concurrent scheduler executions run safely via transaction locks', () => {
+      const vid = `VG-CONCURR-OFF-${Date.now()}`;
+      const t0 = Date.now();
+
+      db.prepare(`
+        INSERT INTO vehicles (
+          vehicle_id, last_ts, last_seq, soc_pct, battery_temp_c, speed_kmh,
+          lat, lng, odometer_km, charging, status, min_seq, max_seq, received_count, updated_at
+        ) VALUES (?, '2026-11-20T10:00:00Z', 1, 80, 30, 0, 13.08, 80.27, 10, 0, 'online', 1, 1, 1, ?)
+      `).run(vid, new Date(t0).toISOString());
+
+      // Execute 3 concurrent checks simultaneously at T0 + 100s
+      const r1 = runOfflineCheck(90, t0 + 100000);
+      const r2 = runOfflineCheck(90, t0 + 100000);
+      const r3 = runOfflineCheck(90, t0 + 100000);
+
+      // Exactly 1 newly offline alert created across all concurrent invocations
+      assert.strictEqual(r1.newlyOfflineCount + r2.newlyOfflineCount + r3.newlyOfflineCount, 1);
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ? AND rule = 'offline'").get(vid).total, 1);
+    });
   });
 
   describe('Order-Independence Verification', () => {
-    test('Shuffled arrival order produces identical alert state to chronological order', () => {
+    test('Overheat: Chronological, reverse, and randomized arrival orders produce identical results', () => {
       const chronological = [
         { seq: 1, ts: '2026-11-20T10:00:00Z', battery_temp_c: 56.0 },
         { seq: 2, ts: '2026-11-20T10:00:05Z', battery_temp_c: 57.0 },
-        { seq: 3, ts: '2026-11-20T10:00:10Z', battery_temp_c: 58.0 }
+        { seq: 3, ts: '2026-11-20T10:00:10Z', battery_temp_c: 58.0 },
+        { seq: 4, ts: '2026-11-20T10:01:00Z', battery_temp_c: 49.0 },
+        { seq: 5, ts: '2026-11-20T10:01:05Z', battery_temp_c: 48.0 },
+        { seq: 6, ts: '2026-11-20T10:01:10Z', battery_temp_c: 47.0 }
       ];
 
-      // Replay in reverse arrival order
       const reversed = [...chronological].reverse();
+      const randomized = [chronological[2], chronological[0], chronological[5], chronological[1], chronological[4], chronological[3]];
 
-      // Ensure chronological sort produces identical result
-      const sortedReversed = [...reversed].sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
-      const resChronological = evaluateOverheat(chronological);
-      const resReversedSorted = evaluateOverheat(sortedReversed);
+      const resChron = evaluateOverheat(chronological);
+      const resRev = evaluateOverheat(reversed);
+      const resRand = evaluateOverheat(randomized);
 
-      assert.strictEqual(resChronological.triggered, true);
-      assert.strictEqual(resReversedSorted.triggered, true);
-      assert.strictEqual(resChronological.details.current_temp_c, resReversedSorted.details.current_temp_c);
+      assert.deepStrictEqual(resChron, resRev, 'Chronological and reverse arrival must produce identical overheat outcome');
+      assert.deepStrictEqual(resChron, resRand, 'Chronological and randomized arrival must produce identical overheat outcome');
+    });
+
+    test('Rapid Discharge: Chronological, reverse, and randomized arrival orders produce identical results', () => {
+      const chronological = [
+        { seq: 1, ts: '2026-11-20T10:00:00Z', soc_pct: 90.0, charging: false },
+        { seq: 2, ts: '2026-11-20T10:01:00Z', soc_pct: 85.0, charging: true },
+        { seq: 3, ts: '2026-11-20T10:02:00Z', soc_pct: 85.0, charging: false },
+        { seq: 4, ts: '2026-11-20T10:03:00Z', soc_pct: 75.0, charging: false } // Drop: 10 in new continuous period
+      ];
+
+      const reversed = [...chronological].reverse();
+      const randomized = [chronological[3], chronological[0], chronological[2], chronological[1]];
+
+      const resChron = evaluateRapidDischarge(chronological);
+      const resRev = evaluateRapidDischarge(reversed);
+      const resRand = evaluateRapidDischarge(randomized);
+
+      assert.deepStrictEqual(resChron, resRev, 'Chronological and reverse arrival must produce identical discharge outcome');
+      assert.deepStrictEqual(resChron, resRand, 'Chronological and randomized arrival must produce identical discharge outcome');
+    });
+
+    test('Geofence: Chronological, reverse, and randomized arrival orders produce identical results', () => {
+      const chronological = [
+        { seq: 1, ts: '2026-11-20T10:00:00Z', lat: 13.0900, lng: 80.2500 }, // inside
+        { seq: 2, ts: '2026-11-20T10:01:00Z', lat: 14.5000, lng: 81.0000 }, // outside
+        { seq: 3, ts: '2026-11-20T10:02:00Z', lat: 13.0900, lng: 80.2500 }  // inside
+      ];
+
+      const reversed = [...chronological].reverse();
+      const randomized = [chronological[1], chronological[2], chronological[0]];
+
+      const resChron = evaluateGeofenceBreach(chronological);
+      const resRev = evaluateGeofenceBreach(reversed);
+      const resRand = evaluateGeofenceBreach(randomized);
+
+      assert.deepStrictEqual(resChron, resRev, 'Chronological and reverse arrival must produce identical geofence outcome');
+      assert.deepStrictEqual(resChron, resRand, 'Chronological and randomized arrival must produce identical geofence outcome');
     });
   });
 });

@@ -10,7 +10,10 @@ const OFFLINE_THRESHOLD_SEC = parseInt(process.env.OFFLINE_THRESHOLD_SEC || '90'
 const findStaleVehiclesStmt = db.prepare(`
   SELECT vehicle_id, updated_at
   FROM vehicles
-  WHERE status = 'online' AND updated_at <= ?
+  WHERE updated_at <= ? AND (
+    status = 'online' OR 
+    vehicle_id NOT IN (SELECT vehicle_id FROM alerts WHERE rule = 'offline' AND status != 'resolved')
+  )
 `);
 
 const setVehicleOfflineStmt = db.prepare(`
@@ -109,6 +112,9 @@ function startOfflineWorker(intervalMs = OFFLINE_CHECK_INTERVAL_MS, thresholdSec
   }
 
   console.log(`[OfflineWorker] Started background monitor (interval: ${intervalMs}ms, threshold: ${thresholdSec}s)`);
+  // Run an immediate check on startup to detect any vehicles already offline during restart
+  runOfflineCheck(thresholdSec);
+
   workerInterval = setInterval(() => {
     runOfflineCheck(thresholdSec);
   }, intervalMs);

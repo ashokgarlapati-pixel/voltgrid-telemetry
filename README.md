@@ -196,10 +196,11 @@ Regardless of batch size, serialized SQLite WAL writes queue up on disk commits 
 The alert engine evaluates four distinct operational rules with deterministic, order-independent logic:
 
 ### 1. Overheat (`overheat`)
-* **Trigger Condition**: Three (3) consecutive valid readings with `battery_temp_c > 55.0°C`.
-* **Resolution Condition**: Three (3) consecutive valid readings with `battery_temp_c <= 50.0°C`.
+* **Trigger Condition**: Three (3) consecutive valid readings with `battery_temp_c > 55.0°C`. Any reading `<= 55.0°C` immediately resets the trigger streak.
+* **Resolution Condition**: Three (3) consecutive valid readings with `battery_temp_c <= 50.0°C`. Resolves active alerts whether currently in `open` or `acknowledged` status.
 * **Hysteresis Band**: Between `50.0°C` and `55.0°C`, the previous alert state is preserved without change.
-* **De-duplication**: Repeated readings `> 55.0°C` do not create duplicate alerts while an alert is open or acknowledged.
+* **Episode Lifecycle**: A resolved alert is closed; subsequent overheating episodes create a fresh alert record with `version = 1`.
+* **Order Independence & Idempotency**: Chronological, reverse, and randomized arrival orders evaluate to identical alert states. Duplicate packets are ignored.
 
 ### 2. Rapid Discharge (`rapid_discharge`)
 * **Trigger Condition**: While not charging (`charging === false`), `soc_pct` drops by `> 8.0` percentage points compared to any non-charging reading within its current continuous non-charging period during the preceding 5 minutes (300 seconds) in event-time.
@@ -217,14 +218,18 @@ The alert engine evaluates four distinct operational rules with deterministic, o
     { "lat": 13.0000, "lng": 80.3200 }
   ]
   ```
-* **Trigger Condition**: Latest device reading is outside the operating polygon (determined by ray-casting).
-* **Resolution Condition**: Latest device reading re-enters the polygon.
+* **Boundary & Corner Classification Invariant**: Points lying exactly on any of the polygon's 4 boundary edges or 4 corner vertices are strictly classified as **inside** (non-breaching) via collinear cross-product and bounding box segment checks (`isPointOnSegment`).
+* **Trigger Condition**: Latest device reading is strictly outside the operating polygon (determined by ray-casting and boundary checks).
+* **Resolution Condition**: Latest device reading re-enters or touches the polygon boundary. Resolves active alerts whether `open` or `acknowledged`.
+* **Order Independence**: Multiple exit and re-entry episodes, late-arriving packets, and duplicate readings cleanly resolve without orphaned or duplicate alert states.
 
-### 4. Offline Detection Worker (`offline`)
-* **Trigger Condition**: Online vehicle has not reported a reading within `90` seconds (`OFFLINE_THRESHOLD_SEC`).
+### 4. Offline Detection Worker & Server Restart Recovery (`offline`)
+* **Trigger Condition**: Online vehicle has not reported fresh telemetry within `90` seconds (`OFFLINE_THRESHOLD_SEC`).
 * **Detection Clock**: Evaluated using server receive time (`vehicles.updated_at`), avoiding dependence on skewed client clocks.
-* **De-duplication**: Periodic sweeps (default every 10s via `OFFLINE_CHECK_INTERVAL_MS`) do not duplicate active alerts.
-* **Atomic Recovery**: When a silent vehicle resumes sending telemetry, its vehicle status returns to `online`, and its active `offline` alert transitions to `resolved` with `version = version + 1` in the same transaction.
+* **Stale & Duplicate Telemetry Protection**: Telemetry ingestion updates `updated_at` only when fresh, advancing telemetry arrives (`excluded.last_ts > vehicles.last_ts OR (excluded.last_ts = vehicles.last_ts AND excluded.last_seq > vehicles.last_seq)`). Late-arriving older readings and duplicate packets do NOT update `updated_at` and cannot keep a silent vehicle artificially online or resurrect an offline state.
+* **Server Restart Recovery**: The offline worker executes an immediate sweep upon startup (`startOfflineWorker()`), detecting any vehicle that went offline prior to or during a server restart (`status = 'online' AND silence >= 90s` or `status = 'offline'` lacking an active alert).
+* **Scheduler Idempotency**: Periodic sweeps (default every 10s via `OFFLINE_CHECK_INTERVAL_MS`) do not duplicate active alerts (`WHERE status != 'resolved'`).
+* **Atomic Telemetry Recovery**: When fresh valid telemetry arrives for an offline vehicle, vehicle status returns to `online`, and its active `offline` alert transitions to `resolved` with `version = version + 1` in the same atomic database transaction.
 
 ### Alert Lifecycle States & Optimistic Concurrency
 Supported states: `open` $\rightarrow$ `acknowledged` $\rightarrow$ `resolved`.
