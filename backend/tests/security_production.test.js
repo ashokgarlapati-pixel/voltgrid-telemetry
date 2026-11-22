@@ -1,4 +1,4 @@
-const { test, describe, before, after } = require('node:test');
+const { test, describe, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
 const os = require('node:os');
@@ -20,6 +20,8 @@ describe('Part A2 / Issue 15: Production & Staging Credential Security Tests', (
   before(() => {
     // Save current api_keys state to restore after unit tests
     initialDbKeys = db.prepare('SELECT api_key, secret, rate_limit_per_sec, burst_capacity FROM api_keys').all();
+    // Ensure clean state for unit tests: remove custom keys so missing-credential tests run deterministically
+    db.prepare('DELETE FROM api_keys WHERE api_key != ?').run(DEV_API_KEY);
   });
 
   after(() => {
@@ -27,12 +29,18 @@ describe('Part A2 / Issue 15: Production & Staging Credential Security Tests', (
     db.prepare('DELETE FROM api_keys').run();
     const insertStmt = db.prepare('INSERT OR IGNORE INTO api_keys (api_key, secret, rate_limit_per_sec, burst_capacity) VALUES (?, ?, ?, ?)');
     for (const k of initialDbKeys) {
-      insertStmt.run(k.api_key, k.secret, k.rate_limit_per_sec, k.burst_capacity);
+      if (k.api_key === DEV_API_KEY) {
+        insertStmt.run(k.api_key, k.secret, k.rate_limit_per_sec, k.burst_capacity);
+      }
     }
     validateAndInitSecurityCredentials({ NODE_ENV: 'test' });
   });
 
   describe('1. Environment-Specific Credential Handling', () => {
+    beforeEach(() => {
+      // Purge any custom keys so missing-credential tests are never masked by pre-provisioned DB keys
+      db.prepare('DELETE FROM api_keys WHERE api_key != ?').run(DEV_API_KEY);
+    });
     test('Development and test environments permit default development credentials', () => {
       const resTest = validateAndInitSecurityCredentials({ NODE_ENV: 'test' });
       assert.strictEqual(resTest.isProduction, false);
