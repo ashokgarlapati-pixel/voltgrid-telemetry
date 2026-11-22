@@ -64,6 +64,16 @@ function evaluateOverheat(readings, activeAlert = null) {
 
   const alertOpenTs = activeAlert && activeAlert.opened_at ? Date.parse(activeAlert.opened_at) : null;
 
+  // If an active alert was already open before or at the start of our evaluation window,
+  // initialize state to 'triggered' with the active alert's original opened_at and details.
+  if (activeAlert && alertOpenTs !== null && sorted.length > 0 && alertOpenTs <= Date.parse(sorted[0].ts)) {
+    state = 'triggered';
+    openedAt = activeAlert.opened_at;
+    openDetails = typeof activeAlert.details === 'string'
+      ? JSON.parse(activeAlert.details || '{}')
+      : (activeAlert.details || { current_temp_c: sorted[0].battery_temp_c, threshold: 55.0 });
+  }
+
   for (const r of sorted) {
     const rTs = Date.parse(r.ts);
 
@@ -294,6 +304,16 @@ function evaluateGeofenceBreach(readings, activeAlert = null) {
 
   const alertOpenTs = activeAlert && activeAlert.opened_at ? Date.parse(activeAlert.opened_at) : null;
 
+  // If an active alert was already open before or at the start of our evaluation window,
+  // initialize inBreach to true with the active alert's original opened_at and details.
+  if (activeAlert && alertOpenTs !== null && sorted.length > 0 && alertOpenTs <= Date.parse(sorted[0].ts)) {
+    inBreach = true;
+    currentOpenedAt = activeAlert.opened_at;
+    currentOpenDetails = typeof activeAlert.details === 'string'
+      ? JSON.parse(activeAlert.details || '{}')
+      : (activeAlert.details || { lat: sorted[0].lat, lng: sorted[0].lng, status: 'outside_operating_polygon' });
+  }
+
   for (const r of sorted) {
     const rTs = Date.parse(r.ts);
 
@@ -408,7 +428,6 @@ const getLatestReadingTsStmt = db.prepare(`
 `);
 
 const getAlertByIdStmt = db.prepare('SELECT * FROM alerts WHERE id = ?');
-const getActiveAlertsForVehicleStmt = db.prepare("SELECT opened_at FROM alerts WHERE vehicle_id = ? AND status != 'resolved'");
 
 const getActiveAlertStmt = db.prepare(`
   SELECT id, status, version, details, opened_at
@@ -489,16 +508,10 @@ function evaluateVehicleAlertsInternal(vehicleId, nowIso) {
     ? Math.max(nowMs, latestTsMs)
     : latestTsMs;
 
-  const tenMinAgoIso = new Date(anchorMs - (10 * 60 * 1000)).toISOString();
-  let cutoffIso = tenMinAgoIso;
-
-  // If there are any active unresolved alerts, extend cutoff back to opened_at
-  const activeAlerts = getActiveAlertsForVehicleStmt.all(vehicleId);
-  for (const a of activeAlerts) {
-    if (a.opened_at && a.opened_at < cutoffIso) {
-      cutoffIso = a.opened_at;
-    }
-  }
+  // Window is strictly bounded to the 10-minute ingestion boundary (MAX_LATE_MS = 600,000 ms).
+  // Long-running active alerts maintain their state via activeAlert metadata passed into rules,
+  // avoiding expanding the database query to load arbitrary hours/days of historical telemetry.
+  const cutoffIso = new Date(anchorMs - (10 * 60 * 1000)).toISOString();
 
   let readings = getWindowHistoryStmt.all(vehicleId, cutoffIso);
   if (!readings || readings.length === 0) return [];

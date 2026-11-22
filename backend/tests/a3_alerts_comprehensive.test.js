@@ -926,5 +926,115 @@ describe('A3 Comprehensive Alert Engine Edge Cases & Lifecycle Tests', () => {
 
       assert.ok(boundedRows < 20, `Bounded rows (${boundedRows}) must be far less than total history (1000)`);
     });
+
+    test('Long-running active alert with large telemetry history: row loading remains bounded as history grows', async () => {
+      const vid = `VG-LONG-ALERT-${Date.now()}`;
+      const now = Date.now();
+      const fiveHoursAgo = new Date(now - (5 * 3600 * 1000)).toISOString();
+
+      // 1. Pre-open an alert opened 5 hours ago (long-running active incident)
+      db.prepare(`
+        INSERT INTO alerts (vehicle_id, rule, status, version, details, opened_at, updated_at)
+        VALUES (?, 'overheat', 'open', 1, ?, ?, ?)
+      `).run(
+        vid,
+        JSON.stringify({ current_temp_c: 58.0, threshold: 55.0, consecutive_hot: 3 }),
+        fiveHoursAgo,
+        fiveHoursAgo
+      );
+
+      const activeBefore = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat' AND status = 'open'").get(vid);
+      assert.ok(activeBefore, 'Pre-existing active alert must exist in database');
+      assert.strictEqual(activeBefore.opened_at, fiveHoursAgo);
+
+      // 2. Seed Phase 1: 1,000 historical readings across the 5-hour incident window
+      const seedStmt = db.prepare(`
+        INSERT INTO telemetry_history (
+          vehicle_id, seq, ts, soc_pct, battery_temp_c, speed_kmh, lat, lng, odometer_km, charging, fault_codes
+        ) VALUES (
+          ?, ?, ?, 80.0, 56.0, 40.0, 13.08, 80.27, 10.0, 0, '[]'
+        )
+      `);
+
+      db.transaction(() => {
+        for (let i = 1; i <= 1000; i++) {
+          const histTs = new Date(now - (5 * 3600 * 1000) + (i * 17000)).toISOString();
+          seedStmt.run(vid, i, histTs);
+        }
+      })();
+
+      const totalHistoryP1 = db.prepare("SELECT COUNT(*) AS total FROM telemetry_history WHERE vehicle_id = ?").get(vid).total;
+      assert.strictEqual(totalHistoryP1, 1000);
+
+      // Ingest 3 readings in current 10-minute window maintaining hot condition (> 55°C)
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 1001, ts: new Date(now - 15000).toISOString(), soc_pct: 75, battery_temp_c: 58.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 50, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 1002, ts: new Date(now - 10000).toISOString(), soc_pct: 75, battery_temp_c: 57.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 50.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 1003, ts: new Date(now - 5000).toISOString(), soc_pct: 75, battery_temp_c: 56.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 50.2, charging: false, fault_codes: [] }
+      ]);
+
+      // Verify active alert remains open with original 5-hour-old opened_at
+      const activeP1 = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat' AND status = 'open'").get(vid);
+      assert.ok(activeP1);
+      assert.strictEqual(activeP1.opened_at, fiveHoursAgo, 'Original opened_at from 5 hours ago must be preserved');
+      assert.strictEqual(db.prepare("SELECT COUNT(*) AS total FROM alerts WHERE vehicle_id = ?").get(vid).total, 1, 'Zero duplicate alerts');
+
+      // Verify row count loaded: 10-minute cutoff bounds rows loaded to <= 10, NOT 1,003 rows!
+      const cutoff1 = new Date(now - (10 * 60 * 1000)).toISOString();
+      const rowsLoadedP1 = db.prepare("SELECT COUNT(*) AS total FROM telemetry_history WHERE vehicle_id = ? AND ts >= ?").get(vid, cutoff1).total;
+      assert.ok(rowsLoadedP1 <= 10, `Loaded rows (${rowsLoadedP1}) must be <= 10, strictly bounded despite 1,003 rows in history`);
+
+      // 3. Seed Phase 2: Add 2,000 more historical readings (total 3,003 rows in history)
+      db.transaction(() => {
+        for (let i = 1004; i <= 3003; i++) {
+          const histTs = new Date(now - (4 * 3600 * 1000) + ((i - 1003) * 6000)).toISOString();
+          seedStmt.run(vid, i, histTs);
+        }
+      })();
+
+      const totalHistoryP2 = db.prepare("SELECT COUNT(*) AS total FROM telemetry_history WHERE vehicle_id = ?").get(vid).total;
+      assert.strictEqual(totalHistoryP2, 3003, 'History expanded to 3,003 rows');
+
+      // Ingest 3 more hot readings in current window
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 3004, ts: new Date(now - 4000).toISOString(), soc_pct: 74, battery_temp_c: 58.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 51, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3005, ts: new Date(now - 3000).toISOString(), soc_pct: 74, battery_temp_c: 57.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 51.1, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3006, ts: new Date(now - 2000).toISOString(), soc_pct: 74, battery_temp_c: 56.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 51.2, charging: false, fault_codes: [] }
+      ]);
+
+      // Verify row count loaded remains bounded: does NOT grow with total vehicle history
+      const rowsLoadedP2 = db.prepare("SELECT COUNT(*) AS total FROM telemetry_history WHERE vehicle_id = ? AND ts >= ?").get(vid, cutoff1).total;
+      assert.ok(rowsLoadedP2 <= 10, `Loaded rows (${rowsLoadedP2}) remains bounded <= 10 even when history tripled to 3,006 rows`);
+
+      // 4. Resolution Phase: Ingest cooling streak (3 readings <= 50°C)
+      const coolTs = new Date(now - 1000).toISOString();
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 3007, ts: new Date(now - 1500).toISOString(), soc_pct: 74, battery_temp_c: 49.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 51.3, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3008, ts: new Date(now - 1200).toISOString(), soc_pct: 74, battery_temp_c: 48.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 51.4, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3009, ts: coolTs, soc_pct: 74, battery_temp_c: 47.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 51.5, charging: false, fault_codes: [] }
+      ]);
+
+      const resolved = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat'").get(vid);
+      assert.strictEqual(resolved.status, 'resolved', 'Long-running alert must resolve cleanly');
+      assert.strictEqual(resolved.opened_at, fiveHoursAgo, 'Resolved alert must preserve original 5-hour-old opened_at');
+      assert.strictEqual(resolved.resolved_at, coolTs, 'Resolved_at must match cooling timestamp');
+      assert.strictEqual(resolved.version, 2, 'Version must increment to 2');
+
+      // 5. Reopening Phase: Ingest new hot streak -> opens new incident with new timestamp
+      const newHotTs = new Date(now - 200).toISOString();
+      await postSignedBatch([
+        { vehicle_id: vid, seq: 3010, ts: new Date(now - 800).toISOString(), soc_pct: 74, battery_temp_c: 56.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 51.6, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3011, ts: new Date(now - 500).toISOString(), soc_pct: 74, battery_temp_c: 57.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 51.7, charging: false, fault_codes: [] },
+        { vehicle_id: vid, seq: 3012, ts: newHotTs, soc_pct: 74, battery_temp_c: 58.0, speed_kmh: 40, lat: 13.08, lng: 80.27, odometer_km: 51.8, charging: false, fault_codes: [] }
+      ]);
+
+      const allAlerts = db.prepare("SELECT * FROM alerts WHERE vehicle_id = ? AND rule = 'overheat' ORDER BY id ASC").all(vid);
+      assert.strictEqual(allAlerts.length, 2, 'Must have exactly 2 alert records: 1 resolved historical, 1 newly reopened');
+      assert.strictEqual(allAlerts[0].status, 'resolved');
+      assert.strictEqual(allAlerts[0].opened_at, fiveHoursAgo);
+      assert.strictEqual(allAlerts[1].status, 'open');
+      assert.strictEqual(allAlerts[1].version, 1);
+      assert.ok(allAlerts[1].opened_at > fiveHoursAgo, 'New alert must have modern opened_at timestamp');
+    });
   });
 });
